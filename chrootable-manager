@@ -9,11 +9,12 @@ IMAGE_DIR="$STORE_DIR/images"; LOG_DIR="$STORE_DIR/logs"; EXPORT_DIR="$STORE_DIR
 DEBIAN_SUITE="${CHROOTABLE_DEBIAN_SUITE:-stable}"
 DEBIAN_MIRROR="${CHROOTABLE_DEBIAN_MIRROR:-http://deb.debian.org/debian}"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
+NON_INTERACTIVE=0
 REQUIRED_COMMANDS=(whiptail dd mkfs.ext4 debootstrap dpkg mount umount mountpoint unshare chroot flock df awk hostname readlink basename date du install mktemp rm rmdir mkdir cp stat truncate e2fsck resize2fs tar gzip)
 MISSING_PACKAGES=()
 
-show_error() { if command -v whiptail >/dev/null 2>&1; then whiptail --title "$APP_NAME" --msgbox "$1" 12 78; else printf '%s\n' "$1" >&2; fi; }
-show_info() { if command -v whiptail >/dev/null 2>&1; then whiptail --title "$APP_NAME" --infobox "$1" 11 78; else printf '%s\n' "$1"; fi; }
+show_error() { if (( ! NON_INTERACTIVE )) && command -v whiptail >/dev/null 2>&1; then whiptail --title "$APP_NAME" --msgbox "$1" 12 78; else printf '%s\n' "$1" >&2; fi; }
+show_info() { if (( ! NON_INTERACTIVE )) && command -v whiptail >/dev/null 2>&1; then whiptail --title "$APP_NAME" --infobox "$1" 11 78; else printf '%s\n' "$1"; fi; }
 
 add_package() { local item; for item in "${MISSING_PACKAGES[@]}"; do [[ $item == "$1" ]] && return; done; MISSING_PACKAGES+=("$1"); }
 package_for_command() {
@@ -87,12 +88,12 @@ choose_size_mib() {
 }
 choose_lifecycle() { whiptail --title "$APP_NAME" --menu "Choose how sessions use this chrootable:" 15 78 5 "persistent" "Write changes directly to the image" "ephemeral" "Use a disposable overlay; retain the base image" 3>&1 1>&2 2>&3; }
 
-create_chrootable() {
-    local name label size lifecycle image work log available required arch
-    name=$(whiptail --title "$APP_NAME" --inputbox "Name for the new chrootable (letters, numbers, dot, underscore, and hyphen):" 11 74 3>&1 1>&2 2>&3) || return
+create_image() {
+    local name=$1 size=$2 lifecycle=$3 label image work log available required arch
     valid_name "$name" || { show_error "Invalid name."; return; }; image="$IMAGE_DIR/$name.img"
     [[ ! -e $image ]] || { show_error "A chrootable named '$name' already exists."; return; }
-    size=$(choose_size_mib) || return; lifecycle=$(choose_lifecycle) || return; label=${name:0:16}
+    valid_size_mib "$size" || { show_error "Invalid image size."; return; }
+    [[ $lifecycle == persistent || $lifecycle == ephemeral ]] || { show_error "Lifecycle must be persistent or ephemeral."; return; }; label=${name:0:16}
     available=$(df -PB1 "$STORE_DIR" | awk 'NR == 2 {print $4}'); required=$((size * 1024 * 1024))
     (( available >= required )) || { show_error "Not enough free space for a ${size} MiB image."; return; }
     work=$(mktemp -d /run/chrootable-manager.create.XXXXXX); log="$LOG_DIR/${name}-$(date +%Y%m%d-%H%M%S).log"
@@ -106,6 +107,12 @@ create_chrootable() {
     umount "$work" || { show_error "Image created but remains mounted at $work."; return; }; rmdir "$work"
     write_metadata "$image" "$lifecycle" "$DEBIAN_SUITE" "$arch" "$size" "$(date --iso-8601=seconds)" never
     show_error "Created '$name' as a $lifecycle chrootable."
+}
+create_chrootable() {
+    local name size lifecycle
+    name=$(whiptail --title "$APP_NAME" --inputbox "Name for the new chrootable (letters, numbers, dot, underscore, and hyphen):" 11 74 3>&1 1>&2 2>&3) || return
+    size=$(choose_size_mib) || return; lifecycle=$(choose_lifecycle) || return
+    create_image "$name" "$size" "$lifecycle"
 }
 
 image_details() {
@@ -155,9 +162,9 @@ delete_chrootable() {
 image_action_menu() {
     local image=$1 choice
     while [[ -f $image ]]; do
-        choice=$(whiptail --title "$APP_NAME" --menu "$(image_details "$image")\n\nChoose an action:" 24 92 8 "enter" "Open a root shell" "clone" "Create a copy" "resize" "Expand the ext4 image" "repair" "Run forced ext4 repair" "export" "Create a .tar.gz archive" "delete" "Permanently remove this image" "back" "Return to the image list" 3>&1 1>&2 2>&3) || return
+        choice=$(whiptail --title "$APP_NAME" --menu "$(image_details "$image")\n\nChoose an action:" 24 92 8 "enter" "Open a root shell" "enter-isolated" "Open a shell with no network namespace access" "clone" "Create a copy" "resize" "Expand the ext4 image" "repair" "Run forced ext4 repair" "export" "Create a .tar.gz archive" "delete" "Permanently remove this image" "back" "Return to the image list" 3>&1 1>&2 2>&3) || return
         case $choice in
-            enter) enter_chrootable "$image" "$(image_lifecycle "$image")" ;; clone) clone_chrootable "$image" ;; resize) resize_chrootable "$image" ;; repair) repair_chrootable "$image" ;; export) export_chrootable "$image" ;; delete) delete_chrootable "$image" && return ;; back) return ;;
+            enter) enter_chrootable "$image" "$(image_lifecycle "$image")" shared ;; enter-isolated) enter_chrootable "$image" "$(image_lifecycle "$image")" isolated ;; clone) clone_chrootable "$image" ;; resize) resize_chrootable "$image" ;; repair) repair_chrootable "$image" ;; export) export_chrootable "$image" ;; delete) delete_chrootable "$image" && return ;; back) return ;;
         esac
     done
 }
@@ -169,9 +176,13 @@ select_chrootable() {
 }
 
 enter_chrootable() {
-    local image=$1 lifecycle=$2 work lock_fd status=0
+    local image=$1 lifecycle=$2 network=${3:-shared} work lock_fd status=0
     lock_image "$image" lock_fd || return; work=$(mktemp -d /run/chrootable-manager.enter.XXXXXX)
-    unshare --mount --uts --ipc --pid --fork "$SCRIPT_PATH" --enter-inner "$image" "$work" "$lifecycle" || status=$?
+    if [[ $network == isolated ]]; then
+        unshare --mount --uts --ipc --pid --fork --net "$SCRIPT_PATH" --enter-inner "$image" "$work" "$lifecycle" || status=$?
+    else
+        unshare --mount --uts --ipc --pid --fork "$SCRIPT_PATH" --enter-inner "$image" "$work" "$lifecycle" || status=$?
+    fi
     rmdir "$work" 2>/dev/null || true; update_last_used "$image"; unlock_image "$lock_fd"; (( status == 0 )) || show_error "The chroot session ended with an error."
 }
 enter_inner() {
@@ -179,7 +190,7 @@ enter_inner() {
     name=$(basename "$image" .img)
     cleanup_inner() {
         mountpoint -q "$root/run" && umount "$root/run" || true; mountpoint -q "$root/proc" && umount "$root/proc" || true
-        mountpoint -q "$root/dev" && umount -R "$root/dev" || true; mountpoint -q "$root/sys" && umount -R "$root/sys" || true; mountpoint -q "$root" && umount "$root" || true
+        mountpoint -q "$root/dev" && umount -R "$root/dev" || true; mountpoint -q "$root" && umount "$root" || true
         mountpoint -q "$lower" && umount "$lower" || true; mountpoint -q "$overlay" && umount "$overlay" || true
         rmdir "$overlay/upper" "$overlay/work" "$overlay" "$lower" 2>/dev/null || true
     }; trap cleanup_inner EXIT
@@ -188,7 +199,7 @@ enter_inner() {
         mkdir -p "$lower" "$overlay"; mount -o loop,ro "$image" "$lower"; mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs "$overlay"; mkdir -p "$overlay/upper" "$overlay/work"
         mount -t overlay overlay -o "lowerdir=$lower,upperdir=$overlay/upper,workdir=$overlay/work" "$root"
     else mount -o loop "$image" "$root"; fi
-    mount -t proc proc "$root/proc"; mount --rbind /dev "$root/dev"; mount --make-rslave "$root/dev"; mount --rbind /sys "$root/sys"; mount --make-rslave "$root/sys"; mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs "$root/run"; hostname "$name"
+    mount -t proc proc "$root/proc"; mount --rbind /dev "$root/dev"; mount --make-rslave "$root/dev"; mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs "$root/run"; hostname "$name"
     printf '\033[H\033[2J'; [[ $lifecycle == ephemeral ]] && printf 'Entering %s with a disposable overlay. Type exit to discard changes.\n\n' "$name" || printf 'Entering %s. Type exit to return to the manager.\n\n' "$name"
     chroot "$root" /usr/bin/env -i HOME=/root USER=root LOGNAME=root TERM="${TERM:-xterm}" PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /bin/bash --login
 }
@@ -199,6 +210,29 @@ main_menu() {
         case $choice in "new chrootable") create_chrootable ;; "select chrootable") select_chrootable ;; quit) return ;; esac
     done
 }
+usage() {
+    printf '%s\n' "Usage: $0 [--list | --create NAME SIZE_MIB persistent|ephemeral | --enter NAME | --enter-isolated NAME]"
+}
+run_cli() {
+    local name image
+    case $1 in
+        --list)
+            shopt -s nullglob
+            for image in "$IMAGE_DIR"/*.img; do printf '%s\t%s\t%s MiB\n' "$(basename "$image" .img)" "$(image_lifecycle "$image")" "$(image_size_mib "$image")"; done
+            shopt -u nullglob ;;
+        --create)
+            [[ $# -eq 4 ]] || { usage; return 2; }
+            create_image "$2" "$3" "$4" ;;
+        --enter|--enter-isolated)
+            [[ $# -eq 2 ]] || { usage; return 2; }
+            name=$2; image="$IMAGE_DIR/$name.img"
+            [[ -f $image ]] || { printf 'Chrootable not found: %s\n' "$name" >&2; return 1; }
+            if [[ $1 == --enter-isolated ]]; then enter_chrootable "$image" "$(image_lifecycle "$image")" isolated; else enter_chrootable "$image" "$(image_lifecycle "$image")" shared; fi ;;
+        *) usage; return 2 ;;
+    esac
+}
 if [[ ${1:-} == --enter-inner ]]; then [[ $# -eq 4 ]] || exit 2; enter_inner "$2" "$3" "$4"; exit; fi
+if [[ ${1:-} == --help || ${1:-} == -h ]]; then usage; exit 0; fi
+if [[ ${1:-} == --* ]]; then NON_INTERACTIVE=1; check_prerequisites; run_cli "$@"; exit $?; fi
 check_prerequisites
 main_menu
