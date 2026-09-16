@@ -277,6 +277,116 @@ test_demo_cleanup() {
     path=$(awk '/^Store: / {print $2}' <<<"$output")
     [[ $path == /tmp/chrootable-demo.* && ! -e $path ]]
 }
+test_allocate_image_strategy() {
+    OP_LOG="$STORE_DIR/op.log"
+    local falloc_called=0 trunc_called=0
+    fallocate() { falloc_called=1; touch "$3"; return 0; }
+    allocate_image "$STORE_DIR/falloc.img" 16
+    assert_eq 1 "$falloc_called"
+    unset -f fallocate
+
+    fallocate() { return 1; }
+    truncate() { trunc_called=1; touch "$3"; return 0; }
+    allocate_image "$STORE_DIR/trunc.img" 16
+    assert_eq 1 "$trunc_called"
+    unset -f fallocate truncate
+}
+test_setup_resolv_conf_systemd_stub() {
+    local fake_work fake_root
+    fake_work=$(mktemp -d "$STORE_DIR/work.XXXXXX")
+    fake_root=$(mktemp -d "$STORE_DIR/root.XXXXXX")
+    mkdir -p "$fake_root/etc"
+
+    mount() { return 0; }
+    setup_resolv_conf "$fake_work" "$fake_root"
+    unset -f mount
+
+    [[ -f $fake_work/resolv.conf ]]
+    assert_eq 0 "$(grep -c '127\.0\.0\.' "$fake_work/resolv.conf" || true)"
+    assert_contains "$(<"$fake_work/resolv.conf")" "nameserver"
+}
+test_worker_cleanup_busy_handling() {
+    WORKER_ROOT="$STORE_DIR/root"
+    WORKER_LOWER="$STORE_DIR/lower"
+    WORKER_OVERLAY="$STORE_DIR/overlay"
+    mkdir -p "$WORKER_ROOT" "$WORKER_LOWER" "$WORKER_OVERLAY"
+
+    mountpoint() { return 0; }
+    local umount_calls=()
+    umount() {
+        umount_calls+=("$*")
+        if [[ $1 == -R ]]; then
+            return 32
+        fi
+        return 0
+    }
+    kill() { return 0; }
+    local rc=0
+    ( worker_cleanup ) || rc=$?
+    unset -f mountpoint umount kill
+
+    assert_eq 0 "$rc"
+    local called="${umount_calls[*]}"
+    assert_contains "$called" "-l $WORKER_ROOT"
+}
+test_session_locale_and_devpts() {
+    local fake_work fake_root
+    fake_work=$(mktemp -d "$STORE_DIR/work.XXXXXX")
+    fake_root=$(mktemp -d "$STORE_DIR/root.XXXXXX")
+    WORKER_ROOT="$fake_root"
+
+    local mounted_devpts=0
+    mount() {
+        if [[ $* == *"devpts"*"-o newinstance"* ]]; then
+            mounted_devpts=1
+        fi
+        return 0
+    }
+    mount_session_devices
+    unset -f mount
+    assert_eq 1 "$mounted_devpts"
+}
+test_isolated_network_brings_up_lo() {
+    local fake_work fake_root
+    fake_work=$(mktemp -d "$STORE_DIR/work.XXXXXX")
+    fake_root=$(mktemp -d "$STORE_DIR/root.XXXXXX")
+    mkdir -p "$fake_root"
+
+    local lo_up=0 lang_set=0
+    ip() {
+        if [[ $* == "link set lo up" ]]; then
+            lo_up=1
+        fi
+        return 0
+    }
+    mount() { return 0; }
+    hostname() { return 0; }
+    chroot() {
+        local env_str="$*"
+        if [[ $env_str == *"LANG=C.UTF-8"* ]]; then
+            lang_set=1
+        fi
+        return 0
+    }
+
+    require_root() { return 0; }
+    unshare() { return 0; }
+    (
+        WORKER_ROOT="$fake_root"; WORKER_LOWER="$fake_work/lower"; WORKER_OVERLAY="$fake_work/overlay"
+        worker_main enter "$STORE_DIR/dummy.img" "$fake_work" test-box persistent isolated echo hi
+    )
+    unset -f ip mount hostname chroot require_root unshare
+    assert_eq 1 "$lo_up"
+    assert_eq 1 "$lang_set"
+}
+test_pending_cleared_on_publish() {
+    make_workdir() { WORK=$(mktemp -d "$STORE_DIR/work.XXXXXX"); }
+    run_worker() { return 0; }
+    create_image publish-check 16 ephemeral minimal
+    assert_eq "" "${PENDING:-}"
+    clone_image "$IMAGE_DIR/publish-check.img" clone-check
+    assert_eq "" "${PENDING:-}"
+}
 
 if [[ ${1:-} == --case ]]; then
     STORE_DIR=$(mktemp -d /tmp/chrootable-regression.XXXXXX)

@@ -11,7 +11,7 @@ DEBIAN_MIRROR=${CHROOTABLE_DEBIAN_MIRROR:-http://deb.debian.org/debian}
 NON_INTERACTIVE=1
 DEMO=0
 REQUIRED_COMMANDS=(awk basename chroot cp date dd debootstrap df dpkg du e2fsck flock
-    gzip hostname install losetup mkdir mkfs.ext4 mktemp mount mountpoint mv readlink
+    gzip hostname install ip losetup mkdir mkfs.ext4 mktemp mount mountpoint mv readlink
     resize2fs rm rmdir stat tail tar truncate umount unshare whiptail)
 
 configure_paths() {
@@ -127,6 +127,7 @@ package_for_command() {
         whiptail|debootstrap|dpkg|hostname|tar|gzip) printf '%s' "$1" ;;
         mkfs.ext4|e2fsck|resize2fs) printf e2fsprogs ;;
         mount|umount|mountpoint|unshare|flock|losetup) printf util-linux ;;
+        ip) printf iproute2 ;;
         awk) printf mawk ;;
         *) printf coreutils ;;
     esac
@@ -231,6 +232,16 @@ list_profiles() {
         network '2 GiB' 'iproute2, ping, DNS tools, curl, SSH client'
 }
 
+allocate_image() {
+    local target=$1 size_mib=$2
+    if command -v fallocate >/dev/null 2>&1 && fallocate -l "${size_mib}M" "$target" >>"$OP_LOG" 2>&1; then
+        return 0
+    elif truncate -s "${size_mib}M" "$target" >>"$OP_LOG" 2>&1; then
+        return 0
+    fi
+    dd if=/dev/zero of="$target" bs=1M count="$size_mib" status=none conv=fsync >>"$OP_LOG" 2>&1
+}
+
 create_image() (
     local name=$1 size=$2 lifecycle=$3 profile=${4:-minimal} image descriptor arch
     unused_image "$name" || return
@@ -248,11 +259,12 @@ create_image() (
     make_workdir || return
     arch=$(dpkg --print-architecture) || return
     info "Creating $name / Debian $DEBIAN_SUITE / $profile / $size MiB. Log: $OP_LOG"
-    dd if=/dev/zero of="$PENDING" bs=1M count="$size" status=progress conv=fsync >>"$OP_LOG" 2>&1 || return
+    allocate_image "$PENDING" "$size" || return
     mkfs.ext4 -F -L "${name:0:16}" "$PENDING" >>"$OP_LOG" 2>&1 || return
     run_worker create "$PENDING" "$WORK" "$name" "$arch" "$profile" >>"$OP_LOG" 2>&1 || return
     write_metadata "$PENDING" "$lifecycle" "$DEBIAN_SUITE" "$arch" "$size" "$(timestamp)" never "$profile" || return
     publish_image "$PENDING" "$image" || return
+    PENDING=
     info "Created '$name'. Enter with: sudo $0 --enter $name"
 )
 clone_image() (
@@ -271,6 +283,7 @@ clone_image() (
     metadata_set "$PENDING" last_used_at never || return
     metadata_set "$PENDING" origin "$(basename "$source" .img)" || return
     publish_image "$PENDING" "$destination" || return
+    PENDING=
     info "Created clone '$name'."
 )
 fsck_preflight() {
@@ -312,6 +325,7 @@ export_image() (
     archive="$EXPORT_DIR/$name-$(date +%Y%m%d-%H%M%S)-$token.tar.gz"
     run_worker export "$image" "$WORK" "$PENDING" >>"$OP_LOG" 2>&1 || return
     mv -T -- "$PENDING" "$archive" || return
+    PENDING=
     printf '%s\n' "$archive"
 )
 set_lifecycle() (
@@ -377,6 +391,7 @@ restore_image() (
     cp --reflink=auto --sparse=always -- "$snapshot" "$PENDING" >>"$OP_LOG" 2>&1 || return
     copy_metadata "$snapshot" "$PENDING" || return
     publish_image "$PENDING" "$image" || return
+    PENDING=
     info "Restored '$name' from '$label'."
     [[ -z ${recovery:-} ]] || info "Undo this restore with: $0 --restore $name $recovery --yes"
 )
@@ -419,17 +434,56 @@ enter_chrootable() (
 worker_cleanup() {
     local status=$? cleanup_status=0
     cd / || true
-    if mountpoint -q "$WORKER_ROOT"; then umount -R "$WORKER_ROOT" || cleanup_status=$?; fi
-    if mountpoint -q "$WORKER_LOWER"; then umount "$WORKER_LOWER" || cleanup_status=$?; fi
-    if mountpoint -q "$WORKER_OVERLAY"; then umount "$WORKER_OVERLAY" || cleanup_status=$?; fi
+    kill -TERM -1 2>/dev/null || true
+    sleep 0.05 2>/dev/null || true
+    kill -KILL -1 2>/dev/null || true
+    if mountpoint -q "$WORKER_ROOT/etc/resolv.conf"; then umount "$WORKER_ROOT/etc/resolv.conf" 2>/dev/null || true; fi
+    if mountpoint -q "$WORKER_ROOT/dev/ptmx"; then umount "$WORKER_ROOT/dev/ptmx" 2>/dev/null || true; fi
+    if mountpoint -q "$WORKER_ROOT/dev/pts"; then umount "$WORKER_ROOT/dev/pts" 2>/dev/null || true; fi
+    if mountpoint -q "$WORKER_ROOT"; then umount -R "$WORKER_ROOT" 2>/dev/null || umount -l "$WORKER_ROOT" || cleanup_status=$?; fi
+    if mountpoint -q "$WORKER_LOWER"; then umount "$WORKER_LOWER" 2>/dev/null || umount -l "$WORKER_LOWER" || cleanup_status=$?; fi
+    if mountpoint -q "$WORKER_OVERLAY"; then umount "$WORKER_OVERLAY" 2>/dev/null || umount -l "$WORKER_OVERLAY" || cleanup_status=$?; fi
     (( status != 0 || cleanup_status == 0 )) || status=$cleanup_status
     exit "$status"
+}
+setup_resolv_conf() {
+    local work=$1 root=$2 target="$root/etc/resolv.conf" source_file=""
+    local dest="$work/resolv.conf"
+
+    if [[ -f /run/systemd/resolve/resolv.conf && -r /run/systemd/resolve/resolv.conf ]]; then
+        source_file="/run/systemd/resolve/resolv.conf"
+    elif [[ -f /etc/resolv.conf && -r /etc/resolv.conf ]]; then
+        source_file="/etc/resolv.conf"
+    fi
+
+    if [[ -n $source_file && -f $source_file ]]; then
+        cp -L "$source_file" "$dest" 2>/dev/null || true
+    fi
+
+    if [[ -f $dest ]] && grep -qE '^[[:space:]]*nameserver[[:space:]]+127\.' "$dest" 2>/dev/null; then
+        awk '!/^[[:space:]]*nameserver[[:space:]]+127\./' "$dest" >"$dest.tmp" 2>/dev/null && mv -f -- "$dest.tmp" "$dest" || true
+        if ! grep -qE '^[[:space:]]*nameserver[[:space:]]+' "$dest" 2>/dev/null; then
+            printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' >>"$dest"
+        fi
+    elif [[ ! -f $dest || ! -s $dest ]]; then
+        printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' >"$dest"
+    fi
+
+    if [[ -d $root/etc ]]; then
+        touch "$target" 2>/dev/null || true
+        mount --bind "$dest" "$target" 2>/dev/null || true
+        mount --make-rslave "$target" 2>/dev/null || true
+    fi
 }
 mount_session_devices() {
     mkdir -p "$WORKER_ROOT/proc" "$WORKER_ROOT/dev" "$WORKER_ROOT/run" || return
     mount -t proc proc "$WORKER_ROOT/proc" || return
     mount --rbind /dev "$WORKER_ROOT/dev" || return
     mount --make-rslave "$WORKER_ROOT/dev" || return
+    if mkdir -p "$WORKER_ROOT/dev/pts" 2>/dev/null; then
+        mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts "$WORKER_ROOT/dev/pts" 2>/dev/null &&
+            mount --bind "$WORKER_ROOT/dev/pts/ptmx" "$WORKER_ROOT/dev/ptmx" 2>/dev/null || true
+    fi
     mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs "$WORKER_ROOT/run"
 }
 worker_main() (
@@ -451,6 +505,7 @@ worker_main() (
             printf '127.0.0.1 localhost\n127.0.1.1 %s\n::1 localhost ip6-localhost ip6-loopback\n' "$name" >"$WORKER_ROOT/etc/hosts" || return
             packages=$(profile_packages "$profile") || return
             if [[ -n $packages ]]; then
+                setup_resolv_conf "$work" "$WORKER_ROOT"
                 mount_session_devices || return
                 local -a package_list=()
                 read -r -a package_list <<<"$packages"
@@ -475,6 +530,11 @@ worker_main() (
             else
                 mount -o loop "$image" "$WORKER_ROOT" || return
             fi
+            if [[ $network == isolated ]]; then
+                ip link set lo up 2>/dev/null || ifconfig lo up 2>/dev/null || true
+            else
+                setup_resolv_conf "$work" "$WORKER_ROOT"
+            fi
             mount_session_devices || return
             hostname "$name" || return
             printf 'started\n' >"$work/started" || return
@@ -486,7 +546,8 @@ worker_main() (
             fi
             cd "$WORKER_ROOT" || return
             chroot "$WORKER_ROOT" /usr/bin/env -i HOME=/root USER=root LOGNAME=root \
-                TERM="${TERM:-xterm}" PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+                LANG="${LANG:-C.UTF-8}" TERM="${TERM:-xterm}" \
+                PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
                 CHROOTABLE_NAME="$name" CHROOTABLE_LIFECYCLE="$lifecycle" CHROOTABLE_NETWORK="$network" \
                 "$@" || return
             cd / || return
