@@ -641,10 +641,12 @@ json_string() {
     printf '"'
 }
 image_json() {
-    local image=$1 name key value comma= status=ready lifecycle=persistent suite=unknown architecture=unknown
-    local profile=minimal created_at=unknown last_used_at=never origin=unknown mkey mval bytes=0 blocks=0 snaps=0 file
+    local image=$1 bytes=${2:-} blocks=${3:-} name key value comma= status=ready lifecycle=persistent suite=unknown architecture=unknown
+    local profile=minimal created_at=unknown last_used_at=never origin=unknown mkey mval snaps=0 file
     name=${image##*/}; name=${name%.img}
-    status=$(image_status "$image")
+    if [[ -f $image.lock && ! -L $image.lock ]]; then
+        status=$(image_status "$image")
+    fi
     if [[ -f $image.meta && ! -L $image.meta ]]; then
         while IFS='=' read -r mkey mval; do
             case $mkey in
@@ -661,7 +663,9 @@ image_json() {
         read -r lifecycle <"$image.mode" || true
     fi
     valid_lifecycle "$lifecycle" || lifecycle=persistent
-    read -r bytes blocks < <(stat -c '%s %b' -- "$image") || return
+    if [[ -z $bytes || -z $blocks ]]; then
+        read -r bytes blocks < <(stat -c '%s %b' -- "$image") || return
+    fi
     for file in "$SNAPSHOT_DIR/$name/"*.img; do [[ -f $file && ! -L $file ]] && snaps=$((snaps + 1)); done
     printf '{'
     for key in name path status lifecycle suite architecture profile created_at last_used_at origin; do
@@ -676,14 +680,24 @@ image_json() {
     printf ',"size_mib":%s,"allocated_bytes":%s,"snapshots":%s}' "$((bytes / 1048576))" "$((blocks * 512))" "$snaps"
 }
 list_images() {
-    local format=${1:-text} image name comma=
-    [[ $format != json ]] || printf '['
+    local format=${1:-text} image name comma= idx=0 bytes blocks
+    local -a valid_images=() stat_lines=()
     for image in "$IMAGE_DIR/"*.img; do
         [[ -f $image && ! -L $image ]] || continue
         name=${image##*/}; name=${name%.img}
         valid_name "$name" || continue
-        if [[ $format == json ]]; then printf '%s' "$comma"; image_json "$image"; comma=,
-        else printf '%s\t%s\t%s MiB\n' "$name" "$(image_lifecycle "$image")" "$(image_size_mib "$image")"; fi
+        valid_images+=("$image")
+    done
+    if (( ${#valid_images[@]} )); then
+        mapfile -t stat_lines < <(stat -c '%s %b' -- "${valid_images[@]}") || return
+    fi
+    [[ $format != json ]] || printf '['
+    for image in "${valid_images[@]}"; do
+        name=${image##*/}; name=${name%.img}
+        read -r bytes blocks <<<"${stat_lines[$idx]:-0 0}"
+        idx=$((idx + 1))
+        if [[ $format == json ]]; then printf '%s' "$comma"; image_json "$image" "$bytes" "$blocks"; comma=,
+        else printf '%s\t%s\t%s MiB\n' "$name" "$(image_lifecycle "$image")" "$((bytes / 1048576))"; fi
     done
     [[ $format != json ]] || printf ']\n'
     return 0
@@ -700,12 +714,32 @@ image_details() {
         "$(metadata_value "$image" created_at 'unknown (legacy image)')" "$(metadata_value "$image" last_used_at never)" "$image"
 }
 workspace_summary() {
-    local image total=0 persistent=0 ephemeral=0 busy=0 bytes=0 snapshots=0 free=unknown
+    local image total=0 persistent=0 ephemeral=0 busy=0 bytes=0 snapshots=0 free=unknown lifecycle mkey mval blocks
+    local -a valid_images=() stat_lines=()
+    local idx=0
     for image in "$IMAGE_DIR/"*.img; do
         [[ -f $image && ! -L $image ]] || continue
-        total=$((total + 1)); bytes=$((bytes + $(allocated_bytes "$image")))
-        if [[ $(image_lifecycle "$image") == ephemeral ]]; then ephemeral=$((ephemeral + 1)); else persistent=$((persistent + 1)); fi
-        [[ $(image_status "$image") != busy ]] || busy=$((busy + 1))
+        valid_images+=("$image")
+    done
+    if (( ${#valid_images[@]} )); then
+        mapfile -t stat_lines < <(stat -c '%b' -- "${valid_images[@]}") || return
+    fi
+    for image in "${valid_images[@]}"; do
+        blocks=${stat_lines[$idx]:-0}; idx=$((idx + 1))
+        total=$((total + 1)); bytes=$((bytes + blocks * 512))
+        lifecycle=persistent
+        if [[ -f $image.meta && ! -L $image.meta ]]; then
+            while IFS='=' read -r mkey mval; do
+                [[ $mkey == lifecycle && -n $mval ]] && { lifecycle=$mval; break; }
+            done <"$image.meta"
+        elif [[ -f $image.mode && ! -L $image.mode ]]; then
+            read -r lifecycle <"$image.mode" || true
+        fi
+        valid_lifecycle "$lifecycle" || lifecycle=persistent
+        if [[ $lifecycle == ephemeral ]]; then ephemeral=$((ephemeral + 1)); else persistent=$((persistent + 1)); fi
+        if [[ -f $image.lock && ! -L $image.lock ]] && [[ $(image_status "$image") == busy ]]; then
+            busy=$((busy + 1))
+        fi
     done
     for image in "$SNAPSHOT_DIR/"*/*.img; do [[ ! -f $image || -L $image ]] || snapshots=$((snapshots + 1)); done
     if [[ -d $STORE_DIR ]]; then free=$(df -Ph "$STORE_DIR" | awk 'NR == 2 {print $4}'); fi
@@ -713,15 +747,39 @@ workspace_summary() {
     printf '%s in images   %s host free   %s snapshots\n' "$(human_bytes "$bytes")" "$free" "$snapshots"
 }
 dashboard() {
-    local image accent= reset=
+    local image name status lifecycle profile mkey mval snaps file bytes idx=0 accent= reset=
+    local -a valid_images=() stat_lines=()
     if [[ -t 1 && -z ${NO_COLOR:-} ]]; then accent=$'\033[1;36m'; reset=$'\033[0m'; fi
     printf '\n%sCHROOTABLE%s  /  Debian environment workbench  /  %s\n\n' "$accent" "$reset" "$APP_VERSION"
     workspace_summary
     printf '\n%-24s %-7s %-11s %-10s %-9s %s\n' WORKSPACE STATE MODE PROFILE CAPACITY SNAPSHOTS
     for image in "$IMAGE_DIR/"*.img; do
         [[ -f $image && ! -L $image ]] || continue
-        printf '%-24s %-7s %-11s %-10s %-9s %s\n' "$(basename "$image" .img)" "$(image_status "$image")" \
-            "$(image_lifecycle "$image")" "$(metadata_value "$image" profile minimal)" "$(image_size_mib "$image")M" "$(snapshot_count "$(basename "$image" .img)")"
+        valid_images+=("$image")
+    done
+    if (( ${#valid_images[@]} )); then
+        mapfile -t stat_lines < <(stat -c '%s' -- "${valid_images[@]}") || return
+    fi
+    for image in "${valid_images[@]}"; do
+        name=${image##*/}; name=${name%.img}
+        bytes=${stat_lines[$idx]:-0}; idx=$((idx + 1))
+        status=ready
+        if [[ -f $image.lock && ! -L $image.lock ]]; then status=$(image_status "$image"); fi
+        lifecycle=persistent; profile=minimal
+        if [[ -f $image.meta && ! -L $image.meta ]]; then
+            while IFS='=' read -r mkey mval; do
+                case $mkey in
+                    lifecycle) [[ -z $mval ]] || lifecycle=$mval ;;
+                    profile) [[ -z $mval ]] || profile=$mval ;;
+                esac
+            done <"$image.meta"
+        elif [[ -f $image.mode && ! -L $image.mode ]]; then
+            read -r lifecycle <"$image.mode" || true
+        fi
+        valid_lifecycle "$lifecycle" || lifecycle=persistent
+        snaps=0
+        for file in "$SNAPSHOT_DIR/$name/"*.img; do [[ -f $file && ! -L $file ]] && snaps=$((snaps + 1)); done
+        printf '%-24s %-7s %-11s %-10s %-9s %s\n' "$name" "$status" "$lifecycle" "$profile" "$((bytes / 1048576))M" "$snaps"
     done
     printf '\nStore: %s\n' "$STORE_DIR"
     if [[ -f $STORE_DIR/activity.tsv ]]; then printf '\nRecent activity\n'; activity 5; fi
@@ -734,15 +792,20 @@ activity() {
     else printf 'No operations recorded yet. Create a workspace to get started.\n'; fi
 }
 show_logs() {
-    local name=$1 log latest=
+    local name=$1 log latest= entry_time entry_action entry_name entry_status entry_log has_journal=0
+    local -A valid_logs=()
     valid_name "$name" || { fail "Invalid image name."; return 1; }
+    if [[ -f $STORE_DIR/activity.tsv ]]; then
+        has_journal=1
+        while IFS=$'\t' read -r entry_time entry_action entry_name entry_status entry_log; do
+            [[ $entry_name == "$name" && -n $entry_log ]] && valid_logs[$entry_log]=1
+        done <"$STORE_DIR/activity.tsv"
+    fi
     for log in "$LOG_DIR/$name-"*.log; do
         [[ -f $log && ! -L $log ]] || continue
         # Use the journal to avoid treating logs for "foo-bar" as logs for "foo".
-        [[ -f $STORE_DIR/activity.tsv ]] || { [[ -n $latest && ! $log -nt $latest ]] || latest=$log; continue; }
-        if awk -F '\t' -v name="$name" -v path="$log" '$3==name && $5==path {found=1} END {exit !found}' "$STORE_DIR/activity.tsv"; then
-            [[ -n $latest && ! $log -nt $latest ]] || latest=$log
-        fi
+        (( ! has_journal )) || [[ -n ${valid_logs[$log]:-} ]] || continue
+        [[ -n $latest && ! $log -nt $latest ]] || latest=$log
     done
     [[ -n $latest ]] || { printf 'No completed operation logs for %s yet.\n' "$name"; return; }
     printf 'Log: %s\n\n' "$latest"

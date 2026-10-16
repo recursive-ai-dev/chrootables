@@ -151,16 +151,29 @@ class Store:
         images = json.loads(result.stdout)
         image_names = {x["name"] for x in images}
         snapshots = []
-        for folder in sorted((self.path / "snapshots").glob("*")):
-            if folder.is_symlink() or not folder.is_dir() or not NAME_RE.fullmatch(folder.name):
-                continue
-            is_orphan = folder.name not in image_names
-            for image in sorted(folder.glob("*.img")):
-                if image.is_symlink() or not image.is_file() or not NAME_RE.fullmatch(image.stem):
-                    continue
-                meta = metadata(Path(str(image) + ".meta"))
-                snapshots.append({"name": folder.name, "label": image.stem, "size_mib": image.stat().st_size // 1048576,
-                                  "created_at": meta.get("snapshot_at", "unknown"), "orphan": is_orphan})
+        snapshots_root = self.path / "snapshots"
+        if snapshots_root.is_dir() and not snapshots_root.is_symlink():
+            with os.scandir(snapshots_root) as folder_entries:
+                folders = sorted(
+                    (e for e in folder_entries if not e.is_symlink() and e.is_dir(follow_symlinks=False) and NAME_RE.fullmatch(e.name)),
+                    key=lambda e: e.name,
+                )
+            for folder in folders:
+                is_orphan = folder.name not in image_names
+                with os.scandir(folder.path) as img_entries:
+                    imgs = sorted(
+                        (e for e in img_entries if e.name.endswith(".img") and not e.is_symlink() and e.is_file(follow_symlinks=False) and NAME_RE.fullmatch(e.name[:-4])),
+                        key=lambda e: e.name,
+                    )
+                for image in imgs:
+                    meta = metadata(Path(image.path + ".meta"))
+                    snapshots.append({
+                        "name": folder.name,
+                        "label": image.name[:-4],
+                        "size_mib": image.stat(follow_symlinks=False).st_size // 1048576,
+                        "created_at": meta.get("snapshot_at", "unknown"),
+                        "orphan": is_orphan,
+                    })
         activity = []
         try:
             for line in read_regular(self.path / "activity.tsv").splitlines()[-100:]:
@@ -182,10 +195,13 @@ class Store:
             path = Path(selected_log)
             if path.parent != self.path / "logs":
                 raise ValueError("Log is outside this workspace store.")
-            entries = [line.split("\t") for line in read_regular(self.path / "activity.tsv").splitlines()]
-            if not any(len(fields) == 5 and fields[2] == target and fields[4] == str(path) for fields in entries):
+            target_path = str(path)
+            if not any(
+                len(fields := line.split("\t")) == 5 and fields[2] == target and fields[4] == target_path
+                for line in read_regular(self.path / "activity.tsv").splitlines()
+            ):
                 raise ValueError("Log does not belong to the selected workspace operation.")
-            return "Log: " + str(path) + "\n\n" + read_regular(path)
+            return "Log: " + target_path + "\n\n" + read_regular(path)
         result = subprocess.run([str(MANAGER), "--logs", name(target)], env=self.environment(), capture_output=True, text=True, timeout=15)
         if result.returncode:
             raise RuntimeError(result.stderr.strip())
