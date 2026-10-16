@@ -1,0 +1,9 @@
+#!/usr/bin/env python3
+"""Launch the native Chrootables desktop application."""
+try:
+    from chrootables.app import main
+except ImportError as error:
+    import sys
+    print(f"Could not start Chrootables: {error}\nInstall PySide6: Fedora: sudo dnf install python3-pyside6\nOr use a virtual environment: python -m pip install -r requirements.txt", file=sys.stderr)
+    raise SystemExit(1)
+raise SystemExit(main())

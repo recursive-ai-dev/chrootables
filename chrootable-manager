@@ -3,14 +3,14 @@
 set -Eeuo pipefail
 
 APP_NAME="Chrootable Manager"
-APP_VERSION=2.0.0
+APP_VERSION=3.0.0
 SCRIPT_PATH=${BASH_SOURCE[0]}
 STORE_DIR=${CHROOTABLE_HOME:-/var/lib/chrootable-manager}
 DEBIAN_SUITE=${CHROOTABLE_DEBIAN_SUITE:-stable}
-DEBIAN_MIRROR=${CHROOTABLE_DEBIAN_MIRROR:-http://deb.debian.org/debian}
+DEBIAN_MIRROR=${CHROOTABLE_DEBIAN_MIRROR:-https://deb.debian.org/debian}
 NON_INTERACTIVE=1
 DEMO=0
-REQUIRED_COMMANDS=(awk basename chroot cp date dd debootstrap df dpkg du e2fsck flock
+REQUIRED_COMMANDS=(awk basename chmod chroot cp date dd debootstrap df dpkg du e2fsck flock gpgv
     gzip hostname install ip losetup mkdir mkfs.ext4 mktemp mount mountpoint mv readlink
     resize2fs rm rmdir stat tail tar truncate umount unshare whiptail)
 
@@ -123,8 +123,16 @@ snapshot_count() {
 }
 
 package_for_command() {
+    if command -v dnf >/dev/null 2>&1; then
+        case $1 in
+            whiptail) printf newt; return ;;
+            ip) printf iproute; return ;;
+            awk) printf gawk; return ;;
+            gpgv) printf gnupg2; return ;;
+        esac
+    fi
     case $1 in
-        whiptail|debootstrap|dpkg|hostname|tar|gzip) printf '%s' "$1" ;;
+        whiptail|debootstrap|dpkg|hostname|tar|gzip|gpgv) printf '%s' "$1" ;;
         mkfs.ext4|e2fsck|resize2fs) printf e2fsprogs ;;
         mount|umount|mountpoint|unshare|flock|losetup) printf util-linux ;;
         ip) printf iproute2 ;;
@@ -142,14 +150,25 @@ check_prerequisites() {
         package=$(package_for_command "$command"); existing=" ${packages[*]} "
         [[ $existing == *" $package "* ]] || packages+=("$package")
     done
+    if [[ ! -r /usr/share/keyrings/debian-archive-keyring.gpg ]]; then
+        if command -v dnf >/dev/null 2>&1; then packages+=(debian-keyring)
+        else packages+=(debian-archive-keyring); fi
+    fi
     if (( ${#packages[@]} )); then
         [[ ${CHROOTABLE_AUTO_INSTALL:-1} != 0 ]] || { fail "Missing packages: ${packages[*]}. Install them or run --setup with CHROOTABLE_AUTO_INSTALL=1."; return 1; }
-        command -v apt-get >/dev/null || { fail "Install these packages first: ${packages[*]}"; return 1; }
         info "Installing dependencies: ${packages[*]} (log: /var/log/chrootable-manager-dependencies.log)"
-        apt-get update >>/var/log/chrootable-manager-dependencies.log 2>&1 &&
-            DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}" >>/var/log/chrootable-manager-dependencies.log 2>&1 || {
-            fail "Dependency installation failed. See /var/log/chrootable-manager-dependencies.log"; return 1;
-        }
+        if command -v dnf >/dev/null 2>&1; then
+            dnf install -y "${packages[@]}" >>/var/log/chrootable-manager-dependencies.log 2>&1 || {
+                fail "Dependency installation failed. See /var/log/chrootable-manager-dependencies.log"; return 1;
+            }
+        elif command -v apt-get >/dev/null 2>&1; then
+            apt-get update >>/var/log/chrootable-manager-dependencies.log 2>&1 &&
+                DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}" >>/var/log/chrootable-manager-dependencies.log 2>&1 || {
+                fail "Dependency installation failed. See /var/log/chrootable-manager-dependencies.log"; return 1;
+            }
+        else
+            fail "Install these packages first: ${packages[*]}"; return 1
+        fi
     fi
 }
 init_store() {
@@ -414,8 +433,10 @@ list_snapshots() {
 }
 
 enter_chrootable() (
-    local image=$1 lifecycle=$2 network=$3 descriptor status=0 name
-    shift 3
+    local image=$1 lifecycle=$2 network=$3 share=$4 read_only=$5 descriptor status=0 name
+    shift 5
+    if [[ -n $share ]]; then canonicalize_shared_folder "$share" share || return; fi
+    [[ $read_only == 0 || ( $read_only == 1 && -n $share ) ]] || { fail "Read-only sharing requires a host folder."; return 1; }
     name=$(basename "$image" .img)
     lock_image "$image" descriptor || return
     assert_offline "$image" || return
@@ -423,7 +444,7 @@ enter_chrootable() (
     make_workdir || return
     local -a namespace=(--mount --uts --ipc --pid --fork --kill-child)
     [[ $network != isolated ]] || namespace+=(--net)
-    unshare "${namespace[@]}" "$SCRIPT_PATH" --worker enter "$image" "$WORK" "$name" "$lifecycle" "$network" "$@" || status=$?
+    unshare "${namespace[@]}" "$SCRIPT_PATH" --worker enter "$image" "$WORK" "$name" "$lifecycle" "$network" "$share" "$read_only" "$@" || status=$?
     # A worker marker distinguishes a guest command failure from mount failure.
     if [[ -f $WORK/started ]]; then
         metadata_set "$image" last_used_at "$(timestamp)" || return
@@ -437,6 +458,14 @@ worker_cleanup() {
     kill -TERM -1 2>/dev/null || true
     sleep 0.05 2>/dev/null || true
     kill -KILL -1 2>/dev/null || true
+    if [[ -n ${WORKER_SHARE_TARGET:-} ]]; then
+        if mountpoint -q "$WORKER_SHARE_TARGET"; then
+            umount -- "$WORKER_SHARE_TARGET" 2>/dev/null || cleanup_status=$?
+        fi
+        if [[ ${WORKER_SHARE_CREATED:-0} == 1 && ! -L $WORKER_SHARE_TARGET ]] && ! mountpoint -q "$WORKER_SHARE_TARGET"; then
+            rmdir -- "$WORKER_SHARE_TARGET" 2>/dev/null || true
+        fi
+    fi
     if mountpoint -q "$WORKER_ROOT/etc/resolv.conf"; then umount "$WORKER_ROOT/etc/resolv.conf" 2>/dev/null || true; fi
     if mountpoint -q "$WORKER_ROOT/dev/ptmx"; then umount "$WORKER_ROOT/dev/ptmx" 2>/dev/null || true; fi
     if mountpoint -q "$WORKER_ROOT/dev/pts"; then umount "$WORKER_ROOT/dev/pts" 2>/dev/null || true; fi
@@ -447,8 +476,8 @@ worker_cleanup() {
     exit "$status"
 }
 setup_resolv_conf() {
-    local work=$1 root=$2 target="$root/etc/resolv.conf" source_file=""
-    local dest="$work/resolv.conf"
+    local work=$1 root=$2 source_file=""
+    local target="$root/etc/resolv.conf" dest="$work/resolv.conf"
 
     if [[ -f /run/systemd/resolve/resolv.conf && -r /run/systemd/resolve/resolv.conf ]]; then
         source_file="/run/systemd/resolve/resolv.conf"
@@ -469,6 +498,10 @@ setup_resolv_conf() {
         printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' >"$dest"
     fi
 
+    # The manager uses umask 077, but apt downloads as the unprivileged _apt
+    # account. Its resolver must stay readable after being bound into the guest.
+    chmod 0644 "$dest" || return
+
     if [[ -d $root/etc ]]; then
         touch "$target" 2>/dev/null || true
         mount --bind "$dest" "$target" 2>/dev/null || true
@@ -486,11 +519,39 @@ mount_session_devices() {
     fi
     mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs "$WORKER_ROOT/run"
 }
+canonicalize_shared_folder() {
+    local original=$1 resolved
+    [[ $original == /* ]] || { fail "Shared folder must be an absolute host directory."; return 1; }
+    [[ $original != *$'\n'* && $original != *$'\r'* ]] || { fail "Shared folder paths cannot contain line breaks."; return 1; }
+    # NUL termination preserves every filename character, including newlines.
+    IFS= read -r -d '' resolved < <(readlink -ez -- "$original") || { fail "Shared folder does not exist: $original"; return 1; }
+    [[ $resolved != / && -d $resolved ]] || { fail "Shared folder must be an existing directory other than /."; return 1; }
+    [[ $resolved != *$'\n'* && $resolved != *$'\r'* ]] || { fail "Shared folder paths cannot contain line breaks."; return 1; }
+    printf -v "$2" '%s' "$resolved"
+}
+mount_shared_folder() {
+    local source=$1 read_only=$2 target="$WORKER_ROOT/shared"
+    [[ -n $source ]] || return 0
+    canonicalize_shared_folder "$source" source || return
+    # /shared is a direct child of the image root: never follow a guest symlink
+    # into the host namespace or replace a file already stored in the image.
+    [[ ! -L $target && ( ! -e $target || -d $target ) ]] || { fail "Guest /shared must be a directory, not a symlink or file."; return 1; }
+    WORKER_SHARE_CREATED=0
+    if [[ ! -d $target ]]; then
+        mkdir -- "$target" || return
+        WORKER_SHARE_CREATED=1
+    fi
+    WORKER_SHARE_TARGET=$target
+    # A plain bind excludes submounts within the source folder.
+    mount --bind -- "$source" "$target" || return
+    if [[ $read_only == 1 ]]; then mount -o remount,bind,ro -- "$target" || return; fi
+}
 worker_main() (
     local kind=$1 image=$2 work=$3
     shift 3
     require_root || return
     WORKER_ROOT="$work/root"; WORKER_LOWER="$work/lower"; WORKER_OVERLAY="$work/overlay"
+    WORKER_SHARE_TARGET=; WORKER_SHARE_CREATED=0
     trap worker_cleanup EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
@@ -500,7 +561,7 @@ worker_main() (
         create)
             local name=$1 arch=$2 profile=$3 packages
             mount -o loop "$image" "$WORKER_ROOT" || return
-            debootstrap --variant=minbase --arch="$arch" "$DEBIAN_SUITE" "$WORKER_ROOT" "$DEBIAN_MIRROR" || return
+            debootstrap --force-check-gpg --keyring=/usr/share/keyrings/debian-archive-keyring.gpg --variant=minbase --arch="$arch" "$DEBIAN_SUITE" "$WORKER_ROOT" "$DEBIAN_MIRROR" || return
             printf '%s\n' "$name" >"$WORKER_ROOT/etc/hostname" || return
             printf '127.0.0.1 localhost\n127.0.1.1 %s\n::1 localhost ip6-localhost ip6-loopback\n' "$name" >"$WORKER_ROOT/etc/hosts" || return
             packages=$(profile_packages "$profile") || return
@@ -519,8 +580,8 @@ worker_main() (
             tar --numeric-owner --acls --xattrs --one-file-system -C "$WORKER_ROOT" -czf "$1" . || return
             ;;
         enter)
-            local name=$1 lifecycle=$2 network=$3
-            shift 3
+            local name=$1 lifecycle=$2 network=$3 share=$4 read_only=$5
+            shift 5
             if [[ $lifecycle == ephemeral ]]; then
                 mkdir -p "$WORKER_LOWER" "$WORKER_OVERLAY" || return
                 mount -o loop,ro,noload "$image" "$WORKER_LOWER" || return
@@ -530,6 +591,7 @@ worker_main() (
             else
                 mount -o loop "$image" "$WORKER_ROOT" || return
             fi
+            mount_shared_folder "$share" "$read_only" || return
             if [[ $network == isolated ]]; then
                 ip link set lo up 2>/dev/null || ifconfig lo up 2>/dev/null || true
             else
@@ -541,7 +603,11 @@ worker_main() (
             # Scripts get exactly the command's stdout; the banner is shell-only.
             if (( $# == 0 )); then
                 info "[$name] $lifecycle session | network: $network"
-                [[ $lifecycle != ephemeral ]] || info "All filesystem changes in this session disappear on exit."
+                [[ $lifecycle != ephemeral ]] || info "Image filesystem changes in this session disappear on exit."
+                if [[ -n $share ]]; then
+                    info "Host folder: $share -> /shared"
+                    if [[ $read_only == 1 ]]; then info "/shared is read-only."; else info "Changes in /shared are saved on the host, including in disposable sessions."; fi
+                fi
                 set -- /bin/bash --login
             fi
             cd "$WORKER_ROOT" || return
@@ -668,6 +734,12 @@ doctor() {
         fi
     done
     (( missing != 0 )) || printf '[OK] Host commands are available.\n'
+    if [[ -r /usr/share/keyrings/debian-archive-keyring.gpg ]]; then
+        printf '[OK] Debian archive signing keys are available.\n'
+    else
+        printf '[MISSING] Debian archive signing keys; run --setup.\n'
+        missing=$((missing + 1))
+    fi
     for fs in ext4 overlay; do
         if awk -v fs="$fs" '$NF==fs {found=1} END {exit !found}' /proc/filesystems; then printf '[OK] Kernel filesystem: %s\n' "$fs"
         else printf '[INFO] %s is not loaded; it may be available as a kernel module.\n' "$fs"; fi
@@ -727,7 +799,7 @@ ui_session() {
     local image=$1 lifecycle=$2 network=$3 status=0
     if (( DEMO )); then ui_message "This preview never mounts an image.\n\nIn a real workspace, this opens a $lifecycle shell with $network networking. Exit returns you to this menu."; return; fi
     printf '\033[H\033[2J'
-    enter_chrootable "$image" "$lifecycle" "$network" || status=$?
+    enter_chrootable "$image" "$lifecycle" "$network" "" 0 || status=$?
     (( status == 0 )) || ui_message "The session exited with status $status.\n\nSee Recent log for operation details."
     return 0
 }
@@ -910,10 +982,12 @@ Explore (no root required when the store is readable)
 
 Create and use (root required)
   --create NAME SIZE_MIB persistent|ephemeral [PROFILE]
-  --enter NAME                     Open a root shell
-  --enter-isolated NAME            Open a shell without host network access
-  --exec NAME [--isolated] -- COMMAND [ARG...]
-  --try NAME [--isolated] [-- COMMAND [ARG...]]
+  --enter NAME [--share HOST_DIR] [--read-only]
+                                   Open a root shell
+  --enter-isolated NAME [--share HOST_DIR] [--read-only]
+                                   Open a shell without host network access
+  --exec NAME [--isolated] [--share HOST_DIR] [--read-only] -- COMMAND [ARG...]
+  --try NAME [--isolated] [--share HOST_DIR] [--read-only] [-- COMMAND [ARG...]]
                                    Disposable session, regardless of image mode
   --clone NAME NEW_NAME             Independent copy (reflink when available)
   --mode NAME persistent|ephemeral  Change the default session lifecycle
@@ -930,12 +1004,16 @@ Recovery and maintenance (root required)
 
 Profiles: minimal (default), build, python, network.
 Sizes are MiB, up to 1048576 (1 TiB). Creation fully allocates the image.
+Shared folders appear at /shared for that session. HOST_DIR must be an existing
+absolute directory other than /. Add --read-only to prevent ordinary writes.
+Host folder changes persist, including in disposable sessions.
 
 Examples
   sudo chrootable-manager --create compiler 4096 persistent build
   sudo chrootable-manager --snapshot compiler clean
   sudo chrootable-manager --try compiler -- bash -lc "apt-get update"
   sudo chrootable-manager --exec compiler -- gcc --version
+  sudo chrootable-manager --enter compiler --share /home/me/project
   sudo chrootable-manager --restore compiler clean --yes
 
 Configuration
@@ -945,15 +1023,35 @@ Configuration
   CHROOTABLE_AUTO_INSTALL=0         Fail instead of installing missing tools
 
 These are host-root development environments, not security sandboxes.
-Ephemeral sessions discard filesystem writes but still expose host devices.'
+Ephemeral sessions discard image writes but still expose host devices and any
+writable shared folder. Guest root can undo read-only mounts.'
 }
 usage_error() { fail "Invalid arguments. Run $0 --help for usage." || true; return 2; }
 validate_session_arguments() {
-    local operation=$1
+    local operation=$1 isolated_seen=0 share_seen=0 read_only_seen=0
+    SESSION_NETWORK=shared SESSION_SHARE= SESSION_READ_ONLY=0 SESSION_COMMAND=()
+    [[ $operation != --enter-isolated ]] || SESSION_NETWORK=isolated
     shift 2
-    [[ ${1:-} != --isolated ]] || shift
-    if (( $# == 0 )); then [[ $operation == --try ]]; return; fi
-    [[ $1 == -- && $# -ge 2 ]]
+    while (( $# )); do
+        case $1 in
+            --isolated)
+                [[ $operation == --exec || $operation == --try ]] && (( isolated_seen == 0 )) || return 1
+                isolated_seen=1; SESSION_NETWORK=isolated; shift ;;
+            --share)
+                (( share_seen == 0 && $# >= 2 )) || return 1
+                canonicalize_shared_folder "$2" SESSION_SHARE || return
+                share_seen=1; shift 2 ;;
+            --read-only)
+                (( read_only_seen == 0 )) || return 1
+                read_only_seen=1; SESSION_READ_ONLY=1; shift ;;
+            --)
+                [[ $operation == --exec || $operation == --try ]] && (( $# >= 2 )) || return 1
+                shift; SESSION_COMMAND=("$@"); break ;;
+            *) return 1 ;;
+        esac
+    done
+    (( read_only_seen == 0 || share_seen == 1 )) || return 1
+    [[ $operation != --exec ]] || (( ${#SESSION_COMMAND[@]} > 0 ))
 }
 validate_cli() {
     case ${1:-} in
@@ -961,19 +1059,19 @@ validate_cli() {
         --list) [[ $# == 1 || ( $# == 2 && $2 == --json ) ]] ;;
         --demo) [[ $# == 1 || ( $# == 2 && $2 == --dashboard ) ]] ;;
         --inspect) [[ $# == 2 || ( $# == 3 && $3 == --json ) ]] && valid_name "$2" ;;
-        --snapshots|--logs|--enter|--enter-isolated|--export) [[ $# == 2 ]] && valid_name "$2" ;;
+        --snapshots|--logs|--export) [[ $# == 2 ]] && valid_name "$2" ;;
         --create) [[ $# == 4 || $# == 5 ]] && valid_name "$2" && valid_size_mib "$3" && valid_lifecycle "$4" && valid_profile "${5:-minimal}" ;;
         --clone|--snapshot) [[ $# == 3 ]] && valid_name "$2" && valid_name "$3" ;;
         --mode) [[ $# == 3 ]] && valid_name "$2" && valid_lifecycle "$3" ;;
         --resize) [[ $# == 3 ]] && valid_name "$2" && valid_size_mib "$3" ;;
         --restore|--drop-snapshot) [[ $# == 4 && $4 == --yes ]] && valid_name "$2" && valid_name "$3" ;;
         --repair|--delete) [[ $# == 3 && $3 == --yes ]] && valid_name "$2" ;;
-        --exec|--try) [[ $# -ge 2 ]] && valid_name "$2" && validate_session_arguments "$@" ;;
+        --enter|--enter-isolated|--exec|--try) [[ $# -ge 2 ]] && valid_name "$2" && validate_session_arguments "$@" ;;
         *) return 1 ;;
     esac
 }
 run_cli() {
-    local image operation=$1 network=shared lifecycle
+    local image operation=$1 lifecycle
     case $operation in
         --help|-h) usage ;; --version) printf '%s\n' "$APP_VERSION" ;;
         --profiles) list_profiles ;; --doctor) doctor ;; --demo) run_demo "${2:-}" ;;
@@ -990,16 +1088,11 @@ run_cli() {
                 --clone) clone_image "$image" "$3" ;; --resize) resize_image "$image" "$3" ;;
                 --repair) repair_image "$image" ;; --delete) delete_image "$image" ;; --export) export_image "$image" ;;
                 --snapshot) snapshot_image "$image" "$3" ;; --mode) set_lifecycle "$image" "$3" ;;
-                --enter|--enter-isolated)
-                    [[ $operation != --enter-isolated ]] || network=isolated
-                    enter_chrootable "$image" "$(image_lifecycle "$image")" "$network" ;;
-                --exec|--try)
-                    shift 2
+                --enter|--enter-isolated|--exec|--try)
+                    validate_session_arguments "$@" || { usage_error; return 2; }
                     lifecycle=$(image_lifecycle "$image")
                     [[ $operation != --try ]] || lifecycle=ephemeral
-                    if [[ ${1:-} == --isolated ]]; then network=isolated; shift; fi
-                    [[ ${1:-} != -- ]] || shift
-                    enter_chrootable "$image" "$lifecycle" "$network" "$@" ;;
+                    enter_chrootable "$image" "$lifecycle" "$SESSION_NETWORK" "$SESSION_SHARE" "$SESSION_READ_ONLY" "${SESSION_COMMAND[@]}" ;;
             esac ;;
     esac
 }
