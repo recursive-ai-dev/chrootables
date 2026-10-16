@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+from functools import lru_cache
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -68,6 +69,7 @@ def byte_size(value):
     return capacity(round(value / 1048576))
 
 
+@lru_cache(maxsize=512)
 def when(value):
     if not value or value in ("unknown", "never"):
         return "Not yet" if value == "never" else "Unknown"
@@ -77,7 +79,14 @@ def when(value):
         return str(value)
 
 
+_GLYPH_CACHE = {}
+
+
 def glyph(kind="box", color="#a8edc9", size=40):
+    key = (kind, color, size)
+    cached = _GLYPH_CACHE.get(key)
+    if cached is not None and not cached.isNull():
+        return cached
     pixmap = QPixmap(size, size)
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
@@ -93,6 +102,7 @@ def glyph(kind="box", color="#a8edc9", size=40):
         painter.setFont(QFont("Noto Sans", int(size * .29), QFont.Weight.Bold))
         painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, kind)
     painter.end()
+    _GLYPH_CACHE[key] = pixmap
     return pixmap
 
 
@@ -214,21 +224,39 @@ class WorkspaceRow(QWidget):
         self.setStyleSheet("background: transparent;")
         layout = QHBoxLayout(self)
         layout.setContentsMargins(18, 15, 18, 15)
-        icon = label("")
-        profile = item.get("profile", "minimal")
-        icon.setPixmap(glyph({"python": "Py", "build": "C+", "network": "~"}.get(profile, "box"), size=44))
-        layout.addWidget(icon)
+        self.icon_label = label("")
+        layout.addWidget(self.icon_label)
         text, column = box(spacing=5)
-        column.addWidget(label(("★  " if favorite else "") + item["name"], "section"))
-        column.addWidget(label(f"Debian {item.get('suite', 'unknown')}  ·  {PROFILES.get(profile, (profile,))[0]}  ·  {capacity(item['size_mib'])}", "muted"))
+        self.title_label = label("", "section")
+        self.meta_label = label("", "muted")
+        column.addWidget(self.title_label)
+        column.addWidget(self.meta_label)
         layout.addWidget(text, 1)
         state, status = box(spacing=5)
-        busy = item["status"] == "busy"
-        status.addWidget(label("●  In use" if busy else "●  Ready", "badge"))
-        mode = label("Disposable" if item["lifecycle"] == "ephemeral" else "Persistent", "muted")
-        mode.setAlignment(Qt.AlignmentFlag.AlignRight)
-        status.addWidget(mode)
+        self.status_label = label("", "badge")
+        self.mode_label = label("", "muted")
+        self.mode_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        status.addWidget(self.status_label)
+        status.addWidget(self.mode_label)
         layout.addWidget(state)
+        self._state = None
+        self.update_row(item, favorite)
+
+    def update_row(self, item, favorite=False):
+        profile = item.get("profile", "minimal")
+        suite = item.get("suite", "unknown")
+        size_mib = item["size_mib"]
+        busy = item["status"] == "busy"
+        ephemeral = item["lifecycle"] == "ephemeral"
+        state = (item["name"], favorite, profile, suite, size_mib, busy, ephemeral)
+        if state == self._state:
+            return
+        self._state = state
+        self.icon_label.setPixmap(glyph({"python": "Py", "build": "C+", "network": "~"}.get(profile, "box"), size=44))
+        self.title_label.setText(("★  " if favorite else "") + item["name"])
+        self.meta_label.setText(f"Debian {suite}  ·  {PROFILES.get(profile, (profile,))[0]}  ·  {capacity(size_mib)}")
+        self.status_label.setText("●  In use" if busy else "●  Ready")
+        self.mode_label.setText("Disposable" if ephemeral else "Persistent")
 
 
 class Window(QMainWindow):
@@ -254,6 +282,8 @@ class Window(QMainWindow):
         self.health_ready = False
         self.store_locked = False
         self.current_view = 0
+        self._detail_state = None
+        self._render_signature = None
         self.client = Client(store, self)
         self.client.ready.connect(self.connected)
         self.client.disconnected.connect(self.disconnected)
@@ -318,6 +348,7 @@ class Window(QMainWindow):
         row.addWidget(headings, 1)
         self.refresh_button = button("↻", self.refresh)
         self.refresh_button.setToolTip("Refresh · F5")
+        self.refresh_button.setAccessibleName("Refresh workspaces")
         row.addWidget(self.refresh_button)
         self.new_button = button("＋  New workspace", self.create, "primary")
         row.addWidget(self.new_button)
@@ -387,10 +418,12 @@ class Window(QMainWindow):
         tools, row = box(horizontal=True)
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search workspaces, profiles or releases…")
+        self.search.setAccessibleName("Search workspaces")
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self.render_library)
         row.addWidget(self.search, 1)
         self.filter = QComboBox()
+        self.filter.setAccessibleName("Filter workspaces")
         self.filter.addItems(["All workspaces", "Persistent", "Disposable", "Favorites", "In use"])
         self.filter.currentIndexChanged.connect(self.render_library)
         row.addWidget(self.filter)
@@ -401,12 +434,14 @@ class Window(QMainWindow):
         self.splitter.setHandleWidth(16)
         self.workspaces = QListWidget()
         self.workspaces.setMinimumWidth(390)
+        self.workspaces.setUniformItemSizes(True)
         self.workspaces.currentItemChanged.connect(self.select_workspace)
         self.workspaces.itemDoubleClicked.connect(lambda _: self.open_terminal())
         self.splitter.addWidget(self.workspaces)
         self.details = QScrollArea()
         self.details.setWidgetResizable(True)
         self.details.setMinimumWidth(320)
+        self.build_detail_card()
         self.splitter.addWidget(self.details)
         self.splitter.setSizes([620, 350])
         self.library_stack.addWidget(self.splitter)
@@ -504,7 +539,7 @@ class Window(QMainWindow):
             widget.setText(text)
         for i, control in enumerate(self.nav):
             control.setChecked(i == index)
-        if index == 3:
+        if index == 3 and not self.health_output.toPlainText():
             self.check_health()
 
     def connected(self, writable):
@@ -543,10 +578,14 @@ class Window(QMainWindow):
         def done(ok, data):
             self.refreshing = False
             if ok:
+                was_locked = self.store_locked
                 self.store_locked = False
                 self.empty_create.setText("Create your first workspace")
+                signature = (data, self.busy, self.demo, was_locked)
                 self.data = data
-                self.render()
+                if signature != self._render_signature:
+                    self._render_signature = signature
+                    self.render()
                 self.status.setText(f"{len(data['images'])} workspaces  ·  {self.store}")
                 if self.client.writable and self.health_ready:
                     self.notice.hide()
@@ -579,7 +618,11 @@ class Window(QMainWindow):
         self.update_controls()
 
     def fill_table(self, table, rows):
+        if table.property("rendered_rows") == rows:
+            return
+        table.setProperty("rendered_rows", rows)
         selected = table.currentRow()
+        table.setUpdatesEnabled(False)
         table.setRowCount(len(rows))
         for r, row in enumerate(rows):
             for c, value in enumerate(row):
@@ -589,13 +632,106 @@ class Window(QMainWindow):
                 table.setItem(r, c, item)
         if rows and selected >= 0:
             table.selectRow(min(selected, len(rows) - 1))
+        table.setUpdatesEnabled(True)
+
+    def build_detail_card(self):
+        card = QFrame()
+        card.setObjectName("detail")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+        top, row = box(horizontal=True)
+        top.setStyleSheet("background: transparent;")
+        row.addWidget(label("WORKSPACE", "eyebrow"), 1)
+        self.favorite_button = button("☆", self.favorite, "quiet")
+        row.addWidget(self.favorite_button)
+        layout.addWidget(top)
+        self.detail_title = label("", "detailTitle", True)
+        layout.addWidget(self.detail_title)
+        self.detail_lifecycle = label("", "muted")
+        layout.addWidget(self.detail_lifecycle)
+        self.terminal_button = button("›_  Open terminal", self.open_terminal, "primary")
+        self.terminal_button.setToolTip("Open in your native terminal · Ctrl Return")
+        layout.addWidget(self.terminal_button)
+        self.offline = QCheckBox("Isolate network for this session")
+        self.offline.setToolTip("Only loopback is available; internet and host networking are disconnected.")
+        self.offline.toggled.connect(lambda checked: self.network_choices.__setitem__(self.selected, checked) if self.selected else None)
+        layout.addWidget(self.offline)
+        layout.addWidget(label("SHARED FOLDER · /shared", "eyebrow"))
+        self.share_path = QLineEdit()
+        self.share_path.setObjectName("sharedFolderPath")
+        self.share_path.setReadOnly(True)
+        self.share_path.setPlaceholderText("No host folder shared")
+        share_actions, share_row = box(horizontal=True, spacing=8)
+        self.share_choose = button("Choose…", self.choose_shared_folder)
+        self.share_choose.setToolTip("Choose a host folder to share at /shared.")
+        self.share_clear = button("Clear", self.clear_shared_folder)
+        share_row.addWidget(self.share_path, 1)
+        share_row.addWidget(self.share_choose)
+        layout.addWidget(share_actions)
+        self.share_read_only = QCheckBox("Read-only shared folder")
+        self.share_read_only.toggled.connect(lambda checked: self.set_shared_folder_read_only(self.selected, checked) if self.selected else None)
+        access, access_row = box(horizontal=True, spacing=8)
+        access_row.addWidget(self.share_read_only, 1)
+        access_row.addWidget(self.share_clear)
+        layout.addWidget(access)
+        layout.addWidget(label("Shared files stay on the host, even after a disposable session. New files belong to root.", "muted", True))
+        self.trial_button = button("Try a disposable session", lambda: self.open_terminal(disposable=True))
+        layout.addWidget(self.trial_button)
+        layout.addSpacing(2)
+        metadata = QWidget()
+        metadata.setStyleSheet("background: transparent;")
+        grid = QGridLayout(metadata)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(16)
+        self.meta_labels = {}
+        for title, r, c, span in [("DISTRIBUTION", 0, 0, 1), ("PROFILE", 0, 1, 1), ("STORAGE", 1, 0, 2), ("LAST SESSION", 2, 0, 1), ("RECOVERY", 2, 1, 1)]:
+            field, field_layout = box(spacing=4)
+            field.setStyleSheet("background: transparent;")
+            field_layout.addWidget(label(title, "eyebrow"))
+            val_label = label("", None, True)
+            self.meta_labels[title] = val_label
+            field_layout.addWidget(val_label)
+            grid.addWidget(field, r, c, 1, span)
+        layout.addWidget(metadata)
+        layout.addStretch()
+        actions, row = box(horizontal=True, spacing=8)
+        self.save_snapshot_button = button("Save snapshot", self.snapshot)
+        row.addWidget(self.save_snapshot_button, 1)
+        self.more_button = button("•••")
+        self.more_button.setToolTip("Clone, resize, export and maintenance")
+        self.more_button.setAccessibleName("More workspace actions")
+        menu = QMenu(self.more_button)
+        self.mutating_actions = []
+        self.mode_action = None
+        for title, callback in [("Clone workspace…", self.clone), ("Expand capacity…", self.resize_image),
+                                ("Switch to disposable", self.change_mode),
+                                ("Export filesystem archive…", self.export), ("View latest log", self.workspace_log),
+                                ("Copy image path", lambda: QApplication.clipboard().setText((self.selected_data() or {}).get("path", ""))),
+                                ("Check and repair…", self.repair), ("Delete workspace…", self.delete)]:
+            action = menu.addAction(title)
+            action.triggered.connect(callback)
+            if callback == self.change_mode:
+                self.mode_action = action
+            if title not in ("View latest log", "Copy image path"):
+                self.mutating_actions.append(action)
+        self.more_button.setMenu(menu)
+        row.addWidget(self.more_button)
+        layout.addWidget(actions)
+        self.detail_card = card
+        self.details.setWidget(card)
 
     def render_library(self):
         if self.store_locked:
             return
         query = self.search.text().casefold().strip()
         mode = self.filter.currentIndex()
-        images = [x for x in self.data["images"] if query in " ".join(str(x.get(k, "")) for k in ("name", "profile", "suite")).casefold()]
+        images = self.data["images"]
+        if query:
+            images = [x for x in images if query in f"{x.get('name', '')} {x.get('profile', '')} {x.get('suite', '')}".casefold()]
+        else:
+            images = list(images)
         if mode == 1:
             images = [x for x in images if x["lifecycle"] == "persistent"]
         elif mode == 2:
@@ -606,21 +742,47 @@ class Window(QMainWindow):
             images = [x for x in images if x["status"] == "busy"]
         images.sort(key=lambda x: (x["name"] not in self.favorites, x["name"].casefold()))
         selected = self.selected
+        self.workspaces.setUpdatesEnabled(False)
         self.workspaces.blockSignals(True)
-        self.workspaces.clear()
+        while self.workspaces.count() > len(images):
+            row = self.workspaces.count() - 1
+            old_item = self.workspaces.item(row)
+            old_widget = self.workspaces.itemWidget(old_item)
+            self.workspaces.takeItem(row)
+            if old_widget:
+                old_widget.deleteLater()
         selected_item = None
-        for data in images:
-            item = QListWidgetItem()
-            item.setData(Qt.ItemDataRole.UserRole, data)
-            item.setSizeHint(QSize(0, 93))
-            self.workspaces.addItem(item)
-            self.workspaces.setItemWidget(item, WorkspaceRow(data, data["name"] in self.favorites))
+        for index, data in enumerate(images):
+            fav = data["name"] in self.favorites
+            if index < self.workspaces.count():
+                item = self.workspaces.item(index)
+                item.setData(Qt.ItemDataRole.UserRole, data)
+                row_widget = self.workspaces.itemWidget(item)
+                if isinstance(row_widget, WorkspaceRow):
+                    row_widget.update_row(data, fav)
+                else:
+                    self.workspaces.setItemWidget(item, WorkspaceRow(data, fav))
+            else:
+                item = QListWidgetItem()
+                item.setData(Qt.ItemDataRole.UserRole, data)
+                item.setSizeHint(QSize(0, 93))
+                self.workspaces.addItem(item)
+                self.workspaces.setItemWidget(item, WorkspaceRow(data, fav))
+            item.setData(
+                Qt.ItemDataRole.AccessibleTextRole,
+                f"{data['name']}, Debian {data.get('suite', 'unknown')}, {data['status']}, {data['lifecycle']}",
+            )
             if data["name"] == selected:
                 selected_item = item
         self.workspaces.blockSignals(False)
+        self.workspaces.setUpdatesEnabled(True)
         self.library_stack.setCurrentIndex(0 if images else 1)
         if images:
-            self.workspaces.setCurrentItem(selected_item or self.workspaces.item(0))
+            target = selected_item or self.workspaces.item(0)
+            if self.workspaces.currentItem() is target:
+                self.select_workspace(target)
+            else:
+                self.workspaces.setCurrentItem(target)
         else:
             self.selected = None
             filtered = bool(self.data["images"])
@@ -632,101 +794,53 @@ class Window(QMainWindow):
         if item is None:
             return
         data = item.data(Qt.ItemDataRole.UserRole)
-        scroll_position = self.details.verticalScrollBar().value() if self.selected == data["name"] else 0
+        same_selection = self.selected == data["name"]
+        scroll_position = self.details.verticalScrollBar().value() if same_selection else 0
         self.selected = data["name"]
-        card = QFrame()
-        card.setObjectName("detail")
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(12)
-        top, row = box(horizontal=True)
-        top.setStyleSheet("background: transparent;")
-        row.addWidget(label("WORKSPACE", "eyebrow"), 1)
-        row.addWidget(button("★" if self.selected in self.favorites else "☆", self.favorite, "quiet"))
-        layout.addWidget(top)
-        layout.addWidget(label(self.selected, "detailTitle", True))
-        lifecycle = data["lifecycle"]
-        layout.addWidget(label("A fresh start, every session." if lifecycle == "ephemeral" else "Your changes stay with you.", "muted"))
-        self.terminal_button = button("›_  Open terminal", self.open_terminal, "primary")
-        self.terminal_button.setToolTip("Open in your native terminal · Ctrl Return")
-        self.terminal_button.setEnabled(data["status"] != "busy" and not self.busy and not self.demo)
-        layout.addWidget(self.terminal_button)
-        self.offline = QCheckBox("Isolate network for this session")
-        self.offline.setToolTip("Only loopback is available; internet and host networking are disconnected.")
-        self.offline.setChecked(self.network_choices.get(self.selected, False))
-        self.offline.toggled.connect(lambda checked, target=self.selected: self.network_choices.__setitem__(target, checked))
-        layout.addWidget(self.offline)
+        fav = self.selected in self.favorites
+        isolated = self.network_choices.get(self.selected, False)
         share, read_only = self.shared_folder_choice(self.selected)
-        layout.addWidget(label("SHARED FOLDER · /shared", "eyebrow"))
-        self.share_path = QLineEdit(share)
-        self.share_path.setObjectName("sharedFolderPath")
-        self.share_path.setReadOnly(True)
-        self.share_path.setPlaceholderText("No host folder shared")
-        self.share_path.setToolTip(share or "Choose a host folder to make it available at /shared.")
-        share_actions, share_row = box(horizontal=True, spacing=8)
-        self.share_choose = button("Choose…", self.choose_shared_folder)
-        self.share_choose.setToolTip("Choose a host folder to share at /shared.")
-        self.share_clear = button("Clear", self.clear_shared_folder)
         can_configure = not self.demo and not self.busy and data["status"] != "busy"
-        self.share_choose.setEnabled(can_configure)
-        self.share_clear.setEnabled(can_configure and bool(share))
-        share_row.addWidget(self.share_path, 1)
-        share_row.addWidget(self.share_choose)
-        layout.addWidget(share_actions)
-        self.share_read_only = QCheckBox("Read-only shared folder")
-        self.share_read_only.setChecked(read_only)
-        self.share_read_only.setEnabled(can_configure and bool(share))
-        self.share_read_only.toggled.connect(lambda checked, target=self.selected: self.set_shared_folder_read_only(target, checked))
-        access, access_row = box(horizontal=True, spacing=8)
-        access_row.addWidget(self.share_read_only, 1)
-        access_row.addWidget(self.share_clear)
-        layout.addWidget(access)
-        layout.addWidget(label("Shared files stay on the host, even after a disposable session. New files belong to root.", "muted", True))
-        trial = button("Try a disposable session", lambda: self.open_terminal(disposable=True))
-        trial.setEnabled(data["status"] != "busy" and not self.busy and not self.demo)
-        layout.addWidget(trial)
-        layout.addSpacing(2)
-        metadata = QWidget()
-        metadata.setStyleSheet("background: transparent;")
-        grid = QGridLayout(metadata)
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setHorizontalSpacing(12)
-        grid.setVerticalSpacing(16)
-        fields = [("DISTRIBUTION", f"Debian {data.get('suite', 'unknown')}", 0, 0, 1),
-                  ("PROFILE", PROFILES.get(data.get("profile"), (data.get("profile", "minimal"),))[0], 0, 1, 1),
-                  ("STORAGE", f"{capacity(data['size_mib'])} capacity · {byte_size(data['allocated_bytes'])} allocated", 1, 0, 2),
-                  ("LAST SESSION", when(data.get("last_used_at")), 2, 0, 1),
-                  ("RECOVERY", f"{data['snapshots']} snapshots", 2, 1, 1)]
-        for title, value, r, c, span in fields:
-            field, field_layout = box(spacing=4)
-            field.setStyleSheet("background: transparent;")
-            field_layout.addWidget(label(title, "eyebrow"))
-            field_layout.addWidget(label(value, None, True))
-            grid.addWidget(field, r, c, 1, span)
-        layout.addWidget(metadata)
-        layout.addStretch()
-        actions, row = box(horizontal=True, spacing=8)
-        save = button("Save snapshot", self.snapshot)
-        save.setEnabled(not self.busy and data["status"] != "busy" and not self.demo)
-        row.addWidget(save, 1)
-        more = button("•••")
-        more.setToolTip("Clone, resize, export and maintenance")
-        menu = QMenu(more)
-        for title, callback in [("Clone workspace…", self.clone), ("Expand capacity…", self.resize_image),
-                                ("Switch to " + ("persistent" if lifecycle == "ephemeral" else "disposable"), self.change_mode),
-                                ("Export filesystem archive…", self.export), ("View latest log", self.workspace_log),
-                                ("Copy image path", lambda: QApplication.clipboard().setText(data["path"])),
-                                ("Check and repair…", self.repair), ("Delete workspace…", self.delete)]:
-            action = menu.addAction(title)
-            action.triggered.connect(callback)
-            if title not in ("View latest log", "Copy image path"):
-                action.setEnabled(not self.busy and data["status"] != "busy" and not self.demo)
-        more.setMenu(menu)
-        row.addWidget(more)
-        layout.addWidget(actions)
-        self.details.setWidget(card)
-        QTimer.singleShot(0, lambda: self.details.verticalScrollBar().setValue(scroll_position)
-                          if self.details.widget() is card else None)
+        state = (
+            self.selected, data.get("status"), data.get("lifecycle"), data.get("suite"),
+            data.get("profile"), data.get("size_mib"), data.get("allocated_bytes"),
+            data.get("last_used_at"), data.get("snapshots"), data.get("path"),
+            fav, can_configure, isolated, share, read_only,
+        )
+        if state != self._detail_state:
+            self._detail_state = state
+            self.favorite_button.setText("★" if fav else "☆")
+            fav_label = "Remove from favorites" if fav else "Add to favorites"
+            self.favorite_button.setToolTip(fav_label)
+            self.favorite_button.setAccessibleName(fav_label)
+            self.detail_title.setText(self.selected)
+            lifecycle = data["lifecycle"]
+            self.detail_lifecycle.setText("A fresh start, every session." if lifecycle == "ephemeral" else "Your changes stay with you.")
+            self.terminal_button.setEnabled(can_configure)
+            self.offline.blockSignals(True)
+            self.offline.setChecked(isolated)
+            self.offline.blockSignals(False)
+            self.share_path.setText(share)
+            self.share_path.setToolTip(share or "Choose a host folder to make it available at /shared.")
+            self.share_choose.setEnabled(can_configure)
+            self.share_clear.setEnabled(can_configure and bool(share))
+            self.share_read_only.blockSignals(True)
+            self.share_read_only.setChecked(read_only)
+            self.share_read_only.blockSignals(False)
+            self.share_read_only.setEnabled(can_configure and bool(share))
+            self.trial_button.setEnabled(can_configure)
+            profile = data.get("profile", "minimal")
+            self.meta_labels["DISTRIBUTION"].setText(f"Debian {data.get('suite', 'unknown')}")
+            self.meta_labels["PROFILE"].setText(PROFILES.get(profile, (profile,))[0])
+            self.meta_labels["STORAGE"].setText(f"{capacity(data['size_mib'])} capacity · {byte_size(data['allocated_bytes'])} allocated")
+            self.meta_labels["LAST SESSION"].setText(when(data.get("last_used_at")))
+            self.meta_labels["RECOVERY"].setText(f"{data['snapshots']} snapshots")
+            self.save_snapshot_button.setEnabled(can_configure)
+            self.mode_action.setText("Switch to " + ("persistent" if lifecycle == "ephemeral" else "disposable"))
+            for action in self.mutating_actions:
+                action.setEnabled(can_configure)
+        if not same_selection or self.details.verticalScrollBar().value() != scroll_position:
+            self.details.verticalScrollBar().setValue(scroll_position)
 
     def selected_data(self):
         return next((x for x in self.data["images"] if x["name"] == self.selected), None)
@@ -763,12 +877,12 @@ class Window(QMainWindow):
                 self.show_error(str(error))
                 return
             self.save_shared_folder(target, path, read_only)
-            self.render_library()
+            self.select_workspace(self.workspaces.currentItem())
 
     def clear_shared_folder(self):
         if self.selected and not self.demo and not self.busy:
             self.save_shared_folder(self.selected, "")
-            self.render_library()
+            self.select_workspace(self.workspaces.currentItem())
 
     def set_shared_folder_read_only(self, target, checked):
         path, _ = self.shared_folder_choice(target)
@@ -898,7 +1012,8 @@ class Window(QMainWindow):
                 self.navigate(0)
             self.update_controls()
             self.refresh()
-            self.check_health()
+            if action == "setup" or not self.health_ready:
+                self.check_health()
         self.client.request(action, params, done)
 
     def update_controls(self):

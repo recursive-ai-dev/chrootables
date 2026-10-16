@@ -523,7 +523,7 @@ canonicalize_shared_folder() {
     local original=$1 resolved
     [[ $original == /* ]] || { fail "Shared folder must be an absolute host directory."; return 1; }
     [[ $original != *$'\n'* && $original != *$'\r'* ]] || { fail "Shared folder paths cannot contain line breaks."; return 1; }
-    # NUL termination preserves every filename character, including newlines.
+    # NUL termination prevents line breaks from being silently trimmed.
     IFS= read -r -d '' resolved < <(readlink -ez -- "$original") || { fail "Shared folder does not exist: $original"; return 1; }
     [[ $resolved != / && -d $resolved ]] || { fail "Shared folder must be an existing directory other than /."; return 1; }
     [[ $resolved != *$'\n'* && $resolved != *$'\r'* ]] || { fail "Shared folder paths cannot contain line breaks."; return 1; }
@@ -591,13 +591,13 @@ worker_main() (
             else
                 mount -o loop "$image" "$WORKER_ROOT" || return
             fi
-            mount_shared_folder "$share" "$read_only" || return
             if [[ $network == isolated ]]; then
                 ip link set lo up 2>/dev/null || ifconfig lo up 2>/dev/null || true
             else
                 setup_resolv_conf "$work" "$WORKER_ROOT"
             fi
             mount_session_devices || return
+            mount_shared_folder "$share" "$read_only" || return
             hostname "$name" || return
             printf 'started\n' >"$work/started" || return
             # Scripts get exactly the command's stdout; the banner is shell-only.
@@ -625,6 +625,10 @@ worker_main() (
 # JSON output needs no Python/jq dependency and never evaluates metadata.
 json_string() {
     local value=$1 character number i
+    if [[ $value != *[\"\\$'\001'-$'\037']* ]]; then
+        printf '"%s"' "$value"
+        return
+    fi
     printf '"'
     for ((i=0; i<${#value}; i++)); do
         character=${value:i:1}
@@ -637,28 +641,49 @@ json_string() {
     printf '"'
 }
 image_json() {
-    local image=$1 name key value comma=
-    name=$(basename "$image" .img)
+    local image=$1 name key value comma= status=ready lifecycle=persistent suite=unknown architecture=unknown
+    local profile=minimal created_at=unknown last_used_at=never origin=unknown mkey mval bytes=0 blocks=0 snaps=0 file
+    name=${image##*/}; name=${name%.img}
+    status=$(image_status "$image")
+    if [[ -f $image.meta && ! -L $image.meta ]]; then
+        while IFS='=' read -r mkey mval; do
+            case $mkey in
+                lifecycle) [[ -z $mval ]] || lifecycle=$mval ;;
+                suite) [[ -z $mval ]] || suite=$mval ;;
+                architecture) [[ -z $mval ]] || architecture=$mval ;;
+                profile) [[ -z $mval ]] || profile=$mval ;;
+                created_at) [[ -z $mval ]] || created_at=$mval ;;
+                last_used_at) [[ -z $mval ]] || last_used_at=$mval ;;
+                origin) [[ -z $mval ]] || origin=$mval ;;
+            esac
+        done <"$image.meta"
+    elif [[ -f $image.mode && ! -L $image.mode ]]; then
+        read -r lifecycle <"$image.mode" || true
+    fi
+    valid_lifecycle "$lifecycle" || lifecycle=persistent
+    read -r bytes blocks < <(stat -c '%s %b' -- "$image") || return
+    for file in "$SNAPSHOT_DIR/$name/"*.img; do [[ -f $file && ! -L $file ]] && snaps=$((snaps + 1)); done
     printf '{'
     for key in name path status lifecycle suite architecture profile created_at last_used_at origin; do
         case $key in
-            name) value=$name ;; path) value=$image ;; status) value=$(image_status "$image") ;;
-            lifecycle) value=$(image_lifecycle "$image") ;; profile) value=$(metadata_value "$image" "$key" minimal) ;;
-            last_used_at) value=$(metadata_value "$image" "$key" never) ;;
-            *) value=$(metadata_value "$image" "$key" unknown) ;;
+            name) value=$name ;; path) value=$image ;; status) value=$status ;;
+            lifecycle) value=$lifecycle ;; suite) value=$suite ;; architecture) value=$architecture ;;
+            profile) value=$profile ;; created_at) value=$created_at ;; last_used_at) value=$last_used_at ;;
+            origin) value=$origin ;;
         esac
         printf '%s"%s":' "$comma" "$key"; json_string "$value"; comma=,
     done
-    printf ',"size_mib":%s,"allocated_bytes":%s,"snapshots":%s}' "$(image_size_mib "$image")" "$(allocated_bytes "$image")" "$(snapshot_count "$name")"
+    printf ',"size_mib":%s,"allocated_bytes":%s,"snapshots":%s}' "$((bytes / 1048576))" "$((blocks * 512))" "$snaps"
 }
 list_images() {
-    local format=${1:-text} image comma=
+    local format=${1:-text} image name comma=
     [[ $format != json ]] || printf '['
     for image in "$IMAGE_DIR/"*.img; do
         [[ -f $image && ! -L $image ]] || continue
-        valid_name "$(basename "$image" .img)" || continue
+        name=${image##*/}; name=${name%.img}
+        valid_name "$name" || continue
         if [[ $format == json ]]; then printf '%s' "$comma"; image_json "$image"; comma=,
-        else printf '%s\t%s\t%s MiB\n' "$(basename "$image" .img)" "$(image_lifecycle "$image")" "$(image_size_mib "$image")"; fi
+        else printf '%s\t%s\t%s MiB\n' "$name" "$(image_lifecycle "$image")" "$(image_size_mib "$image")"; fi
     done
     [[ $format != json ]] || printf ']\n'
     return 0

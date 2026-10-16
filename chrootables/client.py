@@ -52,6 +52,16 @@ class Client(QObject):
         if process is not self.process:
             return
         self.buffer += bytes(process.readAllStandardOutput())
+        pending_id = None
+        pending_chunks = []
+
+        def flush_output():
+            nonlocal pending_id, pending_chunks
+            if pending_chunks:
+                self.output.emit(pending_id, "".join(pending_chunks))
+                pending_id = None
+                pending_chunks = []
+
         while b"\n" in self.buffer:
             line, self.buffer = self.buffer.split(b"\n", 1)
             try:
@@ -60,16 +70,24 @@ class Client(QObject):
                 continue
             if not isinstance(message, dict):
                 continue
-            if message.get("event") == "ready":
+            event = message.get("event")
+            if event == "output":
+                msg_id = message.get("id")
+                if pending_chunks and pending_id != msg_id:
+                    flush_output()
+                pending_id = msg_id
+                pending_chunks.append(message.get("text", ""))
+                continue
+            flush_output()
+            if event == "ready":
                 self.writable = message["writable"]
                 self.is_ready = True
                 self.ready.emit(self.writable)
-            elif message.get("event") == "output":
-                self.output.emit(message["id"], message["text"])
-            elif message.get("event") == "result":
+            elif event == "result":
                 callback = self.callbacks.pop(message.get("id"), None)
                 if callback:
                     callback(message["ok"], message.get("data") if message["ok"] else BackendError(message.get("error"), message.get("code")))
+        flush_output()
 
     def request(self, action, params, callback):
         if not self.is_ready:

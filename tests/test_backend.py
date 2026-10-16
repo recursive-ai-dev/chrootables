@@ -53,6 +53,16 @@ class ValidationTests(unittest.TestCase):
             alias = Path(directory) / "alias"
             alias.symlink_to(folder, target_is_directory=True)
             self.assertEqual(shared_folder(str(alias)), str(folder))
+            alias.unlink()
+            alias.symlink_to("/", target_is_directory=True)
+            with self.assertRaises(ValueError):
+                shared_folder(str(alias))
+            alias.unlink()
+            unusual = Path(directory) / "project\nfiles"
+            unusual.mkdir()
+            alias.symlink_to(unusual, target_is_directory=True)
+            with self.assertRaises(ValueError):
+                shared_folder(str(alias))
 
     def test_shared_folder_rejects_invalid_or_unavailable_paths(self):
         with tempfile.TemporaryDirectory() as directory:

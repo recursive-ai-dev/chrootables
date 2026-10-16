@@ -65,6 +65,25 @@ class DesktopTests(unittest.TestCase):
         self.assertEqual(self.window.selected, "python-playground")
         self.assertTrue(self.window.offline.isChecked())
 
+    def test_workspace_details_keep_scroll_on_refresh_and_reset_on_selection(self):
+        self.window.resize(1180, 780)
+        self.app.processEvents()
+        scroll = self.window.details.verticalScrollBar()
+        self.assertGreater(scroll.maximum(), 0)
+        scroll.setValue(scroll.maximum())
+        position = scroll.value()
+        self.window.render_library()
+        self.app.processEvents()
+        self.assertEqual(scroll.value(), position)
+        for row in range(self.window.workspaces.count()):
+            item = self.window.workspaces.item(row)
+            if item.data(Qt.ItemDataRole.UserRole)["name"] == "clean-slate":
+                self.window.workspaces.setCurrentItem(item)
+                break
+        self.app.processEvents()
+        self.assertEqual(self.window.selected, "clean-slate")
+        self.assertEqual(scroll.value(), 0)
+
     def enable_shared_folder_controls(self, window=None):
         window = window or self.window
         window.demo = False
@@ -247,6 +266,35 @@ class DesktopTests(unittest.TestCase):
         self.assertEqual(window.empty_create.text(), "Unlock workspace store")
         window.search.setText("something")
         self.assertEqual(window.empty_title.text(), "Unlock your workspace library.")
+
+    def test_widget_reuse_and_accessibility_metadata(self):
+        detail_widget = self.window.details.widget()
+        first_item = self.window.workspaces.item(0)
+        first_row = self.window.workspaces.itemWidget(first_item)
+        self.window.render()
+        self.assertIs(self.window.details.widget(), detail_widget)
+        self.assertIs(self.window.workspaces.itemWidget(self.window.workspaces.item(0)), first_row)
+        self.assertIn("build-studio", first_item.data(Qt.ItemDataRole.AccessibleTextRole))
+        self.assertIn("python-playground", self.window.workspaces.currentItem().data(Qt.ItemDataRole.AccessibleTextRole))
+        self.assertEqual(self.window.search.accessibleName(), "Search workspaces")
+        self.assertEqual(self.window.filter.accessibleName(), "Filter workspaces")
+        self.assertEqual(self.window.refresh_button.accessibleName(), "Refresh workspaces")
+        self.assertTrue(self.window.favorite_button.accessibleName())
+
+    def test_client_coalesces_batched_output_before_result(self):
+        from unittest.mock import MagicMock
+        events = []
+        self.window.client.output.connect(lambda ident, text: events.append(("output", ident, text)))
+        self.window.client.callbacks[7] = lambda ok, data: events.append(("result", ok, data))
+        proc = MagicMock()
+        proc.readAllStandardOutput.return_value = (
+            b'{"id":7,"event":"output","text":"line 1\\n"}\n'
+            b'{"id":7,"event":"output","text":"line 2\\n"}\n'
+            b'{"id":7,"event":"result","ok":true,"data":{"exit_code":0}}\n'
+        )
+        self.window.client.process = proc
+        self.window.client.read(proc)
+        self.assertEqual(events, [("output", 7, "line 1\nline 2\n"), ("result", True, {"exit_code": 0})])
 
 
 if __name__ == "__main__":

@@ -149,16 +149,18 @@ class Store:
         if result.returncode:
             raise PermissionError(result.stderr.strip() or "Cannot read the workspace store.")
         images = json.loads(result.stdout)
+        image_names = {x["name"] for x in images}
         snapshots = []
         for folder in sorted((self.path / "snapshots").glob("*")):
             if folder.is_symlink() or not folder.is_dir() or not NAME_RE.fullmatch(folder.name):
                 continue
+            is_orphan = folder.name not in image_names
             for image in sorted(folder.glob("*.img")):
                 if image.is_symlink() or not image.is_file() or not NAME_RE.fullmatch(image.stem):
                     continue
                 meta = metadata(Path(str(image) + ".meta"))
                 snapshots.append({"name": folder.name, "label": image.stem, "size_mib": image.stat().st_size // 1048576,
-                                  "created_at": meta.get("snapshot_at", "unknown"), "orphan": folder.name not in {x["name"] for x in images}})
+                                  "created_at": meta.get("snapshot_at", "unknown"), "orphan": is_orphan})
         activity = []
         try:
             for line in read_regular(self.path / "activity.tsv").splitlines()[-100:]:
@@ -210,6 +212,7 @@ class Store:
         reader = threading.Thread(target=drain, daemon=True)
         reader.start()
         offsets = {}
+        stats = {}
         def tail():
             candidates = list((self.path / "logs").glob("*.log"))
             if action == "setup":
@@ -219,6 +222,10 @@ class Store:
                     info = log.lstat()
                     if not stat.S_ISREG(info.st_mode) or info.st_mtime < started:
                         continue
+                    sig = (info.st_mtime_ns, info.st_size)
+                    if stats.get(log) == sig:
+                        continue
+                    stats[log] = sig
                     data = read_regular(log)
                     previous = offsets.get(log, "")
                     if data != previous:
@@ -255,6 +262,8 @@ def shared_folder(value):
         raise ValueError("Shared folder is unavailable. Choose an existing host folder.") from error
     if path == Path("/"):
         raise ValueError("Choose a folder other than the host filesystem root.")
+    if any(c in str(path) for c in "\r\n"):
+        raise ValueError("Shared folder paths cannot contain line breaks.")
     return str(path)
 
 

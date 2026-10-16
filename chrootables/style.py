@@ -18,6 +18,7 @@ QFrame#notice { background: #29271e; border: 1px solid #49422e; border-radius: 8
 QFrame#notice QWidget { background: transparent; }
 QPushButton { background: #232e30; border: 1px solid #354244; border-radius: 7px; padding: 9px 14px; font-weight: 500; }
 QPushButton:hover { background: #2c3c3c; border-color: #5c7770; }
+QPushButton:focus { border-color: #a8edc9; }
 QPushButton:pressed { background: #314844; }
 QPushButton:disabled { color: #5e6c67; background: #1a2325; border-color: #263133; }
 QPushButton#primary { background: #a8edc9; color: #10281c; border: 1px solid #a8edc9; font-weight: 700; }

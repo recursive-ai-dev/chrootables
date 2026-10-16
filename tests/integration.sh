@@ -6,12 +6,15 @@ manager_source="$(readlink -f "$(dirname "$0")/../chrootable-manager")"
 test_root="$(mktemp -d /tmp/chrootable-manager-test.XXXXXX)"
 manager_path="$test_root/chrootable-manager"
 inspect_mount="$test_root/inspect"
+shared_dir="$test_root/shared host; [project],data"
+shared_nested="$shared_dir/nested"
 
 [[ $EUID -eq 0 ]] || { printf 'Run this test as root.\n' >&2; exit 1; }
 
 cleanup() {
     local status=$?
     mountpoint -q "$inspect_mount" && umount "$inspect_mount" || true
+    mountpoint -q "$shared_nested" && umount "$shared_nested" || true
     if (( status != 0 )); then
         printf 'Integration failure; operation logs follow.\n' >&2
         tail -n 35 "$test_root/store/logs/"*.log >&2 || true
@@ -51,9 +54,63 @@ test "$("$manager_path" --snapshots persistent-test | wc -l)" -eq 2
 "$manager_path" --exec persistent-test -- test ! -e /disposable-marker
 "$manager_path" --exec persistent-test --isolated -- /bin/sh -c 'test "$(ls /sys 2>/dev/null | wc -l)" -eq 0; ! grep -q eth /proc/net/dev'
 
+# Shared host files outlive every image lifecycle. The unusual path also checks
+# that shell metacharacters and spaces stay literal throughout the worker call.
+mkdir -p "$shared_nested"
+printf host-original >"$shared_dir/host-marker"
+"$manager_path" --exec persistent-test --share "$shared_dir" -- /bin/sh -ec 'test "$(cat /shared/host-marker)" = host-original; printf persistent > /shared/persistent-write'
+test "$(cat "$shared_dir/persistent-write")" = persistent
+"$manager_path" --exec persistent-test -- test ! -e /shared
+"$manager_path" --try persistent-test --share "$shared_dir" -- /bin/sh -ec 'printf disposable > /shared/disposable-write; touch /disposable-shared-marker'
+test "$(cat "$shared_dir/disposable-write")" = disposable
+"$manager_path" --exec persistent-test -- /bin/sh -ec 'test ! -e /shared; test ! -e /disposable-shared-marker'
+
+"$manager_path" --exec persistent-test --read-only --share "$shared_dir" -- /bin/sh -ec 'test "$(cat /shared/host-marker)" = host-original; ! touch /shared/readonly-write 2>/dev/null; ! printf changed > /shared/host-marker'
+test ! -e "$shared_dir/readonly-write"
+test "$(cat "$shared_dir/host-marker")" = host-original
+printf outside-writable >"$shared_dir/outside-write"
+"$manager_path" --try persistent-test --read-only --share "$shared_dir" --isolated -- /bin/sh -ec 'test -f /shared/host-marker; ! touch /shared/isolated-readonly-write 2>/dev/null; ! grep -q eth /proc/net/dev'
+test ! -e "$shared_dir/isolated-readonly-write"
+
+# Nested host mounts are excluded by a plain bind, including with read-only sharing.
+printf underlying >"$shared_nested/underlying-file"
+mount -t tmpfs -o size=1m,nosuid,nodev tmpfs "$shared_nested"
+touch "$shared_nested/nested-mount-file"
+"$manager_path" --exec persistent-test --share "$shared_dir" --read-only -- /bin/sh -ec 'test -f /shared/nested/underlying-file; test ! -e /shared/nested/nested-mount-file; ! touch /shared/nested/write 2>/dev/null'
+umount "$shared_nested"
+
+# Guest failures still detach the share and retain the guest exit status.
+guest_status=0
+"$manager_path" --exec persistent-test --share "$shared_dir" -- /bin/sh -ec 'exit 17' || guest_status=$?
+test "$guest_status" -eq 17
+"$manager_path" --exec persistent-test -- test ! -e /shared
+test -z "$(losetup -j "$CHROOTABLE_HOME/images/persistent-test.img")"
+
+# A pre-existing directory and its guest files reappear after the share exits.
+"$manager_path" --exec persistent-test -- /bin/sh -ec 'mkdir /shared; printf guest-data > /shared/guest-file'
+"$manager_path" --exec persistent-test --share "$shared_dir" -- test ! -e /shared/guest-file
+"$manager_path" --exec persistent-test -- /bin/sh -ec 'test "$(cat /shared/guest-file)" = guest-data; rm /shared/guest-file; rmdir /shared'
+
+# A file or symlink at /shared must never redirect a mount into the host.
+"$manager_path" --exec persistent-test -- /bin/sh -ec 'printf guest-file > /shared'
+if "$manager_path" --exec persistent-test --share "$shared_dir" -- touch /shared/unsafe; then
+    printf 'A guest file at /shared was accepted.\n' >&2; exit 1
+fi
+"$manager_path" --exec persistent-test -- /bin/sh -ec 'test "$(cat /shared)" = guest-file; rm /shared'
+mkdir "$test_root/escape-target"
+"$manager_path" --exec persistent-test -- /bin/sh -ec 'ln -s "$1" /shared' sh "$test_root/escape-target"
+if "$manager_path" --exec persistent-test --share "$shared_dir" -- touch /shared/unsafe; then
+    printf 'A guest symlink at /shared was accepted.\n' >&2; exit 1
+fi
+test ! -e "$test_root/escape-target/unsafe"
+"$manager_path" --exec persistent-test -- rm /shared
+
 "$manager_path" --clone persistent-test ephemeral-test
 "$manager_path" --mode ephemeral-test ephemeral
 "$manager_path" --exec ephemeral-test -- touch /ephemeral-marker
+"$manager_path" --exec ephemeral-test --share "$shared_dir" -- /bin/sh -ec 'printf ephemeral > /shared/ephemeral-write; touch /ephemeral-shared-marker'
+test "$(cat "$shared_dir/ephemeral-write")" = ephemeral
+"$manager_path" --exec ephemeral-test -- /bin/sh -ec 'test ! -e /shared; test ! -e /ephemeral-shared-marker'
 mount -o loop,ro "$CHROOTABLE_HOME/images/ephemeral-test.img" "$inspect_mount"
 test ! -e "$inspect_mount/ephemeral-marker"
 umount "$inspect_mount"
