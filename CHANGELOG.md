@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- New workspace profiles: `rust` (rustc, cargo), `go` (golang-go), and `web`
+  (Node.js, npm), available in both the CLI and the desktop create dialog.
 - Host dependency auto-install now supports Arch (`pacman`) and openSUSE
   (`zypper`) alongside `dnf` and `apt-get`, with distro-specific package
   name mappings. The dependency log path is overridable with

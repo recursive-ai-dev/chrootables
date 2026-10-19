@@ -29,7 +29,7 @@ valid_size_mib() {
     [[ $1 =~ ^[1-9][0-9]*$ ]] && { (( ${#1} < 7 )) || { (( ${#1} == 7 )) && [[ $1 < 1048577 ]]; }; }
 }
 valid_lifecycle() { [[ $1 == persistent || $1 == ephemeral ]]; }
-valid_profile() { [[ $1 == minimal || $1 == build || $1 == python || $1 == network ]]; }
+valid_profile() { [[ $1 == minimal || $1 == build || $1 == python || $1 == network || $1 == rust || $1 == go || $1 == web ]]; }
 valid_suite() { [[ $1 =~ ^[a-z0-9][a-z0-9.-]{0,31}$ ]]; }
 valid_mirror() { [[ $1 =~ ^https://[A-Za-z0-9._-]+(:[0-9]+)?(/[A-Za-z0-9._/-]*)?$ ]]; }
 timestamp() { date --iso-8601=seconds; }
@@ -296,6 +296,9 @@ profile_packages() {
         build) printf 'build-essential git ca-certificates curl pkg-config' ;;
         python) printf 'python3 python3-venv python3-pip git ca-certificates curl' ;;
         network) printf 'iproute2 iputils-ping dnsutils curl ca-certificates openssh-client' ;;
+        rust) printf 'rustc cargo git ca-certificates curl pkg-config' ;;
+        go) printf 'golang-go git ca-certificates curl' ;;
+        web) printf 'nodejs npm git ca-certificates curl' ;;
         *) return 1 ;;
     esac
 }
@@ -304,7 +307,10 @@ list_profiles() {
     printf '%-12s %-9s %s\n' minimal '2 GiB' 'Debian minbase; a clean starting point' \
         build '4 GiB' 'C/C++ toolchain, make, Git, curl, pkg-config' \
         python '4 GiB' 'Python 3, venv, pip, Git, curl' \
-        network '2 GiB' 'iproute2, ping, DNS tools, curl, SSH client'
+        network '2 GiB' 'iproute2, ping, DNS tools, curl, SSH client' \
+        rust '6 GiB' 'Rust toolchain, cargo, Git, curl, pkg-config' \
+        go '6 GiB' 'Go toolchain, Git, curl' \
+        web '4 GiB' 'Node.js, npm, Git, curl'
 }
 
 allocate_image() {

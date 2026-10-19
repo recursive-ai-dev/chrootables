@@ -21,6 +21,9 @@ PROFILES = {
     "build": ("Build studio", "C / C++, make, Git, curl and pkg-config.", 4),
     "python": ("Python lab", "Python 3, virtual environments, pip and Git.", 4),
     "network": ("Network toolkit", "DNS tools, ping, curl and an SSH client.", 2),
+    "rust": ("Rust studio", "Rust toolchain, cargo and Git.", 6),
+    "go": ("Go studio", "Go toolchain and Git.", 6),
+    "web": ("Web lab", "Node.js, npm and Git.", 4),
 }
 NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 MUTATIONS = {"create", "clone", "snapshot", "restore", "drop-snapshot", "resize", "mode", "repair", "delete", "export", "setup"}

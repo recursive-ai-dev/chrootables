@@ -173,6 +173,20 @@ check_prerequisites
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Install these packages first:", result.stderr)
 
+    def test_new_profiles_are_valid_listed_and_installable(self):
+        for profile in ("rust", "go", "web"):
+            with self.subTest(profile=profile):
+                result = self.bash(f'''
+if ! valid_profile {profile}; then printf 'invalid profile\n' >&2; exit 1; fi
+packages=$(profile_packages {profile}) || {{ printf 'no packages\n' >&2; exit 1; }}
+[[ -n $packages ]] || {{ printf 'empty package list\n' >&2; exit 1; }}
+''')
+                self.assertEqual(result.returncode, 0, result.stderr)
+        listing = self.bash("list_profiles")
+        self.assertEqual(listing.returncode, 0, listing.stderr)
+        for profile in ("rust", "go", "web"):
+            self.assertIn(profile, listing.stdout)
+
     def test_operation_cleanup_removes_resolver_artifacts_and_preserves_status(self):
         for status in (0, 17):
             with self.subTest(status=status):

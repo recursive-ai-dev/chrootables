@@ -11,7 +11,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock, patch
 
-from chrootables.backend import Store, build_command, name, read_regular, shared_folder, terminal_command, deliver_export, MANAGER
+from chrootables.backend import Store, build_command, name, read_regular, shared_folder, terminal_command, deliver_export, MANAGER, PROFILES
 from chrootables.broker import serve
 
 
@@ -38,6 +38,12 @@ class ValidationTests(unittest.TestCase):
         for field, value in [("suite", "x;id"), ("profile", "untrusted"), ("lifecycle", "other"), ("size_mib", True), ("size_mib", 0), ("size_mib", 1048577), ("size_mib", "4096")]:
             with self.subTest(field=field, value=value), self.assertRaises(ValueError):
                 build_command("create", {**base, field: value})
+
+    def test_all_advertised_profiles_are_accepted_for_create(self):
+        for profile in PROFILES:
+            with self.subTest(profile=profile):
+                args, _ = build_command("create", {"name": "lab", "size_mib": 4096, "profile": profile})
+                self.assertEqual(args[-1], profile)
 
     def test_unknown_operations_rejected(self):
         for action in ("exec", "worker", "bash", "--help"):

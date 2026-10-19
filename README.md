@@ -37,7 +37,7 @@ For a clearly labeled, read-only tour with sample data:
 
 - Search and filter workspaces by profile, release, lifecycle, favorites, or usage.
 - Create Debian 13 (Trixie) or Debian 12 (Bookworm) images from minimal, C/C++,
-  Python, and networking profiles.
+  Python, networking, Rust, Go, and web (Node.js) profiles.
 - Open a shell in Konsole, GNOME Terminal, or xterm. Choose a disposable session
   without changing the image's default lifecycle, and optionally isolate networking.
 - Share a host folder at `/shared`, optionally read-only. The desktop remembers
@@ -60,7 +60,7 @@ use your native terminal's complete terminal emulation.
 |---|---|---|
 | Host distro | Fedora, Debian, Ubuntu; Arch and openSUSE best-effort | Auto-install uses `dnf`, `apt-get`, `pacman`, or `zypper`; other distros must install the prerequisites manually |
 | Host runtime | Python 3.10+, PySide6 6.8+ | CI runs the test suite on `fedora:latest` and `debian:trixie` |
-| Guest images | Debian 13 (Trixie), Debian 12 (Bookworm) | minimal, C/C++, Python, and networking profiles |
+| Guest images | Debian 13 (Trixie), Debian 12 (Bookworm) | minimal, C/C++, Python, networking, Rust, Go, and web (Node.js) profiles |
 | Architecture | x86_64 | ARM64 is on the roadmap but not yet verified |
 
 ## First run and administrator access
