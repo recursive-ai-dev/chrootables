@@ -391,8 +391,9 @@ def shared_folder(value):
     return str(path)
 
 
-def terminal_command(target, store=DEFAULT_STORE, *, disposable=False, isolated=False,
-                     share=None, read_only=False):
+def session_command(target, store=DEFAULT_STORE, *, disposable=False, isolated=False,
+                    share=None, read_only=False):
+    """The validated sudo argv that starts a workspace session."""
     target = name(target)
     if not isinstance(read_only, bool):
         raise ValueError("Read-only must be true or false.")
@@ -406,6 +407,13 @@ def terminal_command(target, store=DEFAULT_STORE, *, disposable=False, isolated=
         command += ["--share", shared_folder(share)]
         if read_only:
             command.append("--read-only")
+    return command
+
+
+def terminal_command(target, store=DEFAULT_STORE, *, disposable=False, isolated=False,
+                     share=None, read_only=False):
+    command = session_command(target, store, disposable=disposable, isolated=isolated,
+                              share=share, read_only=read_only)
     if shutil.which("konsole"):
         return ["konsole", "--separate", "--hold", "-p", "tabtitle=" + target, "-e"] + command
     if shutil.which("gnome-terminal"):

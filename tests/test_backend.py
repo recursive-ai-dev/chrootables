@@ -11,7 +11,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock, patch
 
-from chrootables.backend import Store, build_command, name, read_regular, shared_folder, terminal_command, deliver_export, MANAGER, PROFILES
+from chrootables.backend import Store, build_command, name, read_regular, shared_folder, session_command, terminal_command, deliver_export, MANAGER, PROFILES
 from chrootables.broker import serve
 
 
@@ -55,6 +55,15 @@ class ValidationTests(unittest.TestCase):
             result = terminal_command("lab", Path("/var/lib/a store"), disposable=True, isolated=True)
         self.assertEqual(result[-3:], ["--try", "lab", "--isolated"])
         self.assertIn("CHROOTABLE_HOME=/var/lib/a store", result)
+
+    def test_session_command_is_the_core_of_external_terminals(self):
+        keyword = dict(disposable=True, isolated=True)
+        with patch("chrootables.backend.shutil.which", return_value="/usr/bin/konsole"):
+            wrapped = terminal_command("lab", Path("/var/lib/a store"), **keyword)
+        core = session_command("lab", Path("/var/lib/a store"), **keyword)
+        self.assertEqual(wrapped[wrapped.index(str(MANAGER)):], core[core.index(str(MANAGER)):])
+        self.assertEqual(core[:3], ["sudo", "/usr/bin/env", "CHROOTABLE_AUTO_INSTALL=0"])
+        self.assertIn("CHROOTABLE_HOME=/var/lib/a store", core)
 
     def test_shared_folder_resolves_directory_aliases(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -170,9 +170,8 @@ class DesktopTests(unittest.TestCase):
         self.window.save_shared_folder("python-playground", folder, True)
         self.window.render_library()
         self.window.offline.setChecked(True)
-        with patch("chrootables.app.terminal_command", return_value=["terminal", "argument"]) as command, \
-                patch("chrootables.app.QProcess.startDetached", return_value=(True, 123)) as start, \
-                patch("chrootables.app.QTimer.singleShot"):
+        with patch("chrootables.app.session_command", return_value=["session", "command"]) as command, \
+                patch("chrootables.app.TerminalWindow") as window:
             for disposable in (False, True):
                 with self.subTest(disposable=disposable):
                     self.window.open_terminal(disposable=disposable)
@@ -182,17 +181,19 @@ class DesktopTests(unittest.TestCase):
             self.window.open_terminal()
             command.assert_called_with("python-playground", self.window.store, disposable=False,
                                        isolated=True, share=None, read_only=False)
-        self.assertEqual(start.call_count, 3)
+        self.assertEqual(window.call_count, 3)
 
     def test_unavailable_saved_folder_prevents_terminal_launch(self):
         self.enable_shared_folder_controls()
         folder = self.shared_directory()
         self.window.save_shared_folder("python-playground", folder)
         Path(folder).rmdir()
-        with patch("chrootables.app.QProcess.startDetached") as start, \
+        with patch("chrootables.app.session_command", side_effect=ValueError("missing folder")) as command, \
+                patch("chrootables.app.TerminalWindow") as window, \
                 patch.object(self.window, "show_error") as show_error:
             self.window.open_terminal()
-        start.assert_not_called()
+        command.assert_called_once()
+        window.assert_not_called()
         show_error.assert_called_once()
         self.assertEqual(self.window.shared_folder_choice("python-playground"), (folder, False))
 

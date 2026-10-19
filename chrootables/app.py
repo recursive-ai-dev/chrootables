@@ -20,9 +20,10 @@ from PySide6.QtWidgets import (
     QProgressBar, QMenu, QFileDialog,
 )
 from . import __version__
-from .backend import DEFAULT_STORE, ROOT, PROFILES, name, shared_folder, terminal_command
+from .backend import DEFAULT_STORE, ROOT, PROFILES, name, shared_folder, session_command, terminal_command
 from .client import Client
 from .style import STYLE
+from .terminal import TerminalWindow
 
 
 def label(text, role=None, wrap=False):
@@ -284,6 +285,7 @@ class Window(QMainWindow):
         self.current_view = 0
         self._detail_state = None
         self._render_signature = None
+        self.terminals = []
         self.client = Client(store, self)
         self.client.ready.connect(self.connected)
         self.client.disconnected.connect(self.disconnected)
@@ -1052,15 +1054,25 @@ class Window(QMainWindow):
             return
         try:
             share, read_only = self.shared_folder_choice(self.selected)
-            command = terminal_command(self.selected, self.store, disposable=disposable, isolated=self.offline.isChecked(),
-                                       share=share or None, read_only=read_only)
-            started, pid = QProcess.startDetached(command[0], command[1:])
+            keyword = dict(disposable=disposable, isolated=self.offline.isChecked(),
+                           share=share or None, read_only=read_only)
+            command = session_command(self.selected, self.store, **keyword)
+        except ValueError as error:
+            self.show_error(str(error))
+            return
+
+        def open_external():
+            external = terminal_command(self.selected, self.store, **keyword)
+            started, _ = QProcess.startDetached(external[0], external[1:])
             if not started:
                 raise RuntimeError("Could not start the terminal.")
-            self.status.setText("Terminal opened. Administrator authentication happens in the terminal.")
-            QTimer.singleShot(1500, self.refresh)
-        except (ValueError, RuntimeError) as error:
-            self.show_error(str(error))
+
+        window = TerminalWindow(command, f"Chrootables · {self.selected}", external=open_external)
+        self.terminals.append(window)
+        window.finished.connect(lambda: self.terminals.remove(window))
+        window.show()
+        self.status.setText("Embedded terminal opened. Administrator authentication happens in the terminal.")
+        QTimer.singleShot(1500, self.refresh)
 
     def check_health(self):
         if self.demo or not self.client.is_ready:
