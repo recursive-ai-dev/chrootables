@@ -10,7 +10,7 @@ DEBIAN_SUITE=${CHROOTABLE_DEBIAN_SUITE:-stable}
 DEBIAN_MIRROR=${CHROOTABLE_DEBIAN_MIRROR:-https://deb.debian.org/debian}
 NON_INTERACTIVE=1
 DEMO=0
-REQUIRED_COMMANDS=(awk basename chmod chroot cp date dd debootstrap df dpkg du e2fsck flock gpgv
+REQUIRED_COMMANDS=(awk basename chmod chroot cp date dd debootstrap df dpkg du e2fsck find flock gpgv
     gzip hostname install ip losetup mkdir mkfs.ext4 mktemp mount mountpoint mv readlink
     resize2fs rm rmdir sha256sum stat tail tar truncate umount unshare wget whiptail xz)
 
@@ -19,6 +19,7 @@ configure_paths() {
     LOG_DIR="$STORE_DIR/logs"
     EXPORT_DIR="$STORE_DIR/exports"
     SNAPSHOT_DIR="$STORE_DIR/snapshots"
+    ARCHIVE_DIR="$STORE_DIR/archive"
 }
 configure_paths
 
@@ -30,6 +31,13 @@ valid_size_mib() {
 }
 valid_lifecycle() { [[ $1 == persistent || $1 == ephemeral ]]; }
 valid_profile() { [[ $1 == minimal || $1 == build || $1 == python || $1 == network || $1 == rust || $1 == go || $1 == web ]]; }
+valid_profiles() {
+    local profile
+    for profile in "$@"; do
+        valid_profile "$profile" || return 1
+    done
+    return 0
+}
 valid_suite() { [[ $1 =~ ^[a-z0-9][a-z0-9.-]{0,31}$ ]]; }
 valid_mirror() { [[ $1 =~ ^https://[A-Za-z0-9._-]+(:[0-9]+)?(/[A-Za-z0-9._/-]*)?$ ]]; }
 timestamp() { date --iso-8601=seconds; }
@@ -179,6 +187,7 @@ package_for_command() {
         xz) printf xz-utils ;;
         mkfs.ext4|e2fsck|resize2fs) printf e2fsprogs ;;
         mount|umount|mountpoint|unshare|flock|losetup) printf util-linux ;;
+        find) printf findutils ;;
         ip) printf iproute2 ;;
         awk) printf mawk ;;
         *) printf coreutils ;;
@@ -268,6 +277,7 @@ begin_operation() {
 finish_operation() {
     local status=$?
     if [[ -n ${PENDING:-} ]]; then rm -f -- "$PENDING" "$PENDING.meta" || true; fi
+    if [[ -n ${ARCHIVE_STAGING:-} ]]; then rm -rf --one-file-system -- "$ARCHIVE_STAGING" || true; fi
     if [[ -n ${WORK:-} ]]; then
         rm -f -- "$WORK/started" "$WORK/resolv.conf" "$WORK/resolv.conf.tmp" || true
         rmdir "$WORK/root" "$WORK/lower" "$WORK/overlay" "$WORK" 2>/dev/null || true
@@ -311,6 +321,108 @@ list_profiles() {
         rust '6 GiB' 'Rust toolchain, cargo, Git, curl, pkg-config' \
         go '6 GiB' 'Go toolchain, Git, curl' \
         web '4 GiB' 'Node.js, npm, Git, curl'
+}
+
+# -- Offline package archive -----------------------------------------------
+#
+# --archive-sync downloads everything a create needs into
+# $ARCHIVE_DIR/<suite>-<arch>: a debootstrap --make-tarball of the minbase
+# system, the Debian-signed apt lists it was resolved against, and the profile
+# debs. Creates for that suite then run without a network. apt verifies each
+# deb against the copied lists, so no store-local signing key is needed.
+
+archive_path() { printf '%s/%s-%s' "$ARCHIVE_DIR" "$1" "$2"; }
+archive_has_profile() {
+    local archive=$1 profile=$2
+    [[ ${CHROOTABLE_ARCHIVE:-1} != 0 && -s $archive/base.tgz && -s $archive/mirror ]] || return 1
+    [[ $profile == minimal ]] || grep -qx -- "$profile" "$archive/profiles" 2>/dev/null
+}
+archive_sync() (
+    # Rebuilds the suite's archive as a whole so the lists, base tarball and
+    # debs always come from a single resolution.
+    local suite=$1 arch archive profile
+    shift
+    local -a profiles=("$@")
+    require_root || return
+    valid_suite "$suite" || { fail "Invalid Debian suite: $suite"; return 1; }
+    valid_mirror "$DEBIAN_MIRROR" || { fail "Debian mirror must be an https:// URL: $DEBIAN_MIRROR"; return 1; }
+    (( ${#profiles[@]} )) || profiles=(build python network rust go web)
+    for profile in "${profiles[@]}"; do
+        valid_profile "$profile" || { fail "Unknown profile: $profile. See --profiles."; return 1; }
+    done
+    init_store || return
+    [[ ! -L $ARCHIVE_DIR ]] || { fail "Store subdirectories must not be symlinks: $ARCHIVE_DIR"; return 1; }
+    [[ -d $ARCHIVE_DIR ]] || install -d -m 0700 "$ARCHIVE_DIR" || return
+    arch=$(dpkg --print-architecture) || return
+    archive=$(archive_path "$suite" "$arch")
+    begin_operation archive "$suite" || return
+    make_workdir || return
+    ARCHIVE_STAGING=$(mktemp -d "$ARCHIVE_DIR/.$suite-$arch.XXXXXX") || return
+    info "Downloading Debian $suite ($arch) packages for: minimal ${profiles[*]}. Log: $OP_LOG"
+    mkdir -p "$ARCHIVE_STAGING/scratch" "$ARCHIVE_STAGING/debs" "$ARCHIVE_STAGING/lists" || return
+    # apt downloads as _apt, which must be able to traverse the scratch root.
+    chmod 0755 "$ARCHIVE_STAGING/scratch" || return
+    run_worker archive "$ARCHIVE_STAGING/scratch" "$WORK" "$suite" "$arch" "$ARCHIVE_STAGING" "${profiles[@]}" >>"$OP_LOG" 2>&1 || return
+    rm -rf --one-file-system -- "$ARCHIVE_STAGING/scratch" || return
+    printf '%s\n' "$DEBIAN_MIRROR" >"$ARCHIVE_STAGING/mirror" || return
+    printf '%s\n' "${profiles[@]}" >"$ARCHIVE_STAGING/profiles" || return
+    if [[ -e $archive ]]; then
+        mv -T -- "$archive" "$ARCHIVE_STAGING.old" || return
+    fi
+    mv -T -- "$ARCHIVE_STAGING" "$archive" || return
+    ARCHIVE_STAGING="$ARCHIVE_STAGING.old"
+    rm -rf --one-file-system -- "$ARCHIVE_STAGING" || return
+    ARCHIVE_STAGING=
+    info "Archive ready: $archive ($(du -sh -- "$archive" | cut -f1)). Creates for $suite now work offline."
+)
+archive_worker() {
+    # Runs inside run_worker's namespaces; WORKER_ROOT is a bind of the scratch
+    # directory so worker_cleanup unmounts everything beneath it.
+    local scratch=$1 suite=$2 arch=$3 staging=$4 profile
+    shift 4
+    local -a package_list=()
+    mount --bind "$scratch" "$WORKER_ROOT" || return
+    SHA_SIZE=256 debootstrap --force-check-gpg --keyring=/usr/share/keyrings/debian-archive-keyring.gpg \
+        --variant=minbase --arch="$arch" --make-tarball="$staging/base.tgz" \
+        "$suite" "$staging/tarball-work" "$DEBIAN_MIRROR" || return
+    rm -rf --one-file-system -- "$staging/tarball-work" || return
+    # Unpack the tarball just written: this proves it bootstraps, and resolves
+    # profile dependencies against exactly the base a create will have.
+    debootstrap --variant=minbase --arch="$arch" --unpack-tarball="$staging/base.tgz" "$suite" "$WORKER_ROOT" || return
+    printf 'deb %s %s main\n' "$DEBIAN_MIRROR" "$suite" >"$WORKER_ROOT/etc/apt/sources.list" || return
+    setup_resolv_conf "$work" "$WORKER_ROOT"
+    mount_session_devices || return
+    chroot "$WORKER_ROOT" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get update || return
+    for profile in "$@"; do
+        read -r -a package_list <<<"$(profile_packages "$profile")"
+        (( ${#package_list[@]} )) || continue
+        chroot "$WORKER_ROOT" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get \
+            --download-only -y --no-install-recommends install "${package_list[@]}" || {
+            fail "Downloading profile $profile failed."; return 1;
+        }
+    done
+    find "$WORKER_ROOT/var/cache/apt/archives" -maxdepth 1 -type f -name '*.deb' \
+        -exec cp -p -t "$staging/debs" -- {} + || return
+    find "$WORKER_ROOT/var/lib/apt/lists" -maxdepth 1 -type f ! -name lock \
+        -exec cp -p -t "$staging/lists" -- {} + || return
+}
+archive_install_profile() {
+    # Offline profile install: Debian-signed lists from the archive, debs read
+    # through an overlay so apt's lock and partial files never touch the store.
+    local archive=$1 mirror
+    shift
+    mirror=$(<"$archive/mirror") || return
+    valid_mirror "$mirror" || { fail "Archive records an invalid mirror."; return 1; }
+    # Lists are only used when sources.list names the mirror they came from.
+    printf 'deb %s %s main\n' "$mirror" "$DEBIAN_SUITE" >"$WORKER_ROOT/etc/apt/sources.list" || return
+    find "$archive/lists" -maxdepth 1 -type f -exec cp -p -t "$WORKER_ROOT/var/lib/apt/lists" -- {} + || return
+    mkdir -p "$WORKER_OVERLAY/upper" "$WORKER_OVERLAY/work" || return
+    mount -t overlay overlay -o "lowerdir=$archive/debs,upperdir=$WORKER_OVERLAY/upper,workdir=$WORKER_OVERLAY/work" \
+        "$WORKER_ROOT/var/cache/apt/archives" || return
+    chroot "$WORKER_ROOT" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get \
+        --no-download -y --no-install-recommends install "$@" || return
+    umount "$WORKER_ROOT/var/cache/apt/archives" || return
+    printf 'deb %s %s main\n' "$DEBIAN_MIRROR" "$DEBIAN_SUITE" >"$WORKER_ROOT/etc/apt/sources.list"
 }
 
 allocate_image() {
@@ -648,23 +760,40 @@ worker_main() (
     mkdir -p "$WORKER_ROOT" || return
     case $kind in
         create)
-            local name=$1 arch=$2 profile=$3 packages
+            local name=$1 arch=$2 profile=$3 packages archive offline=0
             valid_suite "$DEBIAN_SUITE" && valid_mirror "$DEBIAN_MIRROR" || { fail "Invalid Debian suite or mirror."; return 1; }
+            archive=$(archive_path "$DEBIAN_SUITE" "$arch")
             mount -o loop "$image" "$WORKER_ROOT" || return
-            SHA_SIZE=256 debootstrap --force-check-gpg --keyring=/usr/share/keyrings/debian-archive-keyring.gpg --variant=minbase --arch="$arch" "$DEBIAN_SUITE" "$WORKER_ROOT" "$DEBIAN_MIRROR" || return
+            if archive_has_profile "$archive" minimal; then
+                info "Bootstrapping from the offline archive: $archive"
+                debootstrap --variant=minbase --arch="$arch" --unpack-tarball="$archive/base.tgz" "$DEBIAN_SUITE" "$WORKER_ROOT" || return
+                ! archive_has_profile "$archive" "$profile" || offline=1
+            else
+                SHA_SIZE=256 debootstrap --force-check-gpg --keyring=/usr/share/keyrings/debian-archive-keyring.gpg --variant=minbase --arch="$arch" "$DEBIAN_SUITE" "$WORKER_ROOT" "$DEBIAN_MIRROR" || return
+            fi
+            printf 'deb %s %s main\n' "$DEBIAN_MIRROR" "$DEBIAN_SUITE" >"$WORKER_ROOT/etc/apt/sources.list" || return
             printf '%s\n' "$name" >"$WORKER_ROOT/etc/hostname" || return
             printf '127.0.0.1 localhost\n127.0.1.1 %s\n::1 localhost ip6-localhost ip6-loopback\n' "$name" >"$WORKER_ROOT/etc/hosts" || return
             packages=$(profile_packages "$profile") || return
             if [[ -n $packages ]]; then
-                setup_resolv_conf "$work" "$WORKER_ROOT"
-                mount_session_devices || return
                 local -a package_list=()
                 read -r -a package_list <<<"$packages"
-                chroot "$WORKER_ROOT" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get update || return
-                chroot "$WORKER_ROOT" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${package_list[@]}" || return
+                if (( offline )); then
+                    info "Installing the $profile profile from the offline archive."
+                    mount_session_devices || return
+                    mkdir -p "$WORKER_OVERLAY" || return
+                    mount -t tmpfs -o mode=0700,nosuid,nodev tmpfs "$WORKER_OVERLAY" || return
+                    archive_install_profile "$archive" "${package_list[@]}" || return
+                else
+                    setup_resolv_conf "$work" "$WORKER_ROOT"
+                    mount_session_devices || return
+                    chroot "$WORKER_ROOT" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get update || return
+                    chroot "$WORKER_ROOT" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${package_list[@]}" || return
+                fi
             fi
             chroot "$WORKER_ROOT" apt-get clean || return
             ;;
+        archive) archive_worker "$image" "$@" || return ;;
         export)
             mount -o loop,ro,noload "$image" "$WORKER_ROOT" || return
             tar --numeric-owner --acls --xattrs --one-file-system -C "$WORKER_ROOT" -czf "$1" . || return
@@ -1197,6 +1326,10 @@ Explore (no root required when the store is readable)
 
 Create and use (root required)
   --create NAME SIZE_MIB persistent|ephemeral [PROFILE]
+  --archive-sync SUITE [PROFILE...]
+                                   Download everything creates of SUITE need
+                                   (all profiles by default) so they work
+                                   offline; rerun to refresh
   --enter NAME [--share HOST_DIR] [--read-only] [--restricted-dev]
                                    Open a root shell
   --enter-isolated NAME [--share HOST_DIR] [--read-only] [--restricted-dev]
@@ -1280,6 +1413,7 @@ validate_cli() {
         --inspect) [[ $# == 2 || ( $# == 3 && $3 == --json ) ]] && valid_name "$2" ;;
         --snapshots|--logs|--export) [[ $# == 2 ]] && valid_name "$2" ;;
         --create) [[ $# == 4 || $# == 5 ]] && valid_name "$2" && valid_size_mib "$3" && valid_lifecycle "$4" && valid_profile "${5:-minimal}" ;;
+        --archive-sync) [[ $# -ge 2 ]] && valid_suite "$2" && valid_profiles "${@:3}" ;;
         --clone|--snapshot) [[ $# == 3 ]] && valid_name "$2" && valid_name "$3" ;;
         --mode) [[ $# == 3 ]] && valid_name "$2" && valid_lifecycle "$3" ;;
         --resize) [[ $# == 3 ]] && valid_name "$2" && valid_size_mib "$3" ;;
@@ -1297,6 +1431,7 @@ run_cli() {
         --dashboard) dashboard ;; --list) list_images "${2:+json}" ;;
         --activity) activity ;; --logs) show_logs "$2" ;; --snapshots) list_snapshots "$2" ;;
         --setup) info "All host dependencies are available." ;;
+        --archive-sync) shift; archive_sync "$@" ;;
         --create) create_image "$2" "$3" "$4" "${5:-minimal}" ;;
         --restore) restore_image "$2" "$3" ;;
         --drop-snapshot) drop_snapshot "$2" "$3" ;;

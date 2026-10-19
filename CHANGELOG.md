@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Offline creation: `--archive-sync SUITE [PROFILE...]` downloads the
+  minbase system (as a debootstrap tarball), the Debian-signed apt lists, and
+  every profile deb into `archive/` in the store. Creates for that suite then
+  bootstrap and install profiles with no network; profiles not synced still
+  fall back to the mirror. Set `CHROOTABLE_ARCHIVE=0` to bypass the archive.
 - Embedded terminal: workspace sessions now open in a pty-backed terminal
   pane inside the desktop window, with an option to hand the session to an
   external terminal. Covers a compact VT/ANSI subset (cursor addressing,

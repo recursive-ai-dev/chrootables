@@ -237,6 +237,32 @@ exit "$2"
                 self.assertIn("\tfailed\t" if status else "\tok\t",
                               (self.store / "activity.tsv").read_text())
 
+    def test_archive_covers_only_synced_profiles(self):
+        archive = self.store / "archive/trixie-amd64"
+        archive.mkdir(parents=True)
+        (archive / "base.tgz").write_bytes(b"tarball")
+        (archive / "mirror").write_text("https://deb.debian.org/debian\n")
+        (archive / "profiles").write_text("build\ngo\n")
+        result = self.bash('''
+for profile in minimal build go python; do
+    if archive_has_profile "$(archive_path trixie amd64)" "$profile"; then echo "$profile yes"; else echo "$profile no"; fi
+done
+CHROOTABLE_ARCHIVE=0 archive_has_profile "$(archive_path trixie amd64)" build || echo disabled
+archive_has_profile "$(archive_path bookworm amd64)" minimal || echo missing
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(),
+                         ["minimal yes", "build yes", "go yes", "python no", "disabled", "missing"])
+
+    def test_archive_sync_arguments_are_validated(self):
+        for arguments, valid in ((["--archive-sync", "trixie"], True),
+                                 (["--archive-sync", "trixie", "build", "web"], True),
+                                 (["--archive-sync"], False),
+                                 (["--archive-sync", "../etc"], False),
+                                 (["--archive-sync", "trixie", "bogus"], False)):
+            result = self.bash('validate_cli "$@"', *arguments)
+            self.assertEqual(result.returncode == 0, valid, arguments)
+
 
 if __name__ == "__main__":
     unittest.main()

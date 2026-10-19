@@ -99,6 +99,7 @@ The default store is `/var/lib/chrootable-manager`:
 images/       ext4 .img files and adjacent metadata
 snapshots/    offline recovery images, grouped by workspace
 exports/      compressed filesystem archives
+archive/      optional offline package archives (--archive-sync)
 logs/         operation diagnostics
 activity.tsv  completed operation history
 ```
@@ -135,7 +136,25 @@ more devices.
 Debian bootstrap uses HTTPS and explicitly requires Release signature verification
 against the installed Debian archive keyring. Chrootables does not depend on cpak's
 signed application catalog. Distribution packages still need network access, valid
-archive keys, and a working Debian mirror.
+archive keys, and a working Debian mirror, unless an offline archive is synced.
+
+### Offline creation
+
+```bash
+sudo ./chrootable-manager --archive-sync trixie            # all profiles
+sudo ./chrootable-manager --archive-sync bookworm build go  # selected profiles
+```
+
+This verifies and downloads, while online, everything a create needs into
+`archive/<suite>-<arch>/` in the store: a debootstrap tarball of the minbase
+system, the Debian-signed apt lists, and every profile deb. After that, creates
+for that suite run without network access. Synced profiles are installed with
+`apt-get --no-download`, so each deb is still checked against the signed
+lists. Profiles that were not synced still download from the mirror. Run the
+command again to refresh the archive, and set `CHROOTABLE_ARCHIVE=0` to skip
+it. Sync the suite name you create with (the desktop uses `trixie` and
+`bookworm`; the CLI default is `stable`). Installing packages later inside a
+session still needs the network.
 
 ## Terminal interface
 
