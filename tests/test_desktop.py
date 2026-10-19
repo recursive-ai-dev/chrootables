@@ -296,6 +296,136 @@ class DesktopTests(unittest.TestCase):
         self.window.client.read(proc)
         self.assertEqual(events, [("output", 7, "line 1\nline 2\n"), ("result", True, {"exit_code": 0})])
 
+    def test_minimized_window_skips_timer_poll_and_refreshes_on_restore(self):
+        from PySide6.QtGui import QWindowStateChangeEvent
+        with patch.object(self.window, "refresh") as refresh:
+            with patch.object(self.window, "isMinimized", return_value=True):
+                self.window._poll_timer()
+                self.assertEqual(refresh.call_count, 0)
+            with patch.object(self.window, "isMinimized", return_value=False):
+                self.window._poll_timer()
+                self.assertEqual(refresh.call_count, 1)
+                event = QWindowStateChangeEvent(Qt.WindowState.WindowMinimized)
+                self.window.changeEvent(event)
+                self.assertEqual(refresh.call_count, 2)
+
+    def test_client_starts_broker_in_isolated_no_site_mode(self):
+        from PySide6.QtCore import QProcess
+        with patch.object(QProcess, "start") as mock_start:
+            self.window.client.start(writable=False)
+            prog, args = mock_start.call_args[0]
+            self.assertEqual(prog, sys.executable)
+            self.assertEqual(args[:2], ["-I", "-S"])
+            self.window.client.start(writable=True)
+            prog, args = mock_start.call_args[0]
+            self.assertEqual(prog, "pkexec")
+            self.assertEqual(args[:3], [sys.executable, "-I", "-S"])
+            self.assertEqual(args[-1], "--writable")
+
+    def test_workspace_actions_keep_target_while_dialog_processes_refresh(self):
+        images = list(self.window.data["images"])
+        def refresh_selection(*args, **kwargs):
+            self.window.data["images"] = [item for item in images if item["name"] != "python-playground"]
+            self.window.render_library()
+            return True
+
+        for action, value, params in [
+            ("snapshot", "checkpoint", {"target": "checkpoint"}),
+            ("clone", "branch", {"target": "branch"}),
+            ("resize_image", 8192, {"size_mib": 8192}),
+        ]:
+            with self.subTest(action=action):
+                self.window.data["images"] = images
+                self.window.selected = "python-playground"
+                self.window.render_library()
+                with patch("chrootables.app.ValueDialog") as dialog_class, \
+                        patch.object(self.window, "perform") as perform:
+                    dialog_class.return_value.exec.side_effect = refresh_selection
+                    dialog_class.return_value.value.return_value = value
+                    getattr(self.window, action)()
+                perform.assert_called_once_with("resize" if action == "resize_image" else action,
+                                                {"name": "python-playground", **params})
+
+        self.window.data["images"] = images
+        self.window.selected = "python-playground"
+        with patch.object(self.window, "confirm", side_effect=refresh_selection), \
+                patch.object(self.window, "perform") as perform:
+            self.window.repair()
+        perform.assert_called_once_with("repair", {"name": "python-playground", "confirmed": True})
+
+        self.window.data["images"] = images
+        self.window.selected = "python-playground"
+        destination = str(Path(self.directory.name) / "export.tar.gz")
+        def choose_destination(*args):
+            refresh_selection()
+            return destination, ""
+        with patch("chrootables.app.QFileDialog.getSaveFileName", side_effect=choose_destination), \
+                patch.object(self.window, "perform") as perform:
+            self.window.export()
+        perform.assert_called_once_with("export", {"name": "python-playground", "destination": destination})
+
+    def test_failed_operation_restores_controls_without_inventory_changes(self):
+        self.enable_shared_folder_controls()
+        self.window.client.is_ready = True
+        self.window.health_ready = True
+        callbacks = {}
+        def request(action, params, callback):
+            if action == "inventory":
+                callback(True, self.window.data)
+            else:
+                callbacks[action] = callback
+        with patch.object(self.window.client, "request", side_effect=request):
+            self.window.refresh()
+            self.window.run_operation("snapshot", {"name": "python-playground", "target": "checkpoint"})
+            self.assertFalse(self.window.terminal_button.isEnabled())
+            callbacks["snapshot"](False, "Workspace is busy.")
+        self.assertFalse(self.window.busy)
+        self.assertTrue(self.window.terminal_button.isEnabled())
+        self.assertTrue(self.window.save_snapshot_button.isEnabled())
+        self.assertTrue(self.window.share_choose.isEnabled())
+
+    def test_client_stop_rejects_requests_from_cancelled_callbacks(self):
+        from unittest.mock import MagicMock
+        client = self.window.client
+        client.process = MagicMock()
+        client.is_ready = client.writable = True
+        results = []
+        def cancelled(ok, data):
+            results.append((ok, client.is_ready, client.writable))
+            client.request("inventory", {}, lambda ok, data: results.append((ok, str(data))))
+        client.callbacks[1] = cancelled
+        client.stop()
+        self.assertEqual(results[0], (False, False, False))
+        self.assertEqual(results[1], (False, "The workspace helper is not connected."))
+        self.assertEqual(client.callbacks, {})
+
+    def test_recovery_selection_follows_snapshot_across_refresh(self):
+        self.window.recovery_table.selectRow(1)
+        selected = self.window.chosen_snapshot().copy()
+        self.window.data["snapshots"].reverse()
+        self.window.data["snapshots"].insert(0, {**selected, "label": "new-checkpoint"})
+        self.window.render()
+        self.assertEqual(self.window.chosen_snapshot(), selected)
+        self.window.data["snapshots"].remove(selected)
+        self.window.render()
+        self.assertIsNone(self.window.chosen_snapshot())
+
+    def test_activity_selection_follows_log_across_refresh(self):
+        self.window.demo = False
+        self.window.activity_table.selectRow(0)
+        selected = self.window.data["activity"][0].copy()
+        self.window.data["activity"].insert(0, {**selected, "log": "new-operation.log"})
+        self.window.render()
+        with patch.object(self.window, "show_log") as show_log:
+            self.window.activity_log()
+        show_log.assert_called_once_with(selected["name"], selected["log"])
+
+        self.window.data["activity"][1] = {**selected, "log": "replacement-operation.log"}
+        self.window.render()
+        with patch.object(self.window, "show_log") as show_log:
+            self.window.activity_log()
+        show_log.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

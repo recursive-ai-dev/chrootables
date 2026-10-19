@@ -1,6 +1,7 @@
 """Validated desktop API for the existing image manager. No shell evaluation."""
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -9,6 +10,7 @@ import re
 import shutil
 import stat
 import subprocess
+import threading
 import time
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -71,14 +73,44 @@ def build_command(action, params):
     return args, env
 
 
-def read_regular(path, limit=256 * 1024):
+def read_regular(path, limit=256 * 1024, offset=None):
     """Read bounded regular files without following a final symlink."""
+    return _read_regular_chunk(path, limit, offset)[0]
+
+
+def _read_regular_chunk(path, limit=256 * 1024, offset=None):
+    """Return bounded text and the byte position actually consumed."""
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(descriptor, "rb") as stream:
-        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode):
             raise ValueError("Expected a regular file.")
-        stream.seek(max(0, os.fstat(stream.fileno()).st_size - limit))
-        return stream.read(limit).decode("utf-8", errors="replace")
+        start = max(0, info.st_size - limit)
+        if offset is not None and 0 <= offset <= info.st_size:
+            start = max(start, offset)
+        stream.seek(start)
+        data = stream.read(max(0, min(limit, info.st_size - start)))
+        return data.decode("utf-8", errors="replace"), stream.tell()
+
+
+def _probe_lock_status(lock_path):
+    try:
+        fd = os.open(lock_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return "ready"
+    except OSError:
+        return "ready" if os.path.islink(lock_path) else "unknown"
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return "ready"
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return "busy"
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return "ready"
+    finally:
+        os.close(fd)
 
 
 def deliver_export(archive, destination):
@@ -98,7 +130,12 @@ try:
     fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     created = True
     with os.fdopen(fd, "wb") as output, os.fdopen(source, "rb") as archive:
-        shutil.copyfileobj(archive, output)
+        try:
+            while True:
+                if os.copy_file_range(archive.fileno(), output.fileno(), 1 << 30) == 0:
+                    break
+        except (AttributeError, OSError):
+            shutil.copyfileobj(archive, output, 1024 * 1024)
 except BaseException:
     if created:
         os.unlink(destination)
@@ -106,7 +143,7 @@ except BaseException:
 '''
     try:
         options = {"user": uid, "group": account.pw_gid, "extra_groups": []} if os.geteuid() == 0 else {}
-        result = subprocess.run(["/usr/bin/python3", "-I", "-c", script, str(source), str(target)],
+        result = subprocess.run(["/usr/bin/python3", "-I", "-S", "-c", script, str(source), str(target)],
                                 pass_fds=(source,), capture_output=True, text=True, **options)
         if result.returncode:
             raise RuntimeError("Archive created, but saving the chosen copy failed: " + result.stderr.strip())
@@ -126,6 +163,12 @@ class Store:
         self.path = Path(path)
         if not self.path.is_absolute() or self.path == Path("/"):
             raise ValueError("Store must be an absolute directory other than /.")
+        self._images_sig = None
+        self._images_cache = []
+        self._snap_meta_cache = {}
+        self._activity_sig = None
+        self._activity_cache = []
+        self._inventory_lock = threading.Lock()
 
     def environment(self, extra=None):
         result = {
@@ -137,21 +180,31 @@ class Store:
         return result
 
     def inventory(self):
+        # Broker reads may overlap; publish each cache signature with its data.
+        with self._inventory_lock:
+            return self._inventory()
+
+    def _inventory(self):
         # Check directories explicitly: glob can silently conceal permission errors.
+        image_dir_entries = None
         if self.path.exists():
             for part in (self.path, self.path / "images", self.path / "snapshots", self.path / "logs"):
                 if part.is_symlink():
                     raise ValueError("Store directories must not be symlinks.")
                 if part.exists():
-                    with os.scandir(part):
-                        pass
-        result = subprocess.run([str(MANAGER), "--list", "--json"], env=self.environment(), capture_output=True, text=True, timeout=20)
-        if result.returncode:
-            raise PermissionError(result.stderr.strip() or "Cannot read the workspace store.")
-        images = json.loads(result.stdout)
-        image_names = {x["name"] for x in images}
-        snapshots = []
+                    with os.scandir(part) as entries:
+                        if part.name == "images":
+                            image_dir_entries = []
+                            for entry in entries:
+                                if entry.is_symlink():
+                                    image_dir_entries.append((entry.name, True, 0, 0, 0, 0))
+                                elif entry.name.endswith((".img", ".meta", ".mode")) and entry.is_file(follow_symlinks=False):
+                                    st = entry.stat(follow_symlinks=False)
+                                    image_dir_entries.append((entry.name, False, st.st_ino, st.st_mtime_ns, st.st_size, st.st_blocks))
+                            image_dir_entries.sort()
         snapshots_root = self.path / "snapshots"
+        raw_snapshots = []
+        snap_counts = {}
         if snapshots_root.is_dir() and not snapshots_root.is_symlink():
             with os.scandir(snapshots_root) as folder_entries:
                 folders = sorted(
@@ -159,34 +212,75 @@ class Store:
                     key=lambda e: e.name,
                 )
             for folder in folders:
-                is_orphan = folder.name not in image_names
+                imgs = []
+                meta_stats = {}
                 with os.scandir(folder.path) as img_entries:
-                    imgs = sorted(
-                        (e for e in img_entries if e.name.endswith(".img") and not e.is_symlink() and e.is_file(follow_symlinks=False) and NAME_RE.fullmatch(e.name[:-4])),
-                        key=lambda e: e.name,
-                    )
+                    for entry in img_entries:
+                        if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                            continue
+                        if entry.name.endswith(".img") and NAME_RE.fullmatch(entry.name[:-4]):
+                            imgs.append(entry)
+                        elif entry.name.endswith(".img.meta"):
+                            meta_stats[entry.name] = entry.stat(follow_symlinks=False)
+                imgs.sort(key=lambda e: e.name)
+                snap_counts[folder.name] = len(imgs)
                 for image in imgs:
-                    meta = metadata(Path(image.path + ".meta"))
-                    snapshots.append({
-                        "name": folder.name,
-                        "label": image.name[:-4],
-                        "size_mib": image.stat(follow_symlinks=False).st_size // 1048576,
-                        "created_at": meta.get("snapshot_at", "unknown"),
-                        "orphan": is_orphan,
-                    })
-        activity = []
+                    img_st = image.stat(follow_symlinks=False)
+                    meta_st = meta_stats.get(image.name + ".meta")
+                    cache_key = (image.path, meta_st.st_ino, meta_st.st_mtime_ns, meta_st.st_size) if meta_st else None
+                    if cache_key is not None and cache_key in self._snap_meta_cache:
+                        created_at = self._snap_meta_cache[cache_key]
+                    else:
+                        meta = metadata(Path(image.path + ".meta")) if meta_st else {}
+                        created_at = meta.get("snapshot_at", "unknown")
+                        if cache_key is not None:
+                            if len(self._snap_meta_cache) >= 2048:
+                                self._snap_meta_cache.clear()
+                            self._snap_meta_cache[cache_key] = created_at
+                    raw_snapshots.append((folder.name, image.name[:-4], img_st.st_size // 1048576, created_at))
+        images_sig = (tuple(image_dir_entries), tuple(sorted(snap_counts.items()))) if image_dir_entries is not None else None
+        if self._images_sig is not None and images_sig is not None and images_sig == self._images_sig:
+            images = []
+            images_root = self.path / "images"
+            for item in self._images_cache:
+                status = _probe_lock_status(images_root / (item["name"] + ".img.lock"))
+                images.append(item if item["status"] == status else {**item, "status": status})
+        else:
+            result = subprocess.run([str(MANAGER), "--list", "--json"], env=self.environment(), capture_output=True, text=True, timeout=20)
+            if result.returncode:
+                raise PermissionError(result.stderr.strip() or "Cannot read the workspace store.")
+            images = json.loads(result.stdout)
+            self._images_sig = images_sig
+            self._images_cache = images
+        image_names = {x["name"] for x in images}
+        snapshots = [
+            {"name": ws_name, "label": label, "size_mib": size_mib, "created_at": created_at, "orphan": ws_name not in image_names}
+            for ws_name, label, size_mib, created_at in raw_snapshots
+        ]
+        activity_path = self.path / "activity.tsv"
         try:
-            for line in read_regular(self.path / "activity.tsv").splitlines()[-100:]:
-                fields = line.split("\t")
-                if len(fields) == 5:
-                    activity.append(dict(zip(("time", "action", "name", "status", "log"), fields)))
+            act_st = activity_path.lstat()
+            act_sig = (act_st.st_ino, act_st.st_mtime_ns, act_st.st_size)
+            if act_sig == self._activity_sig:
+                activity = self._activity_cache
+            else:
+                parsed = []
+                for line in read_regular(activity_path).splitlines()[-100:]:
+                    fields = line.split("\t")
+                    if len(fields) == 5:
+                        parsed.append(dict(zip(("time", "action", "name", "status", "log"), fields)))
+                activity = list(reversed(parsed))
+                self._activity_sig = act_sig
+                self._activity_cache = activity
         except FileNotFoundError:
-            pass
+            self._activity_sig = None
+            self._activity_cache = []
+            activity = []
         existing = self.path
         while not existing.exists():
             existing = existing.parent
         usage = shutil.disk_usage(existing)
-        return {"images": images, "snapshots": snapshots, "activity": list(reversed(activity)),
+        return {"images": images, "snapshots": snapshots, "activity": activity,
                 "store": str(self.path), "free_bytes": usage.free, "total_bytes": usage.total}
 
     def logs(self, target, selected_log=None):
@@ -216,7 +310,6 @@ class Store:
         env = self.environment(extra)
         started = time.time()
         # A reader thread drains the child while the main thread tails its operation log.
-        import threading
         process = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
         archives = []
         def drain():
@@ -229,26 +322,38 @@ class Store:
         reader.start()
         offsets = {}
         stats = {}
+        logs_dir = self.path / "logs"
+        def tail_file(log_path, info):
+            if not stat.S_ISREG(info.st_mode) or info.st_mtime < started:
+                return
+            sig = (info.st_mtime_ns, info.st_size)
+            if stats.get(log_path) == sig:
+                return
+            prev_offset = offsets.get(log_path, 0)
+            if info.st_size < prev_offset:
+                prev_offset = 0
+            chunk, offsets[log_path] = _read_regular_chunk(log_path, offset=prev_offset)
+            stats[log_path] = sig
+            if chunk:
+                output(chunk)
         def tail():
-            candidates = list((self.path / "logs").glob("*.log"))
-            if action == "setup":
-                candidates.append(Path("/var/log/chrootable-manager-dependencies.log"))
-            for log in candidates:
+            if logs_dir.is_dir() and not logs_dir.is_symlink():
                 try:
-                    info = log.lstat()
-                    if not stat.S_ISREG(info.st_mode) or info.st_mtime < started:
-                        continue
-                    sig = (info.st_mtime_ns, info.st_size)
-                    if stats.get(log) == sig:
-                        continue
-                    stats[log] = sig
-                    data = read_regular(log)
-                    previous = offsets.get(log, "")
-                    if data != previous:
-                        output(data[len(previous):] if data.startswith(previous) else data)
-                        offsets[log] = data
+                    with os.scandir(logs_dir) as entries:
+                        for entry in entries:
+                            if entry.name.endswith(".log") and not entry.is_symlink():
+                                try:
+                                    tail_file(entry.path, entry.stat(follow_symlinks=False))
+                                except (FileNotFoundError, OSError):
+                                    continue
+                except OSError:
+                    pass
+            if action == "setup":
+                dep_log = "/var/log/chrootable-manager-dependencies.log"
+                try:
+                    tail_file(dep_log, os.lstat(dep_log))
                 except (FileNotFoundError, OSError):
-                    continue
+                    pass
         while process.poll() is None:
             tail()
             time.sleep(0.2)

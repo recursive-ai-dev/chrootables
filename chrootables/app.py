@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 import sys
 
-from PySide6.QtCore import Qt, QSettings, QSize, QTimer, QProcess
+from PySide6.QtCore import Qt, QEvent, QSettings, QSize, QTimer, QProcess
 from PySide6.QtGui import QColor, QFont, QIcon, QKeySequence, QPainter, QPen, QPixmap, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame, QHBoxLayout, QVBoxLayout,
@@ -290,7 +290,7 @@ class Window(QMainWindow):
         self.client.output.connect(lambda identifier, text: self.append_output(text))
         self.build_ui()
         self.timer = QTimer(self)
-        self.timer.timeout.connect(self.refresh)
+        self.timer.timeout.connect(self._poll_timer)
         self.timer.start(6000)
         for keys, callback in [("Ctrl+N", self.create), ("Ctrl+F", self.focus_search), ("F5", self.refresh), ("Ctrl+Return", self.open_terminal)]:
             shortcut = QShortcut(QKeySequence(keys), self)
@@ -611,27 +611,36 @@ class Window(QMainWindow):
         for widget, value in zip(self.metrics, values):
             widget.setText(value)
         self.render_library()
-        self.fill_table(self.recovery_table, [[x["name"] + (" · deleted" if x.get("orphan") else ""), x["label"], capacity(x["size_mib"]), when(x["created_at"])] for x in self.data["snapshots"]])
+        self.fill_table(self.recovery_table, [[x["name"] + (" · deleted" if x.get("orphan") else ""), x["label"], capacity(x["size_mib"]), when(x["created_at"])] for x in self.data["snapshots"]],
+                        [[x["name"], x["label"]] for x in self.data["snapshots"]])
         self.recovery_empty.setVisible(not self.data["snapshots"])
-        self.fill_table(self.activity_table, [[when(x["time"]), x["action"].replace("-", " ").capitalize(), x["name"], "Completed" if x["status"] == "ok" else "Failed"] for x in self.data["activity"]])
+        self.fill_table(self.activity_table, [[when(x["time"]), x["action"].replace("-", " ").capitalize(), x["name"], "Completed" if x["status"] == "ok" else "Failed"] for x in self.data["activity"]],
+                        [[x["time"], x["action"], x["name"], x["log"]] for x in self.data["activity"]])
         self.activity_empty.setVisible(not self.data["activity"])
         self.update_controls()
 
-    def fill_table(self, table, rows):
-        if table.property("rendered_rows") == rows:
+    def fill_table(self, table, rows, keys):
+        if table.property("rendered_rows") == [rows, keys]:
             return
-        table.setProperty("rendered_rows", rows)
-        selected = table.currentRow()
+        table.setProperty("rendered_rows", [rows, keys])
+        current = table.item(table.currentRow(), 0)
+        selected = current.data(Qt.ItemDataRole.UserRole) if current else None
         table.setUpdatesEnabled(False)
+        blocked = table.blockSignals(True)
+        table.clearSelection()
+        table.setCurrentItem(None)
         table.setRowCount(len(rows))
         for r, row in enumerate(rows):
             for c, value in enumerate(row):
                 item = QTableWidgetItem(str(value))
                 if value == "Failed":
                     item.setForeground(QColor("#efa79d"))
+                if c == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, keys[r])
                 table.setItem(r, c, item)
-        if rows and selected >= 0:
-            table.selectRow(min(selected, len(rows) - 1))
+        if selected in keys:
+            table.selectRow(keys.index(selected))
+        table.blockSignals(blocked)
         table.setUpdatesEnabled(True)
 
     def build_detail_card(self):
@@ -910,18 +919,20 @@ class Window(QMainWindow):
             self.perform("create", dialog.parameters())
 
     def snapshot(self):
-        if not self.selected:
+        target = self.selected
+        if not target:
             return
         dialog = ValueDialog("Save a recovery point", "Capture this workspace before your next experiment. The workspace must be offline.", "Snapshot label", datetime.now().strftime("checkpoint-%Y%m%d-%H%M"), parent=self)
         if dialog.exec():
-            self.perform("snapshot", {"name": self.selected, "target": dialog.value()})
+            self.perform("snapshot", {"name": target, "target": dialog.value()})
 
     def clone(self):
-        if not self.selected:
+        target = self.selected
+        if not target:
             return
-        dialog = ValueDialog("Branch into a new workspace", "An independent copy of the filesystem and profile. The original stays intact.", "New workspace name", self.selected[:58] + "-copy", parent=self)
+        dialog = ValueDialog("Branch into a new workspace", "An independent copy of the filesystem and profile. The original stays intact.", "New workspace name", target[:58] + "-copy", parent=self)
         if dialog.exec():
-            self.perform("clone", {"name": self.selected, "target": dialog.value()})
+            self.perform("clone", {"name": target, "target": dialog.value()})
 
     def resize_image(self):
         data = self.selected_data()
@@ -929,7 +940,7 @@ class Window(QMainWindow):
             return
         dialog = ValueDialog("Give it more room", f"Current capacity: {capacity(data['size_mib'])}. Images can expand up to 1 TiB.", "New capacity", minimum=min(data["size_mib"] + 1024, 1048576), parent=self)
         if dialog.exec():
-            self.perform("resize", {"name": self.selected, "size_mib": dialog.value()})
+            self.perform("resize", {"name": data["name"], "size_mib": dialog.value()})
 
     def change_mode(self):
         data = self.selected_data()
@@ -951,18 +962,20 @@ class Window(QMainWindow):
             self.perform("delete", {"name": target, "confirmed": True})
 
     def repair(self):
-        if self.selected and self.confirm("Repair filesystem", "Forced ext4 repair can change filesystem data. Save a snapshot first if you need a recovery point. Continue?"):
-            self.perform("repair", {"name": self.selected, "confirmed": True})
+        target = self.selected
+        if target and self.confirm("Repair filesystem", "Forced ext4 repair can change filesystem data. Save a snapshot first if you need a recovery point. Continue?"):
+            self.perform("repair", {"name": target, "confirmed": True})
 
     def export(self):
-        if not self.selected:
+        target = self.selected
+        if not target:
             return
-        destination, _ = QFileDialog.getSaveFileName(self, "Export filesystem", str(Path.home() / (self.selected + ".tar.gz")), "Compressed archive (*.tar.gz)")
+        destination, _ = QFileDialog.getSaveFileName(self, "Export filesystem", str(Path.home() / (target + ".tar.gz")), "Compressed archive (*.tar.gz)")
         if destination:
             if Path(destination).exists():
                 self.show_error("Choose a new filename. Exports never overwrite an existing file.")
                 return
-            self.perform("export", {"name": self.selected, "destination": destination})
+            self.perform("export", {"name": target, "destination": destination})
 
     def chosen_snapshot(self):
         row = self.recovery_table.currentRow()
@@ -1007,6 +1020,7 @@ class Window(QMainWindow):
             if not ok:
                 self.append_output("\n" + str(result) + "\n")
                 self.task_panel.show()
+            self.render_library()
             if ok and action == "create":
                 self.selected = params["name"]
                 self.navigate(0)
@@ -1113,6 +1127,15 @@ class Window(QMainWindow):
         self.status.setText("Sample data · launch without --demo to use your own workspaces")
         self.selected = "python-playground"
         self.render()
+
+    def _poll_timer(self):
+        if not self.isMinimized():
+            self.refresh()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange and (event.oldState() & Qt.WindowState.WindowMinimized) and not self.isMinimized():
+            self.refresh()
 
     def closeEvent(self, event):
         if self.busy:

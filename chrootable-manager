@@ -12,7 +12,7 @@ NON_INTERACTIVE=1
 DEMO=0
 REQUIRED_COMMANDS=(awk basename chmod chroot cp date dd debootstrap df dpkg du e2fsck flock gpgv
     gzip hostname install ip losetup mkdir mkfs.ext4 mktemp mount mountpoint mv readlink
-    resize2fs rm rmdir stat tail tar truncate umount unshare whiptail)
+    resize2fs rm rmdir sha256sum stat tail tar truncate umount unshare wget whiptail xz)
 
 configure_paths() {
     IMAGE_DIR="$STORE_DIR/images"
@@ -30,6 +30,8 @@ valid_size_mib() {
 }
 valid_lifecycle() { [[ $1 == persistent || $1 == ephemeral ]]; }
 valid_profile() { [[ $1 == minimal || $1 == build || $1 == python || $1 == network ]]; }
+valid_suite() { [[ $1 =~ ^[a-z0-9][a-z0-9.-]{0,31}$ ]]; }
+valid_mirror() { [[ $1 =~ ^https://[A-Za-z0-9._-]+(:[0-9]+)?(/[A-Za-z0-9._/-]*)?$ ]]; }
 timestamp() { date --iso-8601=seconds; }
 image_size_mib() { local bytes; bytes=$(stat -c%s -- "$1") || return; printf '%s\n' "$((bytes / 1048576))"; }
 allocated_bytes() { local blocks; blocks=$(stat -c%b -- "$1") || return; printf '%s\n' "$((blocks * 512))"; }
@@ -46,9 +48,11 @@ unused_image() {
     [[ ! -e $IMAGE_DIR/$1.img && ! -L $IMAGE_DIR/$1.img ]] || { fail "A chrootable named '$1' already exists."; return 1; }
 }
 metadata_value() {
-    local value= image=$1 key=$2 fallback=${3:-unknown}
+    local value= image=$1 key=$2 fallback=${3:-unknown} mkey mval
     if [[ -f $image.meta && ! -L $image.meta ]]; then
-        value=$(awk -F= -v key="$key" '$1 == key {sub(/^[^=]*=/, ""); print; exit}' "$image.meta") || return
+        while IFS='=' read -r mkey mval || [[ -n $mkey || -n $mval ]]; do
+            if [[ $mkey == "$key" ]]; then value=$mval; break; fi
+        done <"$image.meta" || return
     fi
     printf '%s\n' "${value:-$fallback}"
 }
@@ -60,7 +64,10 @@ image_lifecycle() {
     printf '%s\n' "$lifecycle"
 }
 write_metadata() {
-    local image=$1 temporary
+    local image=$1 temporary value
+    for value in "${@:2}"; do
+        [[ $value != *$'\n'* && $value != *$'\r'* ]] || return 1
+    done
     temporary=$(mktemp "$image.meta.XXXXXX") || return
     if ! printf 'format=2\nlifecycle=%s\nsuite=%s\narchitecture=%s\nsize_mib=%s\ncreated_at=%s\nlast_used_at=%s\nprofile=%s\norigin=%s\n' \
         "$2" "$3" "$4" "$5" "$6" "$7" "${8:-minimal}" "${9:-none}" >"$temporary" ||
@@ -69,7 +76,7 @@ write_metadata() {
     fi
 }
 metadata_set() {
-    local image=$1 key=$2 value=$3 temporary
+    local image=$1 key=$2 value=$3 temporary line
     [[ $key =~ ^[a-z_]+$ && $value != *$'\n'* && $value != *$'\r'* ]] || return 1
     # Upgrade legacy .mode files before creating .meta, preserving their mode.
     if [[ ! -f $image.meta && -f $image ]]; then
@@ -77,17 +84,34 @@ metadata_set() {
     fi
     temporary=$(mktemp "$image.meta.XXXXXX") || return
     if [[ -f $image.meta && ! -L $image.meta ]]; then
-        awk -F= -v key="$key" '$1 != key' "$image.meta" >"$temporary" || { rm -f -- "$temporary"; return 1; }
+        while IFS= read -r line || [[ -n $line ]]; do
+            [[ ${line%%=*} == "$key" ]] || printf '%s\n' "$line"
+        done <"$image.meta" >"$temporary" || { rm -f -- "$temporary"; return 1; }
     fi
     printf '%s=%s\n' "$key" "$value" >>"$temporary" && mv -T -- "$temporary" "$image.meta" || { rm -f -- "$temporary"; return 1; }
 }
 copy_metadata() {
-    local source=$1 destination=$2
-    write_metadata "$destination" "$(image_lifecycle "$source")" \
-        "$(metadata_value "$source" suite unknown)" "$(metadata_value "$source" architecture unknown)" \
-        "$(image_size_mib "$source")" "$(metadata_value "$source" created_at unknown)" \
-        "$(metadata_value "$source" last_used_at never)" "$(metadata_value "$source" profile minimal)" \
-        "$(metadata_value "$source" origin none)"
+    local source=$1 destination=$2 lifecycle=persistent suite=unknown architecture=unknown
+    local created_at=unknown last_used_at=never profile=minimal origin=none mkey mval size_mib
+    if [[ -f $source.meta && ! -L $source.meta ]]; then
+        while IFS='=' read -r mkey mval || [[ -n $mkey || -n $mval ]]; do
+            case $mkey in
+                lifecycle) [[ -z $mval ]] || lifecycle=$mval ;;
+                suite) [[ -z $mval ]] || suite=$mval ;;
+                architecture) [[ -z $mval ]] || architecture=$mval ;;
+                created_at) [[ -z $mval ]] || created_at=$mval ;;
+                last_used_at) [[ -z $mval ]] || last_used_at=$mval ;;
+                profile) [[ -z $mval ]] || profile=$mval ;;
+                origin) [[ -z $mval ]] || origin=$mval ;;
+            esac
+        done <"$source.meta"
+    elif [[ -f $source.mode && ! -L $source.mode ]]; then
+        read -r lifecycle <"$source.mode" || true
+    fi
+    valid_lifecycle "$lifecycle" || lifecycle=persistent
+    size_mib=$(image_size_mib "$source") || return
+    write_metadata "$destination" "$lifecycle" "$suite" "$architecture" "$size_mib" \
+        "${3:-$created_at}" "${4:-$last_used_at}" "$profile" "${5:-$origin}"
 }
 
 # Keep lock files after deletion: unlinking one would allow two processes to
@@ -129,10 +153,12 @@ package_for_command() {
             ip) printf iproute; return ;;
             awk) printf gawk; return ;;
             gpgv) printf gnupg2; return ;;
+            xz) printf xz; return ;;
         esac
     fi
     case $1 in
-        whiptail|debootstrap|dpkg|hostname|tar|gzip|gpgv) printf '%s' "$1" ;;
+        whiptail|debootstrap|dpkg|hostname|tar|gzip|gpgv|wget) printf '%s' "$1" ;;
+        xz) printf xz-utils ;;
         mkfs.ext4|e2fsck|resize2fs) printf e2fsprogs ;;
         mount|umount|mountpoint|unshare|flock|losetup) printf util-linux ;;
         ip) printf iproute2 ;;
@@ -156,15 +182,17 @@ check_prerequisites() {
     fi
     if (( ${#packages[@]} )); then
         [[ ${CHROOTABLE_AUTO_INSTALL:-1} != 0 ]] || { fail "Missing packages: ${packages[*]}. Install them or run --setup with CHROOTABLE_AUTO_INSTALL=1."; return 1; }
-        info "Installing dependencies: ${packages[*]} (log: /var/log/chrootable-manager-dependencies.log)"
+        local dep_log=/var/log/chrootable-manager-dependencies.log
+        [[ ! -L $dep_log ]] || { fail "Refusing a symlink dependency log: $dep_log"; return 1; }
+        info "Installing dependencies: ${packages[*]} (log: $dep_log)"
         if command -v dnf >/dev/null 2>&1; then
-            dnf install -y "${packages[@]}" >>/var/log/chrootable-manager-dependencies.log 2>&1 || {
-                fail "Dependency installation failed. See /var/log/chrootable-manager-dependencies.log"; return 1;
+            dnf install -y --setopt=install_weak_deps=False "${packages[@]}" >>"$dep_log" 2>&1 || {
+                fail "Dependency installation failed. See $dep_log"; return 1;
             }
         elif command -v apt-get >/dev/null 2>&1; then
-            apt-get update >>/var/log/chrootable-manager-dependencies.log 2>&1 &&
-                DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}" >>/var/log/chrootable-manager-dependencies.log 2>&1 || {
-                fail "Dependency installation failed. See /var/log/chrootable-manager-dependencies.log"; return 1;
+            apt-get update >>"$dep_log" 2>&1 &&
+                DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages[@]}" >>"$dep_log" 2>&1 || {
+                fail "Dependency installation failed. See $dep_log"; return 1;
             }
         else
             fail "Install these packages first: ${packages[*]}"; return 1
@@ -178,7 +206,7 @@ init_store() {
     configure_paths
     if [[ -e $STORE_DIR ]]; then
         local owner permissions
-        owner=$(stat -c%u "$STORE_DIR"); permissions=$(stat -c%a "$STORE_DIR")
+        read -r owner permissions < <(stat -c '%u %a' -- "$STORE_DIR") || return
         [[ $owner == "$EUID" ]] && (( (8#$permissions & 0022) == 0 )) || {
             fail "The store must be owned by the current user and not writable by group/others: $STORE_DIR"; return 1;
         }
@@ -188,7 +216,8 @@ init_store() {
         [[ ! -L $directory ]] || { fail "Store subdirectories must not be symlinks: $directory"; return 1; }
     done
     [[ -d $STORE_DIR ]] || install -d -m 0700 "$STORE_DIR" || return
-    install -d -m 0700 "$IMAGE_DIR" "$LOG_DIR" "$EXPORT_DIR" "$SNAPSHOT_DIR"
+    [[ -d $IMAGE_DIR && -d $LOG_DIR && -d $EXPORT_DIR && -d $SNAPSHOT_DIR ]] ||
+        install -d -m 0700 "$IMAGE_DIR" "$LOG_DIR" "$EXPORT_DIR" "$SNAPSHOT_DIR"
 }
 check_readable_store() {
     [[ ! -e $STORE_DIR || ( -r $STORE_DIR && -x $STORE_DIR ) ]] || { fail "Store is not readable. Run with sudo to view $STORE_DIR"; return 1; }
@@ -213,7 +242,7 @@ finish_operation() {
     local status=$?
     if [[ -n ${PENDING:-} ]]; then rm -f -- "$PENDING" "$PENDING.meta" || true; fi
     if [[ -n ${WORK:-} ]]; then
-        rm -f -- "$WORK/started" || true
+        rm -f -- "$WORK/started" "$WORK/resolv.conf" "$WORK/resolv.conf.tmp" || true
         rmdir "$WORK/root" "$WORK/lower" "$WORK/overlay" "$WORK" 2>/dev/null || true
     fi
     if (( status == 0 )); then
@@ -253,9 +282,9 @@ list_profiles() {
 
 allocate_image() {
     local target=$1 size_mib=$2
-    if command -v fallocate >/dev/null 2>&1 && fallocate -l "${size_mib}M" "$target" >>"$OP_LOG" 2>&1; then
+    if truncate -s "${size_mib}M" "$target" >>"$OP_LOG" 2>&1; then
         return 0
-    elif truncate -s "${size_mib}M" "$target" >>"$OP_LOG" 2>&1; then
+    elif command -v fallocate >/dev/null 2>&1 && fallocate -l "${size_mib}M" "$target" >>"$OP_LOG" 2>&1; then
         return 0
     fi
     dd if=/dev/zero of="$target" bs=1M count="$size_mib" status=none conv=fsync >>"$OP_LOG" 2>&1
@@ -267,11 +296,13 @@ create_image() (
     valid_size_mib "$size" || { fail "Size must be a whole number from 1 to 1048576 MiB."; return 1; }
     valid_lifecycle "$lifecycle" || { fail "Lifecycle must be persistent or ephemeral."; return 1; }
     valid_profile "$profile" || { fail "Unknown profile: $profile. See --profiles."; return 1; }
+    valid_suite "$DEBIAN_SUITE" || { fail "Invalid Debian suite: $DEBIAN_SUITE"; return 1; }
+    valid_mirror "$DEBIAN_MIRROR" || { fail "Debian mirror must be an https:// URL: $DEBIAN_MIRROR"; return 1; }
     image="$IMAGE_DIR/$name.img"
     lock_image "$image" descriptor || return
     unused_image "$name" || return
     local available
-    available=$(df -PB1 "$STORE_DIR" | awk 'NR == 2 {print $4}') || return
+    { read -r _; read -r _ _ _ available _; } < <(df -PB1 "$STORE_DIR") || return
     (( available >= size * 1048576 )) || { fail "Not enough free space for a ${size} MiB image."; return 1; }
     begin_operation create "$name" || return
     PENDING=$(mktemp "$IMAGE_DIR/.$name.XXXXXX.partial") || return
@@ -287,20 +318,18 @@ create_image() (
     info "Created '$name'. Enter with: sudo $0 --enter $name"
 )
 clone_image() (
-    local source=$1 name=$2 descriptor destination_lock destination
+    local source=$1 name=$2 descriptor destination_lock destination source_name
     unused_image "$name" || return
     lock_image "$source" descriptor || return
     assert_offline "$source" || return
     destination="$IMAGE_DIR/$name.img"
     lock_image "$destination" destination_lock || return
     unused_image "$name" || return
-    begin_operation clone "$(basename "$source" .img)" || return
+    source_name=${source##*/}; source_name=${source_name%.img}
+    begin_operation clone "$source_name" || return
     PENDING=$(mktemp "$IMAGE_DIR/.$name.XXXXXX.partial") || return
     cp --reflink=auto --sparse=always -- "$source" "$PENDING" >>"$OP_LOG" 2>&1 || return
-    copy_metadata "$source" "$PENDING" || return
-    metadata_set "$PENDING" created_at "$(timestamp)" || return
-    metadata_set "$PENDING" last_used_at never || return
-    metadata_set "$PENDING" origin "$(basename "$source" .img)" || return
+    copy_metadata "$source" "$PENDING" "$(timestamp)" never "$source_name" || return
     publish_image "$PENDING" "$destination" || return
     PENDING=
     info "Created clone '$name'."
@@ -312,10 +341,12 @@ fsck_preflight() {
 }
 resize_image() (
     local image=$1 requested=$2 current descriptor
-    current=$(image_size_mib "$image") || return
-    valid_size_mib "$requested" && (( requested > current )) || { fail "Choose a size larger than $current MiB (maximum 1048576)."; return 1; }
     lock_image "$image" descriptor || return
     assert_offline "$image" || return
+    # Capacity can change before the lock is acquired; never truncate using a
+    # stale expansion check after another resize has already finished.
+    current=$(image_size_mib "$image") || return
+    valid_size_mib "$requested" && (( requested > current )) || { fail "Choose a size larger than $current MiB (maximum 1048576)."; return 1; }
     begin_operation resize "$(basename "$image" .img)" || return
     fsck_preflight "$image" "$OP_LOG" || return
     truncate -s "${requested}M" "$image" >>"$OP_LOG" 2>&1 || return
@@ -424,11 +455,21 @@ drop_snapshot() (
     info "Deleted snapshot '$name / $label'."
 )
 list_snapshots() {
-    local name=$1 snapshot
+    local name=$1 snapshot snap_name bytes stat_output idx=0
+    local -a valid_snaps=() stat_lines=()
     valid_name "$name" || { fail "Invalid image name."; return 1; }
     for snapshot in "$SNAPSHOT_DIR/$name/"*.img; do
         [[ -f $snapshot && ! -L $snapshot ]] || continue
-        printf '%s\t%s MiB\t%s\n' "$(basename "$snapshot" .img)" "$(image_size_mib "$snapshot")" "$(metadata_value "$snapshot" snapshot_at unknown)"
+        valid_snaps+=("$snapshot")
+    done
+    if (( ${#valid_snaps[@]} )); then
+        stat_output=$(stat -c '%s' -- "${valid_snaps[@]}") || return
+        mapfile -t stat_lines <<<"$stat_output"
+    fi
+    for snapshot in "${valid_snaps[@]}"; do
+        snap_name=${snapshot##*/}; snap_name=${snap_name%.img}
+        bytes=${stat_lines[$idx]:-0}; idx=$((idx + 1))
+        printf '%s\t%s MiB\t%s\n' "$snap_name" "$((bytes / 1048576))" "$(metadata_value "$snapshot" snapshot_at unknown)"
     done
 }
 
@@ -560,8 +601,9 @@ worker_main() (
     case $kind in
         create)
             local name=$1 arch=$2 profile=$3 packages
+            valid_suite "$DEBIAN_SUITE" && valid_mirror "$DEBIAN_MIRROR" || { fail "Invalid Debian suite or mirror."; return 1; }
             mount -o loop "$image" "$WORKER_ROOT" || return
-            debootstrap --force-check-gpg --keyring=/usr/share/keyrings/debian-archive-keyring.gpg --variant=minbase --arch="$arch" "$DEBIAN_SUITE" "$WORKER_ROOT" "$DEBIAN_MIRROR" || return
+            SHA_SIZE=256 debootstrap --force-check-gpg --keyring=/usr/share/keyrings/debian-archive-keyring.gpg --variant=minbase --arch="$arch" "$DEBIAN_SUITE" "$WORKER_ROOT" "$DEBIAN_MIRROR" || return
             printf '%s\n' "$name" >"$WORKER_ROOT/etc/hostname" || return
             printf '127.0.0.1 localhost\n127.0.1.1 %s\n::1 localhost ip6-localhost ip6-loopback\n' "$name" >"$WORKER_ROOT/etc/hosts" || return
             packages=$(profile_packages "$profile") || return
@@ -572,8 +614,8 @@ worker_main() (
                 read -r -a package_list <<<"$packages"
                 chroot "$WORKER_ROOT" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get update || return
                 chroot "$WORKER_ROOT" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${package_list[@]}" || return
-                chroot "$WORKER_ROOT" apt-get clean || return
             fi
+            chroot "$WORKER_ROOT" apt-get clean || return
             ;;
         export)
             mount -o loop,ro,noload "$image" "$WORKER_ROOT" || return
@@ -648,7 +690,7 @@ image_json() {
         status=$(image_status "$image")
     fi
     if [[ -f $image.meta && ! -L $image.meta ]]; then
-        while IFS='=' read -r mkey mval; do
+        while IFS='=' read -r mkey mval || [[ -n $mkey || -n $mval ]]; do
             case $mkey in
                 lifecycle) [[ -z $mval ]] || lifecycle=$mval ;;
                 suite) [[ -z $mval ]] || suite=$mval ;;
@@ -680,7 +722,7 @@ image_json() {
     printf ',"size_mib":%s,"allocated_bytes":%s,"snapshots":%s}' "$((bytes / 1048576))" "$((blocks * 512))" "$snaps"
 }
 list_images() {
-    local format=${1:-text} image name comma= idx=0 bytes blocks
+    local format=${1:-text} image name comma= idx=0 bytes blocks stat_output
     local -a valid_images=() stat_lines=()
     for image in "$IMAGE_DIR/"*.img; do
         [[ -f $image && ! -L $image ]] || continue
@@ -689,7 +731,8 @@ list_images() {
         valid_images+=("$image")
     done
     if (( ${#valid_images[@]} )); then
-        mapfile -t stat_lines < <(stat -c '%s %b' -- "${valid_images[@]}") || return
+        stat_output=$(stat -c '%s %b' -- "${valid_images[@]}") || return
+        mapfile -t stat_lines <<<"$stat_output"
     fi
     [[ $format != json ]] || printf '['
     for image in "${valid_images[@]}"; do
@@ -703,18 +746,35 @@ list_images() {
     return 0
 }
 image_details() {
-    local image=$1 name
-    name=$(basename "$image" .img)
-    printf '%s  /  %s  /  %s\n' "$name" "$(image_status "$image")" "$(image_lifecycle "$image")"
+    local image=$1 name status=ready lifecycle=persistent suite=unknown architecture=unknown
+    local profile=minimal created_at='unknown (legacy image)' last_used_at=never mkey mval bytes=0 blocks=0
+    name=${image##*/}; name=${name%.img}
+    if [[ -f $image.lock && ! -L $image.lock ]]; then status=$(image_status "$image"); fi
+    if [[ -f $image.meta && ! -L $image.meta ]]; then
+        while IFS='=' read -r mkey mval || [[ -n $mkey || -n $mval ]]; do
+            case $mkey in
+                lifecycle) [[ -z $mval ]] || lifecycle=$mval ;;
+                suite) [[ -z $mval ]] || suite=$mval ;;
+                architecture) [[ -z $mval ]] || architecture=$mval ;;
+                profile) [[ -z $mval ]] || profile=$mval ;;
+                created_at) [[ -z $mval ]] || created_at=$mval ;;
+                last_used_at) [[ -z $mval ]] || last_used_at=$mval ;;
+            esac
+        done <"$image.meta"
+    elif [[ -f $image.mode && ! -L $image.mode ]]; then
+        read -r lifecycle <"$image.mode" || true
+    fi
+    valid_lifecycle "$lifecycle" || lifecycle=persistent
+    read -r bytes blocks < <(stat -c '%s %b' -- "$image") || return
+    printf '%s  /  %s  /  %s\n' "$name" "$status" "$lifecycle"
     printf '\nDebian %-14s Architecture %s\nProfile %-13s Snapshots    %s\n' \
-        "$(metadata_value "$image" suite unknown)" "$(metadata_value "$image" architecture unknown)" \
-        "$(metadata_value "$image" profile minimal)" "$(snapshot_count "$name")"
+        "$suite" "$architecture" "$profile" "$(snapshot_count "$name")"
     printf 'Capacity %s MiB   Allocated %s\nCreated  %s\nLast run %s\nImage    %s\n' \
-        "$(image_size_mib "$image")" "$(human_bytes "$(allocated_bytes "$image")")" \
-        "$(metadata_value "$image" created_at 'unknown (legacy image)')" "$(metadata_value "$image" last_used_at never)" "$image"
+        "$((bytes / 1048576))" "$(human_bytes "$((blocks * 512))")" \
+        "$created_at" "$last_used_at" "$image"
 }
 workspace_summary() {
-    local image total=0 persistent=0 ephemeral=0 busy=0 bytes=0 snapshots=0 free=unknown lifecycle mkey mval blocks
+    local image total=0 persistent=0 ephemeral=0 busy=0 bytes=0 snapshots=0 free=unknown lifecycle mkey mval blocks stat_output
     local -a valid_images=() stat_lines=()
     local idx=0
     for image in "$IMAGE_DIR/"*.img; do
@@ -722,14 +782,15 @@ workspace_summary() {
         valid_images+=("$image")
     done
     if (( ${#valid_images[@]} )); then
-        mapfile -t stat_lines < <(stat -c '%b' -- "${valid_images[@]}") || return
+        stat_output=$(stat -c '%b' -- "${valid_images[@]}") || return
+        mapfile -t stat_lines <<<"$stat_output"
     fi
     for image in "${valid_images[@]}"; do
         blocks=${stat_lines[$idx]:-0}; idx=$((idx + 1))
         total=$((total + 1)); bytes=$((bytes + blocks * 512))
         lifecycle=persistent
         if [[ -f $image.meta && ! -L $image.meta ]]; then
-            while IFS='=' read -r mkey mval; do
+            while IFS='=' read -r mkey mval || [[ -n $mkey || -n $mval ]]; do
                 [[ $mkey == lifecycle && -n $mval ]] && { lifecycle=$mval; break; }
             done <"$image.meta"
         elif [[ -f $image.mode && ! -L $image.mode ]]; then
@@ -742,32 +803,36 @@ workspace_summary() {
         fi
     done
     for image in "$SNAPSHOT_DIR/"*/*.img; do [[ ! -f $image || -L $image ]] || snapshots=$((snapshots + 1)); done
-    if [[ -d $STORE_DIR ]]; then free=$(df -Ph "$STORE_DIR" | awk 'NR == 2 {print $4}'); fi
+    if [[ -d $STORE_DIR ]]; then { read -r _; read -r _ _ _ free _; } < <(df -Ph "$STORE_DIR") || free=unknown; fi
     printf '%s workspaces   %s persistent   %s disposable   %s busy\n' "$total" "$persistent" "$ephemeral" "$busy"
     printf '%s in images   %s host free   %s snapshots\n' "$(human_bytes "$bytes")" "$free" "$snapshots"
 }
 dashboard() {
-    local image name status lifecycle profile mkey mval snaps file bytes idx=0 accent= reset=
-    local -a valid_images=() stat_lines=()
+    local image name status lifecycle profile mkey mval snaps file bytes blocks stat_output idx=0 accent= reset=
+    local total=0 persistent=0 ephemeral=0 busy=0 allocated=0 snapshots=0 free=unknown row
+    local -a valid_images=() stat_lines=() rows=()
     if [[ -t 1 && -z ${NO_COLOR:-} ]]; then accent=$'\033[1;36m'; reset=$'\033[0m'; fi
     printf '\n%sCHROOTABLE%s  /  Debian environment workbench  /  %s\n\n' "$accent" "$reset" "$APP_VERSION"
-    workspace_summary
-    printf '\n%-24s %-7s %-11s %-10s %-9s %s\n' WORKSPACE STATE MODE PROFILE CAPACITY SNAPSHOTS
     for image in "$IMAGE_DIR/"*.img; do
         [[ -f $image && ! -L $image ]] || continue
         valid_images+=("$image")
     done
     if (( ${#valid_images[@]} )); then
-        mapfile -t stat_lines < <(stat -c '%s' -- "${valid_images[@]}") || return
+        stat_output=$(stat -c '%s %b' -- "${valid_images[@]}") || return
+        mapfile -t stat_lines <<<"$stat_output"
     fi
     for image in "${valid_images[@]}"; do
         name=${image##*/}; name=${name%.img}
-        bytes=${stat_lines[$idx]:-0}; idx=$((idx + 1))
+        read -r bytes blocks <<<"${stat_lines[$idx]:-0 0}"; idx=$((idx + 1))
+        total=$((total + 1)); allocated=$((allocated + blocks * 512))
         status=ready
-        if [[ -f $image.lock && ! -L $image.lock ]]; then status=$(image_status "$image"); fi
+        if [[ -f $image.lock && ! -L $image.lock ]]; then
+            status=$(image_status "$image")
+            [[ $status != busy ]] || busy=$((busy + 1))
+        fi
         lifecycle=persistent; profile=minimal
         if [[ -f $image.meta && ! -L $image.meta ]]; then
-            while IFS='=' read -r mkey mval; do
+            while IFS='=' read -r mkey mval || [[ -n $mkey || -n $mval ]]; do
                 case $mkey in
                     lifecycle) [[ -z $mval ]] || lifecycle=$mval ;;
                     profile) [[ -z $mval ]] || profile=$mval ;;
@@ -777,18 +842,28 @@ dashboard() {
             read -r lifecycle <"$image.mode" || true
         fi
         valid_lifecycle "$lifecycle" || lifecycle=persistent
+        if [[ $lifecycle == ephemeral ]]; then ephemeral=$((ephemeral + 1)); else persistent=$((persistent + 1)); fi
         snaps=0
         for file in "$SNAPSHOT_DIR/$name/"*.img; do [[ -f $file && ! -L $file ]] && snaps=$((snaps + 1)); done
-        printf '%-24s %-7s %-11s %-10s %-9s %s\n' "$name" "$status" "$lifecycle" "$profile" "$((bytes / 1048576))M" "$snaps"
+        printf -v row '%-24s %-7s %-11s %-10s %-9s %s' "$name" "$status" "$lifecycle" "$profile" "$((bytes / 1048576))M" "$snaps"
+        rows+=("$row")
     done
+    for file in "$SNAPSHOT_DIR/"*/*.img; do [[ ! -f $file || -L $file ]] || snapshots=$((snapshots + 1)); done
+    if [[ -d $STORE_DIR ]]; then { read -r _; read -r _ _ _ free _; } < <(df -Ph "$STORE_DIR") || free=unknown; fi
+    printf '%s workspaces   %s persistent   %s disposable   %s busy\n' "$total" "$persistent" "$ephemeral" "$busy"
+    printf '%s in images   %s host free   %s snapshots\n' "$(human_bytes "$allocated")" "$free" "$snapshots"
+    printf '\n%-24s %-7s %-11s %-10s %-9s %s\n' WORKSPACE STATE MODE PROFILE CAPACITY SNAPSHOTS
+    if (( ${#rows[@]} )); then printf '%s\n' "${rows[@]}"; fi
     printf '\nStore: %s\n' "$STORE_DIR"
     if [[ -f $STORE_DIR/activity.tsv ]]; then printf '\nRecent activity\n'; activity 5; fi
     printf '\nCreate: --create NAME 4096 persistent build\nExplore: --help | --profiles | --doctor | --demo\n\n'
 }
 activity() {
-    local count=${1:-20}
+    local count=${1:-20} c1 c2 c3 c4 c5
     if [[ -f $STORE_DIR/activity.tsv ]]; then
-        tail -n "$count" "$STORE_DIR/activity.tsv" | awk -F '\t' '{printf "%s  %-14s %-20s %s\n", $1, $2, $3, $4}'
+        while IFS=$'\t' read -r c1 c2 c3 c4 c5; do
+            printf '%s  %-14s %-20s %s\n' "$c1" "$c2" "$c3" "$c4"
+        done < <(tail -n "$count" "$STORE_DIR/activity.tsv")
     else printf 'No operations recorded yet. Create a workspace to get started.\n'; fi
 }
 show_logs() {
@@ -1107,7 +1182,7 @@ Examples
 Configuration
   sudo CHROOTABLE_HOME=/srv/chrootables chrootable-manager
   CHROOTABLE_DEBIAN_SUITE=stable
-  CHROOTABLE_DEBIAN_MIRROR=http://deb.debian.org/debian
+  CHROOTABLE_DEBIAN_MIRROR=https://deb.debian.org/debian
   CHROOTABLE_AUTO_INSTALL=0         Fail instead of installing missing tools
 
 These are host-root development environments, not security sandboxes.

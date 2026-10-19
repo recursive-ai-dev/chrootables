@@ -17,6 +17,8 @@ def desktop_quote(value):
     value = str(value).replace("%", "%%")
     for character in ('\\', '"', '`', '$'):
         value = value.replace(character, "\\" + character)
+    # The desktop file parser unescapes the value before Exec parses its arguments.
+    value = value.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
     return '"' + value + '"'
 
 entry = applications / "io.github.chrootables.Desktop.desktop"

@@ -31,7 +31,7 @@ class Client(QObject):
         self.buffer = b""
         process = QProcess(self)
         self.process = process
-        args = [str(ROOT / "chrootables" / "broker.py"), "--store", self.store]
+        args = ["-I", "-S", str(ROOT / "chrootables" / "broker.py"), "--store", self.store]
         if writable:
             program, args = "pkexec", [sys.executable, *args, "--writable"]
         else:
@@ -100,6 +100,7 @@ class Client(QObject):
         return identifier
 
     def stop(self):
+        self.is_ready = self.writable = False
         if self.process:
             process, self.process = self.process, None
             process.closeWriteChannel()
@@ -110,4 +111,3 @@ class Client(QObject):
         callbacks, self.callbacks = self.callbacks, {}
         for callback in callbacks.values():
             callback(False, "Connection changed. Refresh and try again.")
-        self.is_ready = self.writable = False

@@ -3,9 +3,13 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
+import threading
+import time
 import unittest
-from unittest.mock import patch
+from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import Mock, patch
 
 from chrootables.backend import Store, build_command, name, read_regular, shared_folder, terminal_command, deliver_export, MANAGER
 from chrootables.broker import serve
@@ -158,15 +162,74 @@ class StoreTests(unittest.TestCase):
         log = self.path / "test.log"
         log.write_text("0123456789")
         self.assertEqual(read_regular(log, 4), "6789")
+        self.assertEqual(read_regular(log, offset=6), "6789")
+        self.assertEqual(read_regular(log, offset=10), "")
         link = self.path / "link"
         link.symlink_to(log)
         with self.assertRaises(OSError):
             read_regular(link)
 
+    def test_inventory_cache_reuses_unchanged_state_and_tracks_locks_and_mutations(self):
+        import fcntl
+        import chrootables.backend as backend_mod
+        image = self.image()
+        real_run = subprocess.run
+        with patch("chrootables.backend.subprocess.run", side_effect=real_run) as mocked_run:
+            first = self.store.inventory()
+            second = self.store.inventory()
+            self.assertEqual(first["images"], second["images"])
+            self.assertEqual(mocked_run.call_count, 1)
+            with Path(str(image) + ".lock").open("w") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                busy = self.store.inventory()
+                self.assertEqual(busy["images"][0]["status"], "busy")
+                self.assertEqual(mocked_run.call_count, 1)
+            ready = self.store.inventory()
+            self.assertEqual(ready["images"][0]["status"], "ready")
+            self.assertEqual(mocked_run.call_count, 1)
+            Path(str(image) + ".meta").write_text("lifecycle=persistent\nsuite=bookworm\narchitecture=amd64\nprofile=minimal\ncreated_at=2026-10-16T10:00:00\nlast_used_at=never\n")
+            updated = self.store.inventory()
+            self.assertEqual(updated["images"][0]["lifecycle"], "persistent")
+            self.assertEqual(updated["images"][0]["suite"], "bookworm")
+            self.assertEqual(mocked_run.call_count, 2)
+
     def test_missing_store_is_empty_without_creating_it(self):
         missing = self.path / "missing"
         self.assertEqual(Store(missing).inventory()["images"], [])
         self.assertFalse(missing.exists())
+
+    def test_concurrent_inventory_requests_share_one_cache_refresh(self):
+        self.image()
+        start = threading.Barrier(2)
+        real_run = subprocess.run
+
+        def slow_inventory(*args, **kwargs):
+            time.sleep(0.05)
+            return real_run(*args, **kwargs)
+
+        def inventory():
+            start.wait(timeout=5)
+            return self.store.inventory()
+
+        with patch("chrootables.backend.subprocess.run", side_effect=slow_inventory) as run:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(inventory) for _ in range(2)]
+                results = [future.result(timeout=5) for future in futures]
+        self.assertEqual(results[0]["images"], results[1]["images"])
+        self.assertEqual(run.call_count, 1)
+
+    def test_cached_inventory_does_not_block_on_fifo_lock(self):
+        image = self.image()
+        os.mkfifo(str(image) + ".lock")
+        script = """import sys
+from chrootables.backend import Store
+store = Store(sys.argv[1])
+assert store.inventory()['images'][0]['status'] == 'ready'
+assert store.inventory()['images'][0]['status'] == 'ready'
+"""
+        result = subprocess.run([sys.executable, "-c", script, str(self.path)],
+                                capture_output=True, text=True, timeout=3)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_selected_operation_log_is_exact_and_confined(self):
         first = self.path / "logs/lab-create.log"
@@ -218,6 +281,31 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(code, 17)
         self.assertIn("diagnostic output", "".join(output))
 
+    def test_operation_log_append_during_read_is_streamed_once(self):
+        log = self.path / "logs/lab-clone.log"
+        log.write_text("first\n")
+        process = Mock(stdout=io.StringIO(), returncode=0)
+        process.poll.side_effect = [None, 0]
+        real_open = os.open
+        appended = False
+
+        def append_before_open(path, flags, *args, **kwargs):
+            nonlocal appended
+            if Path(path) == log and not appended:
+                appended = True
+                with log.open("a") as stream:
+                    stream.write("second\n")
+            return real_open(path, flags, *args, **kwargs)
+
+        output = []
+        with patch("chrootables.backend.subprocess.Popen", return_value=process), \
+             patch("chrootables.backend.time.time", return_value=0), \
+             patch("chrootables.backend.time.sleep"), \
+             patch("chrootables.backend.os.open", side_effect=append_before_open):
+            code = self.store.operate("clone", {"name": "lab", "target": "copy"}, output.append)
+        self.assertEqual(code, 0)
+        self.assertEqual("".join(output), "first\nsecond\n")
+
     def test_resolver_setup_does_not_use_uninitialized_local(self):
         work = self.path / "work"
         root = self.path / "root"
@@ -229,6 +317,29 @@ class StoreTests(unittest.TestCase):
         self.assertIn("nameserver", (work / "resolv.conf").read_text())
         self.assertTrue((root / "etc/resolv.conf").exists())
         self.assertEqual((work / "resolv.conf").stat().st_mode & 0o777, 0o644)
+
+    def test_requirements_hash_locked_and_minimal_scope(self):
+        req_text = (MANAGER.parent / "requirements.txt").read_text()
+        self.assertIn("PySide6-Essentials==6.11.2", req_text)
+        self.assertIn("shiboken6==6.11.2", req_text)
+        self.assertNotIn("PySide6-Addons", req_text)
+        self.assertNotIn(">=", req_text)
+        self.assertEqual(req_text.count("--hash=sha256:"), 10)
+
+    def test_suite_and_mirror_supply_chain_validation(self):
+        script = '''
+source "$1"
+valid_suite trixie && valid_suite bookworm && valid_suite stable || exit 10
+! valid_suite "--no-check-gpg" || exit 11
+! valid_suite $'trixie\nlifecycle=ephemeral' || exit 12
+valid_mirror "https://deb.debian.org/debian" || exit 13
+! valid_mirror "http://deb.debian.org/debian" || exit 14
+! valid_mirror "file:///tmp/mirror" || exit 15
+! valid_mirror "--no-check-gpg" || exit 16
+! write_metadata "$2/img" persistent $'trixie\norigin=injected' amd64 1024 now never minimal || exit 17
+'''
+        result = subprocess.run(["bash", "-c", script, "supply-chain-test", str(MANAGER), str(self.path)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, f"exit {result.returncode}: {result.stderr}")
 
 
 if __name__ == "__main__":
