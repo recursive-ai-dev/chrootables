@@ -155,6 +155,24 @@ package_for_command() {
             gpgv) printf gnupg2; return ;;
             xz) printf xz; return ;;
         esac
+    elif command -v pacman >/dev/null 2>&1; then
+        case $1 in
+            whiptail) printf newt; return ;;
+            ip) printf iproute2; return ;;
+            awk) printf gawk; return ;;
+            gpgv) printf gnupg; return ;;
+            hostname) printf inetutils; return ;;
+            xz) printf xz; return ;;
+        esac
+    elif command -v zypper >/dev/null 2>&1; then
+        case $1 in
+            whiptail) printf newt; return ;;
+            ip) printf iproute2; return ;;
+            awk) printf gawk; return ;;
+            gpgv) printf gpg2; return ;;
+            hostname) printf hostname; return ;;
+            xz) printf xz; return ;;
+        esac
     fi
     case $1 in
         whiptail|debootstrap|dpkg|hostname|tar|gzip|gpgv|wget) printf '%s' "$1" ;;
@@ -182,7 +200,7 @@ check_prerequisites() {
     fi
     if (( ${#packages[@]} )); then
         [[ ${CHROOTABLE_AUTO_INSTALL:-1} != 0 ]] || { fail "Missing packages: ${packages[*]}. Install them or run --setup with CHROOTABLE_AUTO_INSTALL=1."; return 1; }
-        local dep_log=/var/log/chrootable-manager-dependencies.log
+        local dep_log=${CHROOTABLE_DEP_LOG:-/var/log/chrootable-manager-dependencies.log}
         [[ ! -L $dep_log ]] || { fail "Refusing a symlink dependency log: $dep_log"; return 1; }
         info "Installing dependencies: ${packages[*]} (log: $dep_log)"
         if command -v dnf >/dev/null 2>&1; then
@@ -192,6 +210,15 @@ check_prerequisites() {
         elif command -v apt-get >/dev/null 2>&1; then
             apt-get update >>"$dep_log" 2>&1 &&
                 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages[@]}" >>"$dep_log" 2>&1 || {
+                fail "Dependency installation failed. See $dep_log"; return 1;
+            }
+        elif command -v pacman >/dev/null 2>&1; then
+            pacman -Sy --noconfirm --needed "${packages[@]}" >>"$dep_log" 2>&1 || {
+                fail "Dependency installation failed. See $dep_log"; return 1;
+            }
+        elif command -v zypper >/dev/null 2>&1; then
+            zypper --non-interactive refresh >>"$dep_log" 2>&1 &&
+                zypper --non-interactive install "${packages[@]}" >>"$dep_log" 2>&1 || {
                 fail "Dependency installation failed. See $dep_log"; return 1;
             }
         else

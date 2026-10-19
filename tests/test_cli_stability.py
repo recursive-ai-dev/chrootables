@@ -98,6 +98,81 @@ stat() {
                 else:
                     self.assertIn("ephemeral", result.stdout)
 
+    def stub_package_manager(self, name):
+        stubs = self.store / (name + "-stubs")
+        stubs.mkdir(exist_ok=True)
+        stub = stubs / name
+        stub.write_text(
+            f'#!/bin/bash\nprintf "{name}: %s\\n" "$*" >>{self.store / (name + ".log")}\n'
+        )
+        stub.chmod(0o755)
+        return stubs
+
+    def test_package_mapping_prefers_pacman_and_zypper_over_generic_fallback(self):
+        for name, expected in (
+            ("pacman", ["newt", "gnupg", "inetutils", "gawk"]),
+            ("zypper", ["newt", "gpg2", "hostname", "gawk"]),
+        ):
+            with self.subTest(manager=name):
+                stubs = self.stub_package_manager(name)
+                result = self.bash(f'''
+PATH="{stubs}"
+package_for_command whiptail; printf '\\n'
+package_for_command gpgv; printf '\\n'
+package_for_command hostname; printf '\\n'
+package_for_command awk; printf '\\n'
+''')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.split(), expected)
+
+    def test_check_prerequisites_installs_through_pacman(self):
+        stubs = self.stub_package_manager("pacman")
+        result = self.bash(f'''
+PATH="{stubs}"
+CHROOTABLE_DEP_LOG="$STORE_DIR/dep.log"
+NON_INTERACTIVE=0
+require_root() {{ :; }}
+check_prerequisites
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        invocation = (self.store / "pacman.log").read_text()
+        self.assertTrue(invocation.startswith("pacman: -Sy --noconfirm --needed "),
+                        invocation)
+        for package in ("gawk", "gnupg", "inetutils", "newt", "util-linux",
+                        "e2fsprogs", "coreutils"):
+            self.assertIn(package, invocation)
+        self.assertTrue((self.store / "dep.log").exists())
+
+    def test_check_prerequisites_installs_through_zypper(self):
+        stubs = self.stub_package_manager("zypper")
+        result = self.bash(f'''
+PATH="{stubs}"
+CHROOTABLE_DEP_LOG="$STORE_DIR/dep.log"
+NON_INTERACTIVE=0
+require_root() {{ :; }}
+check_prerequisites
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        invocations = (self.store / "zypper.log").read_text().splitlines()
+        self.assertEqual(len(invocations), 2, invocations)
+        self.assertEqual(invocations[0], "zypper: --non-interactive refresh")
+        self.assertTrue(invocations[1].startswith("zypper: --non-interactive install "),
+                        invocations[1])
+        for package in ("gawk", "gpg2", "newt", "util-linux", "e2fsprogs"):
+            self.assertIn(package, invocations[1])
+
+    def test_check_prerequisites_reports_missing_manager_when_none_supported(self):
+        empty = self.store / "empty-stubs"
+        empty.mkdir(exist_ok=True)
+        result = self.bash(f'''
+PATH="{empty}"
+CHROOTABLE_AUTO_INSTALL=1
+require_root() {{ :; }}
+check_prerequisites
+''')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Install these packages first:", result.stderr)
+
     def test_operation_cleanup_removes_resolver_artifacts_and_preserves_status(self):
         for status in (0, 17):
             with self.subTest(status=status):

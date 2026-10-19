@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Host dependency auto-install now supports Arch (`pacman`) and openSUSE
+  (`zypper`) alongside `dnf` and `apt-get`, with distro-specific package
+  name mappings. The dependency log path is overridable with
+  `CHROOTABLE_DEP_LOG` for non-root verification.
+
 ## v3.1.0 — 2026-10-19
 
 Landed the stabilization and audit passes and added the project roadmap.

@@ -58,7 +58,7 @@ use your native terminal's complete terminal emulation.
 
 | Layer | Supported | Notes |
 |---|---|---|
-| Host distro | Fedora, Debian, Ubuntu | Auto-install uses `dnf` or `apt-get`; other distros must install the prerequisites manually |
+| Host distro | Fedora, Debian, Ubuntu; Arch and openSUSE best-effort | Auto-install uses `dnf`, `apt-get`, `pacman`, or `zypper`; other distros must install the prerequisites manually |
 | Host runtime | Python 3.10+, PySide6 6.8+ | CI runs the test suite on `fedora:latest` and `debian:trixie` |
 | Guest images | Debian 13 (Trixie), Debian 12 (Bookworm) | minimal, C/C++, Python, and networking profiles |
 | Architecture | x86_64 | ARM64 is on the roadmap but not yet verified |
@@ -66,7 +66,9 @@ use your native terminal's complete terminal emulation.
 ## First run and administrator access
 
 Open **Host health** and choose **Install missing dependencies** if needed. Fedora
-uses `dnf`; Debian/Ubuntu uses `apt-get`. Setup includes debootstrap, Debian archive
+uses `dnf`; Debian/Ubuntu uses `apt-get`; Arch uses `pacman` and openSUSE uses
+`zypper` (both best-effort — package names occasionally differ, and `CHROOTABLE_AUTO_INSTALL=0`
+lets you install them yourself). Setup includes debootstrap, Debian archive
 signing keys, ext4 tools, namespace tools, and the terminal UI dependencies.
 
 The desktop window runs as your user. **Unlock workspace store** opens a polkit
