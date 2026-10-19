@@ -54,6 +54,15 @@ The desktop currently manages Debian images. It does not implement an OCI app
 store, graphical application exports, or an embedded terminal emulator. Sessions
 use your native terminal's complete terminal emulation.
 
+## Support matrix
+
+| Layer | Supported | Notes |
+|---|---|---|
+| Host distro | Fedora, Debian, Ubuntu | Auto-install uses `dnf` or `apt-get`; other distros must install the prerequisites manually |
+| Host runtime | Python 3.10+, PySide6 6.8+ | CI runs the test suite on `fedora:latest` and `debian:trixie` |
+| Guest images | Debian 13 (Trixie), Debian 12 (Bookworm) | minimal, C/C++, Python, and networking profiles |
+| Architecture | x86_64 | ARM64 is on the roadmap but not yet verified |
+
 ## First run and administrator access
 
 Open **Host health** and choose **Install missing dependencies** if needed. Fedora

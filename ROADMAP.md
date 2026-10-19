@@ -25,8 +25,8 @@ with regression tests. 69 unit tests, plus an opt-in root integration suite.
 - Packaging: publish to COPR (Fedora) and a PPA or OBS (Debian/Ubuntu) so the
   app installs without a checkout; keep `scripts/install-desktop.py` as the
   source-checkout path.
-- Release hygiene: version the audit reports into `docs/` or remove them from
-  the repo root; add a CHANGELOG.
+- Release hygiene: audit reports live under `docs/` as historical baselines;
+  maintain the CHANGELOG for each release.
 - Support matrix: document tested host distros and Python/PySide6 versions.
 
 ## Phase 2 — Reach
