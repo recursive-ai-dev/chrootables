@@ -65,6 +65,14 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(core[:3], ["sudo", "/usr/bin/env", "CHROOTABLE_AUTO_INSTALL=0"])
         self.assertIn("CHROOTABLE_HOME=/var/lib/a store", core)
 
+    def test_session_command_restricts_devices_when_requested(self):
+        core = session_command("lab", restricted_dev=True)
+        self.assertIn("--restricted-dev", core)
+        self.assertNotIn("--restricted-dev", session_command("lab"))
+        for value in (1, "true", None):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                session_command("lab", restricted_dev=value)
+
     def test_shared_folder_resolves_directory_aliases(self):
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory) / "project files"

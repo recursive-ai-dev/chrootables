@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Embedded terminal: workspace sessions now open in a pty-backed terminal
+  pane inside the desktop window, with an option to hand the session to an
+  external terminal. Covers a compact VT/ANSI subset (cursor addressing,
+  erase, insert/delete, SGR colors, alt-screen, scroll regions).
+- Opt-in restricted devices: `--restricted-dev` (CLI) and a "Restrict
+  devices" checkbox (desktop) give a session a minimal `/dev` without host
+  device nodes. The default trust model is unchanged.
 - New workspace profiles: `rust` (rustc, cargo), `go` (golang-go), and `web`
   (Node.js, npm), available in both the CLI and the desktop create dialog.
 - Host dependency auto-install now supports Arch (`pacman`) and openSUSE

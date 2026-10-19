@@ -176,12 +176,19 @@ class DesktopTests(unittest.TestCase):
                 with self.subTest(disposable=disposable):
                     self.window.open_terminal(disposable=disposable)
                     command.assert_called_with("python-playground", self.window.store, disposable=disposable,
-                                               isolated=True, share=folder, read_only=True)
+                                               isolated=True, restricted_dev=False,
+                                               share=folder, read_only=True)
             self.window.clear_shared_folder()
             self.window.open_terminal()
             command.assert_called_with("python-playground", self.window.store, disposable=False,
-                                       isolated=True, share=None, read_only=False)
-        self.assertEqual(window.call_count, 3)
+                                       isolated=True, restricted_dev=False,
+                                       share=None, read_only=False)
+            self.window.restricted.setChecked(True)
+            self.window.open_terminal()
+            command.assert_called_with("python-playground", self.window.store, disposable=False,
+                                       isolated=True, restricted_dev=True,
+                                       share=None, read_only=False)
+        self.assertEqual(window.call_count, 4)
 
     def test_unavailable_saved_folder_prevents_terminal_launch(self):
         self.enable_shared_folder_controls()

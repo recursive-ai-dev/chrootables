@@ -392,17 +392,19 @@ def shared_folder(value):
 
 
 def session_command(target, store=DEFAULT_STORE, *, disposable=False, isolated=False,
-                    share=None, read_only=False):
+                    share=None, read_only=False, restricted_dev=False):
     """The validated sudo argv that starts a workspace session."""
     target = name(target)
-    if not isinstance(read_only, bool):
-        raise ValueError("Read-only must be true or false.")
+    if not isinstance(read_only, bool) or not isinstance(restricted_dev, bool):
+        raise ValueError("Read-only and restricted-devices must be true or false.")
     if read_only and share is None:
         raise ValueError("Choose a shared folder before enabling read-only access.")
     action = "--try" if disposable else "--enter-isolated" if isolated else "--enter"
     command = ["sudo", "/usr/bin/env", "CHROOTABLE_AUTO_INSTALL=0", "CHROOTABLE_HOME=" + str(store), str(MANAGER), action, target]
     if disposable and isolated:
         command.append("--isolated")
+    if restricted_dev:
+        command.append("--restricted-dev")
     if share is not None:
         command += ["--share", shared_folder(share)]
         if read_only:
@@ -411,9 +413,9 @@ def session_command(target, store=DEFAULT_STORE, *, disposable=False, isolated=F
 
 
 def terminal_command(target, store=DEFAULT_STORE, *, disposable=False, isolated=False,
-                     share=None, read_only=False):
+                     share=None, read_only=False, restricted_dev=False):
     command = session_command(target, store, disposable=disposable, isolated=isolated,
-                              share=share, read_only=read_only)
+                              share=share, read_only=read_only, restricted_dev=restricted_dev)
     if shutil.which("konsole"):
         return ["konsole", "--separate", "--hold", "-p", "tabtitle=" + target, "-e"] + command
     if shutil.which("gnome-terminal"):

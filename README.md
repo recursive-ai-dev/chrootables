@@ -38,8 +38,10 @@ For a clearly labeled, read-only tour with sample data:
 - Search and filter workspaces by profile, release, lifecycle, favorites, or usage.
 - Create Debian 13 (Trixie) or Debian 12 (Bookworm) images from minimal, C/C++,
   Python, networking, Rust, Go, and web (Node.js) profiles.
-- Open a shell in Konsole, GNOME Terminal, or xterm. Choose a disposable session
-  without changing the image's default lifecycle, and optionally isolate networking.
+- Open a shell in the embedded terminal pane, or hand the session to Konsole,
+  GNOME Terminal, or xterm. Choose a disposable session without changing the
+  image's default lifecycle, optionally isolate networking, and optionally
+  restrict devices.
 - Share a host folder at `/shared`, optionally read-only. The desktop remembers
   your folder and access setting for each workspace and store.
 - Save snapshots, restore with an automatic before-restore recovery point, and
@@ -51,8 +53,9 @@ For a clearly labeled, read-only tour with sample data:
   `F5` to refresh. Workspace status refreshes every six seconds.
 
 The desktop currently manages Debian images. It does not implement an OCI app
-store, graphical application exports, or an embedded terminal emulator. Sessions
-use your native terminal's complete terminal emulation.
+store or graphical application exports. The embedded terminal pane implements a
+compact VT/ANSI subset; for full terminal fidelity use the external terminal
+button in the session window.
 
 ## Support matrix
 
@@ -123,7 +126,11 @@ for your desktop user and are not copied with cloned images or recovery points.
 Sessions use private mount, UTS, IPC and PID namespaces. Optional network isolation
 adds a private network namespace with only loopback. `/sys` is not mounted.
 **This is a tool for trusted development, not a security sandbox for hostile code:**
-it runs as host root and exposes host devices through `/dev`.
+it runs as host root and exposes host devices through `/dev`. The opt-in
+`--restricted-dev` session option replaces `/dev` with a minimal tmpfs holding
+only `null`, `zero`, `full`, `random`, `urandom`, `tty`, and a fresh `devpts`
+instance; no host device nodes are exposed, at the cost of tools that expect
+more devices.
 
 Debian bootstrap uses HTTPS and explicitly requires Release signature verification
 against the installed Debian archive keyring. Chrootables does not depend on cpak's
@@ -157,7 +164,8 @@ sudo CHROOTABLE_DEBIAN_SUITE=trixie ./chrootable-manager --create lab 2048 persi
 
 Use `--share /absolute/host/folder` with `--enter`, `--enter-isolated`, `--exec`,
 or `--try` to mount one existing directory at `/shared`. Add `--read-only` for a
-read-only mount. Session options go before the `--` command separator and can be
+read-only mount, and `--restricted-dev` for a minimal `/dev` without host device
+nodes. Session options go before the `--` command separator and can be
 combined with `--isolated` for `--exec` and `--try`. The CLI shares only when the
 option is supplied; it does not use the desktop's saved preferences. The host root
 directory cannot be shared, and a guest `/shared` symlink or non-directory is

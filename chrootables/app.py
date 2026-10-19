@@ -274,6 +274,7 @@ class Window(QMainWindow):
         self.data = {"images": [], "snapshots": [], "activity": [], "free_bytes": 0}
         self.selected = None
         self.network_choices = {}
+        self.restricted_choices = {}
         self.shared_folder_choices = {}
         self.session_settings_prefix = "sessions/" + sha256(str(self.store.resolve()).encode()).hexdigest()
         self.busy = False
@@ -668,6 +669,10 @@ class Window(QMainWindow):
         self.offline.setToolTip("Only loopback is available; internet and host networking are disconnected.")
         self.offline.toggled.connect(lambda checked: self.network_choices.__setitem__(self.selected, checked) if self.selected else None)
         layout.addWidget(self.offline)
+        self.restricted = QCheckBox("Restrict devices for this session")
+        self.restricted.setToolTip("The session gets a minimal /dev without host device nodes. Fewer tools will work; this is still not a security sandbox.")
+        self.restricted.toggled.connect(lambda checked: self.restricted_choices.__setitem__(self.selected, checked) if self.selected else None)
+        layout.addWidget(self.restricted)
         layout.addWidget(label("SHARED FOLDER · /shared", "eyebrow"))
         self.share_path = QLineEdit()
         self.share_path.setObjectName("sharedFolderPath")
@@ -810,6 +815,7 @@ class Window(QMainWindow):
         self.selected = data["name"]
         fav = self.selected in self.favorites
         isolated = self.network_choices.get(self.selected, False)
+        restricted = self.restricted_choices.get(self.selected, False)
         share, read_only = self.shared_folder_choice(self.selected)
         can_configure = not self.demo and not self.busy and data["status"] != "busy"
         state = (
@@ -831,6 +837,9 @@ class Window(QMainWindow):
             self.offline.blockSignals(True)
             self.offline.setChecked(isolated)
             self.offline.blockSignals(False)
+            self.restricted.blockSignals(True)
+            self.restricted.setChecked(restricted)
+            self.restricted.blockSignals(False)
             self.share_path.setText(share)
             self.share_path.setToolTip(share or "Choose a host folder to make it available at /shared.")
             self.share_choose.setEnabled(can_configure)
@@ -1055,6 +1064,7 @@ class Window(QMainWindow):
         try:
             share, read_only = self.shared_folder_choice(self.selected)
             keyword = dict(disposable=disposable, isolated=self.offline.isChecked(),
+                           restricted_dev=self.restricted.isChecked(),
                            share=share or None, read_only=read_only)
             command = session_command(self.selected, self.store, **keyword)
         except ValueError as error:

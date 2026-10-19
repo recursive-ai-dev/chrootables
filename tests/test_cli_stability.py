@@ -187,6 +187,38 @@ packages=$(profile_packages {profile}) || {{ printf 'no packages\n' >&2; exit 1;
         for profile in ("rust", "go", "web"):
             self.assertIn(profile, listing.stdout)
 
+    def test_restricted_dev_session_flag_parses_once_per_operation(self):
+        for operation, allowed in (("--enter", True), ("--enter-isolated", True),
+                                   ("--exec", True), ("--try", True)):
+            with self.subTest(operation=operation):
+                arguments = [operation, "lab", "--restricted-dev"]
+                if operation in ("--exec", "--try"):
+                    arguments += ["--", "true"]
+                result = self.bash("validate_session_arguments \"$@\"",
+                                  *arguments)
+                self.assertEqual(allowed, result.returncode == 0, result.stderr)
+        for operation in ("--enter", "--exec", "--try"):
+            arguments = [operation, "lab", "--restricted-dev", "--restricted-dev"]
+            if operation in ("--exec", "--try"):
+                arguments += ["--", "true"]
+            result = self.bash("validate_session_arguments \"$@\"", *arguments)
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_enter_chrootable_hands_restricted_dev_to_worker(self):
+        for flag, expected in ((1, "1"), (0, "0")):
+            with self.subTest(flag=flag):
+                result = self.bash(f'''
+SESSION_RESTRICTED_DEV={flag}
+lock_image() {{ return 0; }}
+assert_offline() {{ return 0; }}
+begin_operation() {{ return 0; }}
+make_workdir() {{ WORK="$STORE_DIR/work"; mkdir -p "$WORK"; return 0; }}
+unshare() {{ printf '%s' "$CHROOTABLE_RESTRICTED_DEV" >"$STORE_DIR/restricted-flag"; return 0; }}
+enter_chrootable "$STORE_DIR/images/lab.img" persistent shared "" 0
+''')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((self.store / "restricted-flag").read_text(), expected)
+
     def test_operation_cleanup_removes_resolver_artifacts_and_preserves_status(self):
         for status in (0, 17):
             with self.subTest(status=status):

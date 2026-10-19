@@ -511,6 +511,7 @@ enter_chrootable() (
     shift 5
     if [[ -n $share ]]; then canonicalize_shared_folder "$share" share || return; fi
     [[ $read_only == 0 || ( $read_only == 1 && -n $share ) ]] || { fail "Read-only sharing requires a host folder."; return 1; }
+    export CHROOTABLE_RESTRICTED_DEV="${SESSION_RESTRICTED_DEV:-0}"
     name=$(basename "$image" .img)
     lock_image "$image" descriptor || return
     assert_offline "$image" || return
@@ -593,6 +594,20 @@ mount_session_devices() {
     fi
     mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs "$WORKER_ROOT/run"
 }
+mount_restricted_devices() {
+    # Opt-in reduced /dev: a fresh tmpfs with only the character devices a
+    # Debian shell needs. No host device nodes are exposed.
+    local dev="$WORKER_ROOT/dev"
+    mkdir -p "$dev/pts" || return
+    mount -t tmpfs -o mode=0755,nosuid tmpfs "$dev" || return
+    mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts "$dev/pts" || return
+    ln -s pts/ptmx "$dev/ptmx" || return
+    ln -s /proc/self/fd "$dev/fd" && ln -s /proc/self/fd/0 "$dev/stdin" &&
+        ln -s /proc/self/fd/1 "$dev/stdout" && ln -s /proc/self/fd/2 "$dev/stderr" || return
+    mknod -m 666 "$dev/null" c 1 3 && mknod -m 666 "$dev/zero" c 1 5 &&
+        mknod -m 666 "$dev/full" c 1 7 && mknod -m 444 "$dev/random" c 1 8 &&
+        mknod -m 666 "$dev/urandom" c 1 9 && mknod -m 666 "$dev/tty" c 5 0 || return
+}
 canonicalize_shared_folder() {
     local original=$1 resolved
     [[ $original == /* ]] || { fail "Shared folder must be an absolute host directory."; return 1; }
@@ -671,7 +686,11 @@ worker_main() (
             else
                 setup_resolv_conf "$work" "$WORKER_ROOT"
             fi
-            mount_session_devices || return
+            if [[ ${CHROOTABLE_RESTRICTED_DEV:-0} == 1 ]]; then
+                mount_restricted_devices || return
+            else
+                mount_session_devices || return
+            fi
             mount_shared_folder "$share" "$read_only" || return
             hostname "$name" || return
             printf 'started\n' >"$work/started" || return
@@ -1178,12 +1197,12 @@ Explore (no root required when the store is readable)
 
 Create and use (root required)
   --create NAME SIZE_MIB persistent|ephemeral [PROFILE]
-  --enter NAME [--share HOST_DIR] [--read-only]
+  --enter NAME [--share HOST_DIR] [--read-only] [--restricted-dev]
                                    Open a root shell
-  --enter-isolated NAME [--share HOST_DIR] [--read-only]
+  --enter-isolated NAME [--share HOST_DIR] [--read-only] [--restricted-dev]
                                    Open a shell without host network access
-  --exec NAME [--isolated] [--share HOST_DIR] [--read-only] -- COMMAND [ARG...]
-  --try NAME [--isolated] [--share HOST_DIR] [--read-only] [-- COMMAND [ARG...]]
+  --exec NAME [--isolated] [--share HOST_DIR] [--read-only] [--restricted-dev] -- COMMAND [ARG...]
+  --try NAME [--isolated] [--share HOST_DIR] [--read-only] [--restricted-dev] [-- COMMAND [ARG...]]
                                    Disposable session, regardless of image mode
   --clone NAME NEW_NAME             Independent copy (reflink when available)
   --mode NAME persistent|ephemeral  Change the default session lifecycle
@@ -1220,12 +1239,13 @@ Configuration
 
 These are host-root development environments, not security sandboxes.
 Ephemeral sessions discard image writes but still expose host devices and any
-writable shared folder. Guest root can undo read-only mounts.'
+writable shared folder. Guest root can undo read-only mounts. Add
+--restricted-dev to give a session a minimal /dev without host device nodes.'
 }
 usage_error() { fail "Invalid arguments. Run $0 --help for usage." || true; return 2; }
 validate_session_arguments() {
-    local operation=$1 isolated_seen=0 share_seen=0 read_only_seen=0
-    SESSION_NETWORK=shared SESSION_SHARE= SESSION_READ_ONLY=0 SESSION_COMMAND=()
+    local operation=$1 isolated_seen=0 share_seen=0 read_only_seen=0 restricted_seen=0
+    SESSION_NETWORK=shared SESSION_SHARE= SESSION_READ_ONLY=0 SESSION_RESTRICTED_DEV=0 SESSION_COMMAND=()
     [[ $operation != --enter-isolated ]] || SESSION_NETWORK=isolated
     shift 2
     while (( $# )); do
@@ -1240,6 +1260,9 @@ validate_session_arguments() {
             --read-only)
                 (( read_only_seen == 0 )) || return 1
                 read_only_seen=1; SESSION_READ_ONLY=1; shift ;;
+            --restricted-dev)
+                (( restricted_seen == 0 )) || return 1
+                restricted_seen=1; SESSION_RESTRICTED_DEV=1; shift ;;
             --)
                 [[ $operation == --exec || $operation == --try ]] && (( $# >= 2 )) || return 1
                 shift; SESSION_COMMAND=("$@"); break ;;
