@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Stop the embedded terminal's process group when closing a session, so child
+  commands do not keep the PTY open after Ubuntu's shell exits.
+- Add a rootless `.deb` builder, system menu entry, and Ubuntu/Debian runtime
+  dependencies. Packaged launchers use system interpreters so Homebrew Python
+  and virtual environments do not interfere with distribution Qt bindings.
 - Offline creation: `--archive-sync SUITE [PROFILE...]` downloads the
   minbase system (as a debootstrap tarball), the Debian-signed apt lists, and
   every profile deb into `archive/` in the store. Creates for that suite then

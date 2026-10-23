@@ -190,6 +190,26 @@ class DesktopTests(unittest.TestCase):
                                        share=None, read_only=False)
         self.assertEqual(window.call_count, 4)
 
+    def test_external_terminal_keeps_original_workspace_after_selection_changes(self):
+        self.enable_shared_folder_controls()
+        with patch("chrootables.app.TerminalWindow") as window, \
+                patch("chrootables.app.terminal_command", return_value=["terminal"]) as command, \
+                patch("chrootables.app.QProcess.startDetached", return_value=(True, 123)):
+            self.window.open_terminal()
+            external = window.call_args.kwargs["external"]
+            self.window.selected = "clean-slate"
+            external()
+            self.assertEqual(command.call_args.args[0], "python-playground")
+
+    def test_terminal_launch_failure_is_reported_without_registering_window(self):
+        self.enable_shared_folder_controls()
+        with patch("chrootables.app.TerminalWindow", side_effect=OSError("missing sudo")), \
+                patch.object(self.window, "show_error") as error:
+            self.window.open_terminal()
+        error.assert_called_once()
+        self.assertIn("missing sudo", error.call_args.args[0])
+        self.assertEqual(self.window.terminals, [])
+
     def test_unavailable_saved_folder_prevents_terminal_launch(self):
         self.enable_shared_folder_controls()
         folder = self.shared_directory()

@@ -20,19 +20,19 @@ jobs:
     steps:
       - name: Install dependencies (Fedora)
         if: startsWith(matrix.container, 'fedora')
-        run: dnf install -y --setopt=install_weak_deps=False git python3-pyside6
+        run: dnf install -y --setopt=install_weak_deps=False git python3-pyside6 python3-gobject-base desktop-file-utils
       - name: Install dependencies (Debian)
         if: startsWith(matrix.container, 'debian')
         run: |
           apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git python3-pyside6
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git python3-pyside6 python3-gi gir1.2-glib-2.0 desktop-file-utils dpkg
       - uses: actions/checkout@v4
-      - name: Syntax check
-        run: bash -n chrootable-manager
-      - name: Unit tests
-        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
-      - name: Demo screenshot
-        run: ./chrootables-desktop --demo --screenshot /tmp/chrootables.png
+      - name: Verify (Fedora)
+        if: startsWith(matrix.container, 'fedora')
+        run: python3 scripts/check.py --require-desktop-integration
+      - name: Verify and build package (Debian)
+        if: startsWith(matrix.container, 'debian')
+        run: python3 scripts/check.py --require-desktop-integration --build-deb
 
   integration:
     name: integration (root, opt-in)

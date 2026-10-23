@@ -9,6 +9,7 @@ from __future__ import annotations
 import codecs
 import fcntl
 import os
+import signal
 import struct
 import subprocess
 import termios
@@ -398,11 +399,18 @@ class VtScreen:
         columns = max(20, columns)
         if rows == self.rows and columns == self.columns:
             return
-        lines = [self._blank_line() for _ in range(rows)]
-        for index, line in enumerate(self.lines[:rows]):
-            width = min(columns, self.columns)
-            lines[index][:width] = line[:width]
-        self.lines = lines
+        def resized(lines):
+            result = [[(" ", DEFAULT_STYLE)] * columns for _ in range(rows)]
+            for index, line in enumerate(lines[:rows]):
+                width = min(columns, len(line))
+                result[index][:width] = line[:width]
+            return result
+
+        self.lines = resized(self.lines)
+        if self._primary is not None:
+            lines, row, column, _, _ = self._primary
+            self._primary = (resized(lines), min(row, rows - 1),
+                             min(column, columns - 1), 0, rows - 1)
         self.rows, self.columns = rows, columns
         self._top, self._bottom = 0, rows - 1
         self._clamp_cursor()
@@ -446,41 +454,62 @@ class PtyProcess(QObject):
                  rows=DEFAULT_ROWS, columns=DEFAULT_COLUMNS):
         super().__init__(parent)
         self.master, slave = os.openpty()
-        self._set_window_size(slave, rows, columns)
-        environment = dict(os.environ)
-        environment.setdefault("TERM", "xterm-256color")
-        if env:
-            environment.update(env)
-        self.process = subprocess.Popen(
-            argv, stdin=slave, stdout=slave, stderr=slave,
-            start_new_session=True, env=environment, close_fds=True,
-        )
-        os.close(slave)
+        try:
+            self._set_window_size(slave, rows, columns)
+            environment = dict(os.environ)
+            environment.setdefault("TERM", "xterm-256color")
+            if env:
+                environment.update(env)
+            self.process = subprocess.Popen(
+                argv, stdin=slave, stdout=slave, stderr=slave,
+                start_new_session=True, env=environment, close_fds=True,
+            )
+        except BaseException:
+            os.close(self.master)
+            raise
+        finally:
+            os.close(slave)
         self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self._notifier = QSocketNotifier(self.master, QSocketNotifier.Type.Read, self)
         self._notifier.activated.connect(self._readable)
+        self._finished = False
+        self._reaper = QTimer(self)
+        self._reaper.setInterval(25)
+        self._reaper.timeout.connect(self._check_finished)
 
     def _set_window_size(self, descriptor, rows, columns):
         winsize = struct.pack("HHHH", rows, columns, 0, 0)
         fcntl.ioctl(descriptor, termios.TIOCSWINSZ, winsize)
 
     def _readable(self):
+        if self.master is None:
+            return
         try:
             data = os.read(self.master, 65536)
         except OSError:
             data = b""
         if not data:
             self._notifier.setEnabled(False)
-            code = self.process.wait()
-            try:
-                os.close(self.master)
-            except OSError:
-                pass
-            self.finished.emit(code)
+            descriptor, self.master = self.master, None
+            os.close(descriptor)
+            remaining = self._decoder.decode(b"", final=True)
+            if remaining:
+                self.output.emit(remaining)
+            self._reaper.start()
+            self._check_finished()
             return
         self.output.emit(self._decoder.decode(data))
 
+    def _check_finished(self):
+        code = self.process.poll()
+        if code is not None and not self._finished:
+            self._finished = True
+            self._reaper.stop()
+            self.finished.emit(code)
+
     def write(self, payload):
+        if self.master is None:
+            return
         if isinstance(payload, str):
             payload = payload.encode("utf-8")
         try:
@@ -489,13 +518,21 @@ class PtyProcess(QObject):
             pass
 
     def resize(self, rows, columns):
+        if self.master is None:
+            return
         try:
             self._set_window_size(self.master, rows, columns)
         except OSError:
             pass
 
     def terminate(self):
-        self.process.terminate()
+        # start_new_session creates a private group. Stop its children too:
+        # Ubuntu's /bin/sh can leave cat holding the PTY after the shell exits.
+        if not self._finished:
+            try:
+                os.killpg(self.process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
 
     @property
     def running(self):
@@ -620,9 +657,11 @@ class TerminalWindow(QDialog):
         self.setWindowTitle(title)
         self.resize(760, 480)
         self._external = external
+        self._closing = False
         layout = QVBoxLayout(self)
         self.pane = TerminalPane()
-        self.process = PtyProcess(command)
+        self.process = PtyProcess(command, parent=self)
+        self.process.finished.connect(self._session_finished)
         self.pane.attach(self.process)
         layout.addWidget(self.pane, 1)
         buttons = QHBoxLayout()
@@ -647,5 +686,25 @@ class TerminalWindow(QDialog):
     def closeEvent(self, event):
         # Closing the window ends the session, matching the CLI's rule that
         # closing the terminal releases the image lock.
-        self.process.terminate()
-        super().closeEvent(event)
+        if self._begin_close():
+            super().closeEvent(event)
+        else:
+            event.ignore()
+
+    def _begin_close(self):
+        if self.process._finished:
+            return True
+        if not self._closing:
+            self._closing = True
+            self.process.terminate()
+        # Keep the window (and its process/notifier) owned until EOF and reaping.
+        return False
+
+    def reject(self):
+        # Escape calls reject directly, bypassing closeEvent.
+        if self._begin_close():
+            super().reject()
+
+    def _session_finished(self, code):
+        if self._closing:
+            self.close()

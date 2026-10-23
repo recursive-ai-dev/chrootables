@@ -1,9 +1,11 @@
 """Terminal emulation, key mapping, and pty round-trip tests. No root required."""
 import os
+from pathlib import Path
 import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -121,6 +123,30 @@ class VtScreenTests(unittest.TestCase):
         self.assertEqual(screen.plain().splitlines()[0], "a")
         self.assertEqual((screen.row, screen.column), (0, 0))
 
+    def test_resize_updates_every_row_width_and_accepts_output(self):
+        screen = VtScreen(3, 20)
+        screen.feed("kept")
+        for rows, columns in ((5, 40), (2, 25)):
+            screen.resize(rows, columns)
+            self.assertEqual(len(screen.lines), rows)
+            self.assertTrue(all(len(line) == columns for line in screen.lines))
+            screen.feed(f"\x1b[{rows};{columns}HX")
+            self.assertEqual(screen.lines[-1][-1][0], "X")
+        self.assertTrue(screen.plain().startswith("kept"))
+
+    def test_resize_alternate_screen_also_resizes_saved_primary(self):
+        for rows, columns in ((5, 40), (2, 20)):
+            with self.subTest(rows=rows, columns=columns):
+                screen = VtScreen(3, 30)
+                screen.feed("primary\x1b[?1049h")
+                screen.resize(rows, columns)
+                screen.feed("\x1b[?1049l")
+                self.assertEqual(len(screen.lines), rows)
+                self.assertTrue(all(len(line) == columns for line in screen.lines))
+                self.assertTrue(screen.plain().startswith("primary"))
+                screen.feed(f"\x1b[{rows};1H\nend")
+                self.assertIn("end", screen.plain())
+
     def test_resize_preserves_text(self):
         screen = VtScreen(4, 20)
         screen.feed("hello")
@@ -154,6 +180,55 @@ class PtyProcessTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
+
+    def test_failed_start_closes_both_pty_descriptors(self):
+        for failure in ("spawn", "window_size"):
+            with self.subTest(failure=failure):
+                master, slave = os.openpty()
+                try:
+                    failing_call = ("chrootables.terminal.subprocess.Popen" if failure == "spawn"
+                                    else "chrootables.terminal.PtyProcess._set_window_size")
+                    with patch("chrootables.terminal.os.openpty", return_value=(master, slave)), \
+                            patch(failing_call, side_effect=OSError("launch failed")):
+                        with self.assertRaisesRegex(OSError, "launch failed"):
+                            PtyProcess(["missing-command"])
+                    for descriptor in (master, slave):
+                        with self.assertRaises(OSError):
+                            os.fstat(descriptor)
+                finally:
+                    for descriptor in (master, slave):
+                        try:
+                            os.close(descriptor)
+                        except OSError:
+                            pass
+
+    def test_eof_reaps_without_waiting_and_invalidates_descriptor(self):
+        child = Mock()
+        child.poll.return_value = None
+        child.wait.side_effect = AssertionError("GUI thread must not wait")
+        with patch("chrootables.terminal.subprocess.Popen", return_value=child):
+            process = PtyProcess(["fake-child"])
+        finished = []
+        output = []
+        process.finished.connect(finished.append)
+        process.output.connect(output.append)
+        process._decoder.decode(b"\xe2")
+        process._readable()  # The slave is closed, but the child has not exited.
+        self.assertIsNone(process.master)
+        self.assertEqual(finished, [])
+        self.assertEqual(output, ["\ufffd"])
+        with patch("chrootables.terminal.os.write") as write, \
+                patch.object(process, "_set_window_size") as resize:
+            process.write("late input")
+            process.resize(24, 80)
+        write.assert_not_called()
+        resize.assert_not_called()
+        child.poll.return_value = 7
+        self.assertTrue(pump(self.app, lambda: bool(finished)))
+        process._readable()
+        process._check_finished()
+        self.assertEqual(finished, [7])
+        child.wait.assert_not_called()
 
     def test_round_trip_and_finish(self):
         collected = []
@@ -202,8 +277,9 @@ class TerminalPaneTests(unittest.TestCase):
             QTest.keyClick(pane, Qt.Key.Key_Return)
             self.assertTrue(pump(self.app,
                                  lambda: os.path.exists(target) and
-                                 open(target).read().strip() == "hello"))
+                                 Path(target).read_text().strip() == "hello"))
             process.terminate()
+            self.assertTrue(pump(self.app, lambda: process._finished))
             pane.close()
 
 
@@ -211,6 +287,41 @@ class TerminalWindowTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
+
+    def test_close_terminates_children_after_session_leader_exits(self):
+        script = "import subprocess; subprocess.Popen(['/bin/sleep', '30']); print('READY', flush=True)"
+        window = TerminalWindow([sys.executable, "-c", script], "session")
+        window.show()
+        self.assertTrue(pump(self.app, lambda: "READY" in window.pane.screen.plain()
+                             and window.process.process.poll() is not None))
+        self.assertFalse(window.process._finished)
+        window.close()
+        self.assertTrue(pump(self.app, lambda: window.process._finished))
+        self.assertFalse(window.isVisible())
+
+    def test_close_and_escape_keep_window_owned_until_child_is_reaped(self):
+        script = ("import os, signal, time; "
+                  "signal.signal(signal.SIGTERM, lambda *args: (time.sleep(.15), os._exit(0))); "
+                  "print('READY', flush=True); time.sleep(30)")
+        for escape in (False, True, False):
+            with self.subTest(escape=escape):
+                window = TerminalWindow([sys.executable, "-c", script], "session")
+                window.show()
+                finished = []
+                window.finished.connect(finished.append)
+                self.assertTrue(pump(self.app, lambda: "READY" in window.pane.screen.plain()))
+                if escape:
+                    QTest.keyClick(window, Qt.Key.Key_Escape)
+                else:
+                    window.close()
+                self.assertEqual(finished, [])
+                self.assertTrue(window.isVisible())
+                self.assertTrue(pump(self.app, lambda: bool(finished)))
+                self.assertFalse(window.isVisible())
+                self.assertTrue(window.process._finished)
+                self.assertIsNone(window.process.master)
+                self.assertEqual(window.process.process.returncode, 0)
+                self.assertEqual(len(finished), 1)
 
     def test_window_hosts_session_and_close_terminates_it(self):
         window = TerminalWindow(["/bin/sh", "-c", "printf 'READY'; sleep 30"],
@@ -220,7 +331,7 @@ class TerminalWindowTests(unittest.TestCase):
         self.assertTrue(pump(self.app, lambda: "READY" in window.pane.screen.plain()))
         self.assertTrue(window.process.running)
         window.close()
-        self.assertTrue(pump(self.app, lambda: not window.process.running))
+        self.assertTrue(pump(self.app, lambda: window.process._finished and not window.isVisible()))
 
 
 if __name__ == "__main__":

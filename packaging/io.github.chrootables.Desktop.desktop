@@ -1,0 +1,16 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Chrootables
+Comment=Build, snapshot and explore local Debian workspaces
+Exec=chrootables-desktop
+Icon=io.github.chrootables.Desktop
+Terminal=false
+Categories=Development;
+Keywords=Linux;Debian;chroot;workspace;snapshot;container;
+StartupNotify=true
+Actions=Tour;
+
+[Desktop Action Tour]
+Name=Explore the desktop tour
+Exec=chrootables-desktop --demo

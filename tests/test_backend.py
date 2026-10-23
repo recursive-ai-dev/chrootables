@@ -294,6 +294,83 @@ assert store.inventory()['images'][0]['status'] == 'ready'
             deliver_export(source, target)
         self.assertEqual(target.read_bytes(), b"archive payload")
 
+    @unittest.skipIf(os.getuid() == 0, "Tests the user-side export writer")
+    def test_failed_export_copy_removes_partial_destination_and_retains_source(self):
+        source = self.path / "source.tar.gz"
+        source.write_bytes(b"original archive")
+        target = self.path / "partial.tar.gz"
+        real_run = subprocess.run
+        for failure in ("OSError(28, 'No space left on device')", "KeyboardInterrupt()"):
+            with self.subTest(failure=failure):
+                def inject_copy_failure(argv, **kwargs):
+                    injected = ("def failed_copy(source, destination, length):\n"
+                                "    destination.write(b'partial')\n"
+                                "    raise " + failure + "\n"
+                                "def unsupported_copy(*args):\n"
+                                "    raise OSError(18, 'Cross-device link')\n"
+                                "os.copy_file_range = unsupported_copy\n"
+                                "shutil.copyfileobj = failed_copy\n")
+                    argv = list(argv)
+                    argv[4] = argv[4].replace("source, destination =", injected + "source, destination =", 1)
+                    return real_run(argv, **kwargs)
+                with patch("chrootables.backend.subprocess.run", side_effect=inject_copy_failure):
+                    with self.assertRaisesRegex(RuntimeError, "saving the chosen copy failed"):
+                        deliver_export(source, target)
+                self.assertFalse(target.exists())
+                self.assertEqual(source.read_bytes(), b"original archive")
+
+    def test_inventory_failure_does_not_publish_a_new_cache_signature(self):
+        image = self.image()
+        initial = self.store.inventory()
+        signature = self.store._images_sig
+        metadata_path = Path(str(image) + ".meta")
+        metadata_path.write_text(metadata_path.read_text() + "origin=changed\n")
+        with patch("chrootables.backend.subprocess.run",
+                   return_value=Mock(returncode=1, stderr="image disappeared", stdout="")):
+            with self.assertRaisesRegex(PermissionError, "image disappeared"):
+                self.store.inventory()
+        self.assertEqual(self.store._images_sig, signature)
+        self.assertEqual(self.store._images_cache, initial["images"])
+        self.assertEqual(self.store.inventory()["images"][0]["origin"], "changed")
+
+    def test_snapshot_disappearing_during_scan_is_reported_and_next_refresh_recovers(self):
+        folder = self.path / "snapshots/lab"
+        folder.mkdir()
+        snapshot = folder / "checkpoint.img"
+        snapshot.touch()
+        real_scandir = os.scandir
+
+        class VanishingScan:
+            def __enter__(self):
+                self.scan = real_scandir(folder)
+                return self.scan.__enter__()
+
+            def __exit__(self, *args):
+                self.scan.__exit__(*args)
+                snapshot.unlink()
+
+        def scandir(path):
+            return VanishingScan() if Path(path) == folder else real_scandir(path)
+
+        with patch("chrootables.backend.os.scandir", side_effect=scandir):
+            with self.assertRaises(FileNotFoundError):
+                self.store.inventory()
+        self.assertEqual(self.store.inventory()["snapshots"], [])
+
+    def test_broker_reports_spawn_failure_and_keeps_serving(self):
+        request = json.dumps({"id": 1, "action": "clone", "params": {"name": "lab", "target": "copy"}})
+        request += '\n{"id":2,"action":"doctor"}\n'
+        output = io.StringIO()
+        with patch("chrootables.backend.subprocess.Popen", side_effect=OSError("cannot launch manager")), \
+                patch.object(self.store, "doctor", return_value={"ready": True, "output": "ready"}):
+            serve(self.store, io.StringIO(request), output, writable=True)
+        results = {message["id"]: message for line in output.getvalue().splitlines()
+                   if (message := json.loads(line)).get("event") == "result"}
+        self.assertFalse(results[1]["ok"])
+        self.assertEqual(results[1]["code"], "operation_failed")
+        self.assertIn("cannot launch manager", results[1]["error"])
+        self.assertTrue(results[2]["ok"])
+
     def test_operation_failure_is_reported_and_streamed(self):
         fake = self.path / "fake-manager"
         fake.write_text("#!/bin/sh\nprintf 'diagnostic output\\n'\nexit 17\n")

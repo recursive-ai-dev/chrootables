@@ -6,6 +6,35 @@ point. The Qt desktop and the Bash terminal interface use the same image store.
 
 ## Launch
 
+### Ubuntu / Debian package
+
+On Ubuntu 26.04, install the locally built package with:
+
+```bash
+sudo apt install ./dist/chrootables_3.1.0-1_all.deb
+chrootables-desktop
+```
+
+APT installs the Qt bindings and workspace prerequisites. The package adds an
+application-menu entry and the `chrootable-manager` CLI. Its desktop launcher uses
+`/usr/bin/python3`, so a Homebrew Python or activated virtual environment does not
+override Ubuntu's Python and Qt packages. Launch the desktop as your normal user;
+workspace operations request administrator access when needed.
+
+Build the package without root or pip dependencies:
+
+```bash
+/usr/bin/python3 scripts/build-deb.py
+```
+
+The build requires `dpkg-deb` (from `dpkg`). The package contains portable Python
+and Bash code (`Architecture: all`); the verified host architecture is amd64.
+It requires distro PySide6 6.8 or newer, so older Ubuntu/Debian releases may not
+provide suitable dependencies. Remove it with `sudo apt remove chrootables`;
+workspace images in `/var/lib/chrootable-manager` remain intact.
+
+### From a checkout
+
 ```bash
 ./chrootables-desktop
 ```
@@ -14,6 +43,9 @@ Requires Python 3.10+ and PySide6 6.8+. On Fedora, install the desktop dependenc
 with `sudo dnf install python3-pyside6`. Alternatively, use a virtual environment
 and `python -m pip install -r requirements.txt`, then run the launcher from that
 activated environment.
+
+On Ubuntu 26.04, use `sudo apt install python3-pyside6.qtwidgets` and launch with
+`/usr/bin/python3 ./chrootables-desktop` to use the distribution's Python bindings.
 
 Add Chrootables to your application menu:
 
@@ -200,10 +232,23 @@ for all operations except its dedicated dependency installation action.
 No web server, Node build, or downloaded frontend dependencies are required.
 
 ```bash
-python3 -m unittest discover -s tests -p 'test_*.py' -v
-bash -n chrootable-manager
-QT_QPA_PLATFORM=offscreen ./chrootables-desktop --demo --screenshot /tmp/chrootables.png
+python3 scripts/check.py
 ```
+
+Use Python 3.10–3.14 with the pinned `requirements.txt` dependencies; those
+pins do not support Python 3.15. Distribution-provided Qt bindings may support
+additional Python versions. Run the checks with the same interpreter used to
+install the bindings (for example, `.venv/bin/python scripts/check.py`).
+
+The check command runs syntax checks, the full unit suite, both demos, and a
+Debian package build when `dpkg-deb` is available. Build artifacts are temporary.
+Use `--build-deb` to require packaging tools and
+`--require-desktop-integration` to require PyGObject and `desktop-file-validate`.
+On Debian, the latter dependencies are provided by `python3-gi`,
+`gir1.2-glib-2.0`, and `desktop-file-utils`; use the distribution Python or a
+virtual environment with access to system site packages. Missing optional
+integrations are reported as skipped tests. CI requires desktop integration on
+both distributions and the package build on Debian.
 
 Tests cover command validation, real CLI inventory and lock state, protected
 exports, stdio broker behavior, Qt navigation, creation validation, and a real

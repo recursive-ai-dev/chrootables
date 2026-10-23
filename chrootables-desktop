@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Launch the native Chrootables desktop application."""
+from pathlib import Path
+import sys
+
+# Resolve the installed /usr/bin symlink, including under Python isolated mode.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 try:
     from chrootables.app import main
 except ImportError as error:
-    import sys
-    print(f"Could not start Chrootables: {error}\nInstall PySide6: Fedora: sudo dnf install python3-pyside6\nOr use a virtual environment: python -m pip install -r requirements.txt", file=sys.stderr)
+    print(f"Could not start Chrootables: {error}\nUbuntu/Debian: sudo apt install python3-pyside6.qtwidgets\nThen launch with /usr/bin/python3 ./chrootables-desktop\nFedora: sudo dnf install python3-pyside6\nOr use a virtual environment: python -m pip install -r requirements.txt", file=sys.stderr)
     raise SystemExit(1)
 raise SystemExit(main())

@@ -1061,23 +1061,28 @@ class Window(QMainWindow):
         data = self.selected_data()
         if not data or self.demo or self.busy or data["status"] == "busy":
             return
+        target = data["name"]
         try:
-            share, read_only = self.shared_folder_choice(self.selected)
+            share, read_only = self.shared_folder_choice(target)
             keyword = dict(disposable=disposable, isolated=self.offline.isChecked(),
                            restricted_dev=self.restricted.isChecked(),
                            share=share or None, read_only=read_only)
-            command = session_command(self.selected, self.store, **keyword)
+            command = session_command(target, self.store, **keyword)
         except ValueError as error:
             self.show_error(str(error))
             return
 
         def open_external():
-            external = terminal_command(self.selected, self.store, **keyword)
+            external = terminal_command(target, self.store, **keyword)
             started, _ = QProcess.startDetached(external[0], external[1:])
             if not started:
                 raise RuntimeError("Could not start the terminal.")
 
-        window = TerminalWindow(command, f"Chrootables · {self.selected}", external=open_external)
+        try:
+            window = TerminalWindow(command, f"Chrootables · {target}", external=open_external)
+        except OSError as error:
+            self.show_error("Could not start the terminal: " + str(error))
+            return
         self.terminals.append(window)
         window.finished.connect(lambda: self.terminals.remove(window))
         window.show()

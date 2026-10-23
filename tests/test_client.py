@@ -1,0 +1,129 @@
+"""Failure and reconnection coverage for the local helper protocol."""
+import json
+import os
+from pathlib import Path
+import unittest
+from unittest.mock import Mock, patch
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+from PySide6.QtWidgets import QApplication
+from chrootables.client import Client
+
+
+class ClientTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        self.client = Client("/tmp/test-store")
+        self.process = Mock()
+        self.process.write.return_value = 1
+        self.client.process = self.process
+        self.client.is_ready = True
+        self.addCleanup(self.client.stop)
+
+    def read(self, *messages):
+        self.process.readAllStandardOutput.return_value = b"".join(
+            (json.dumps(message) + "\n").encode() for message in messages)
+        self.client.read(self.process)
+
+    def test_malformed_envelopes_fail_pending_requests_once(self):
+        invalid = [None, [], {}, {"event": "ready"},
+                   {"event": "ready", "writable": "false"},
+                   {"event": "output", "id": 1, "text": None},
+                   {"event": "output", "id": [], "text": "bad"},
+                   {"event": "output", "id": True, "text": "bad"},
+                   {"event": "output", "id": 2**40, "text": "bad"},
+                   {"event": "result", "id": 1, "ok": 1},
+                   {"event": "result", "id": 1, "ok": False, "error": []}]
+        for message in invalid:
+            with self.subTest(message=message):
+                self.client._failed = False
+                self.client.is_ready = True
+                callback = Mock()
+                self.client.request("logs", {}, callback)
+                self.read(message, {"event": "ready", "writable": True})
+                self.client.failure("helper exited")
+                callback.assert_called_once()
+                self.assertFalse(callback.call_args.args[0])
+                self.assertFalse(self.client.is_ready)
+                self.assertFalse(self.client.writable)
+                self.assertEqual(self.client.callbacks, {})
+
+    def test_invalid_json_and_helper_error_are_visible(self):
+        for payload in (b"invalid json\n", b'{"event":"error","error":"Request too large."}\n'):
+            self.client._failed = False
+            self.client.is_ready = True
+            callback = Mock()
+            self.client.request("logs", {}, callback)
+            self.process.readAllStandardOutput.return_value = payload
+            self.client.read(self.process)
+            callback.assert_called_once()
+            self.assertFalse(callback.call_args.args[0])
+            self.assertTrue(str(callback.call_args.args[1]))
+
+    def test_malformed_result_data_does_not_reach_ui_as_success(self):
+        inventory = json.loads((Path(__file__).resolve().parents[1] / "assets/demo.json").read_text())
+        inventory["images"][0]["profile"] = []
+        for action, data in (("inventory", None), ("inventory", inventory),
+                             ("doctor", {"ready": "yes", "output": "ok"}),
+                             ("logs", {}), ("create", {"exit_code": False})):
+            with self.subTest(action=action):
+                callback = Mock()
+                identifier = self.client.request(action, {}, callback)
+                self.read({"event": "result", "id": identifier, "ok": True, "data": data})
+                callback.assert_called_once()
+                self.assertFalse(callback.call_args.args[0])
+                self.assertIn("Invalid", str(callback.call_args.args[1]))
+
+    def test_disconnect_fails_all_pending_requests_once(self):
+        callbacks = [Mock(), Mock()]
+        for callback in callbacks:
+            self.client.request("inventory", {}, callback)
+        disconnected = Mock()
+        self.client.disconnected.connect(disconnected)
+        self.client.failure("helper exited")
+        self.client.failure("helper exited again")
+        for callback in callbacks:
+            callback.assert_called_once_with(False, "helper exited")
+        disconnected.assert_called_once_with("helper exited")
+
+    def test_reconnection_from_callback_ignores_remaining_old_messages(self):
+        received = []
+        old = self.process
+        identifier = self.client.request("logs", {}, lambda *args: self.client.start())
+        self.client.ready.connect(received.append)
+        with patch("chrootables.client.QProcess") as process_class:
+            self.read({"event": "result", "id": identifier, "ok": True, "data": "log"},
+                      {"event": "ready", "writable": True})
+            self.assertIs(self.client.process, process_class.return_value)
+        self.assertEqual(received, [])
+        self.assertFalse(self.client.is_ready)
+        old.readAllStandardOutput.return_value = b'{"event":"ready","writable":true}\n'
+        self.client.read(old)
+        self.assertFalse(self.client.is_ready)
+
+    def test_partial_messages_are_buffered(self):
+        callback = Mock()
+        identifier = self.client.request("logs", {}, callback)
+        payload = (json.dumps({"event": "result", "id": identifier, "ok": True, "data": "log"}) + "\n").encode()
+        self.process.readAllStandardOutput.return_value = payload[:15]
+        self.client.read(self.process)
+        callback.assert_not_called()
+        self.process.readAllStandardOutput.return_value = payload[15:]
+        self.client.read(self.process)
+        callback.assert_called_once_with(True, "log")
+
+    def test_write_failure_and_unserializable_request_do_not_leak_callbacks(self):
+        callback = Mock()
+        self.client.request("logs", {"invalid": object()}, callback)
+        self.assertFalse(callback.call_args.args[0])
+        self.process.write.assert_not_called()
+        self.assertEqual(self.client.callbacks, {})
+        callback.reset_mock()
+        self.process.write.return_value = -1
+        self.client.request("logs", {}, callback)
+        self.assertFalse(callback.call_args.args[0])
+        self.assertEqual(self.client.callbacks, {})
+        self.assertFalse(self.client.is_ready)
