@@ -214,6 +214,7 @@ chrootable-manager --operations --json
 chrootable-manager --doctor --json
 ```
 
+A root-protected store requires `sudo` for the operation listing.
 When diagnostics identify a recoverable staged publication, complete that
 specific transaction with administrator access:
 

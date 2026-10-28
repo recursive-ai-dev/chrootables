@@ -29,7 +29,7 @@ jobs:
         if: startsWith(matrix.container, 'debian')
         run: |
           apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git python3-pyside6.qtcore python3-pyside6.qtgui python3-pyside6.qtwidgets python3-pyside6.qttest python3-gi gir1.2-glib-2.0 desktop-file-utils dpkg
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git ca-certificates python3-pyside6.qtcore python3-pyside6.qtgui python3-pyside6.qtwidgets python3-pyside6.qttest python3-gi gir1.2-glib-2.0 desktop-file-utils dpkg
       - uses: actions/checkout@v4
       - name: Verify (Fedora)
         if: startsWith(matrix.container, 'fedora')
@@ -140,7 +140,7 @@ jobs:
       - name: Install dependencies
         run: |
           apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git ca-certificates python3
       - uses: actions/checkout@v4
       - name: Setup and integration suite
         run: |
