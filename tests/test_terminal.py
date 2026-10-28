@@ -87,6 +87,11 @@ class VtScreenTests(unittest.TestCase):
         screen.feed("\x1b[38;5;196mX")
         self.assertEqual(screen.lines[0][0][1].fg, 196)
 
+    def test_true_color_channels_stay_within_renderable_range(self):
+        screen = VtScreen(2, 20)
+        screen.feed("\x1b[38;2;99999999999999999999;128;0mX")
+        self.assertEqual(screen.lines[0][0][1].fg, (255, 128, 0))
+
     def test_alt_screen_saves_and_restores_primary(self):
         screen = VtScreen(4, 20)
         screen.feed("primary text")
@@ -153,6 +158,45 @@ class VtScreenTests(unittest.TestCase):
         screen.resize(6, 30)
         self.assertEqual(screen.plain().splitlines()[0], "hello")
         self.assertEqual((screen.rows, screen.columns), (6, 30))
+
+    def test_saved_cursor_restore_after_shrink(self):
+        for save, restore in (("\x1b7", "\x1b8"), ("\x1b[s", "\x1b[u")):
+            with self.subTest(restore=restore):
+                screen = VtScreen(8, 40)
+                screen.feed("\x1b[8;40H" + save)
+                screen.resize(2, 20)
+                screen.feed(restore + "X")
+                self.assertEqual(screen.lines[-1][-1][0], "X")
+
+    def test_unsupported_csi_is_consumed_without_changing_screen(self):
+        for params, final in (("?2", "J"), ("1?2", "A"), ("²", "A"),
+                              ("38:2:1:2:3", "m"), ("9" * 5000, "A"),
+                              ("9" * 5000, "m"), ("?" + "9" * 5000, "h")):
+            with self.subTest(params=params[:30], final=final):
+                screen = VtScreen(2, 20)
+                screen.feed("kept\x1b[")
+                # Exercise parameters split across PTY reads too.
+                for start in range(0, len(params), 100):
+                    screen.feed(params[start:start + 100])
+                    self.assertLessEqual(len(screen._params), 256)
+                screen.feed(final + "tail")
+                self.assertEqual(screen.plain().splitlines()[0], "kepttail")
+                self.assertIsNone(screen.lines[0][4][1].fg)
+
+    def test_erase_to_start_of_display_clears_previous_rows(self):
+        screen = VtScreen(4, 20)
+        screen.feed("first\r\nsecond\r\nthird\r\nlast")
+        screen.feed("\x1b[3;3H\x1b[1J")
+        self.assertEqual(screen.plain().splitlines(), ["", "", "   rd", "last"])
+
+    def test_cancelled_csi_recovers_for_text_and_new_sequences(self):
+        for params in ("12", "9" * 5000):
+            for ending in ("\x18", "\x1a", "\x1b[0m"):
+                with self.subTest(length=len(params), ending=ending):
+                    screen = VtScreen(2, 20)
+                    screen.feed("kept\x1b[" + params)
+                    screen.feed(ending + "tail")
+                    self.assertEqual(screen.plain().splitlines()[0], "kepttail")
 
 
 class KeyMappingTests(unittest.TestCase):

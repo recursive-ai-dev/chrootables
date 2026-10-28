@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Harden embedded terminal escape parsing against unsupported and oversized
+  sequences, and keep RGB values within the renderer's range. Fix saved cursor
+  restoration after shrinking the window and clearing text before the cursor.
 - Stop the embedded terminal's process group when closing a session, so child
   commands do not keep the PTY open after Ubuntu's shell exits.
 - Add a rootless `.deb` builder, system menu entry, and Ubuntu/Debian runtime

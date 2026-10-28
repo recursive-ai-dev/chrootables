@@ -73,7 +73,8 @@ class Style:
 DEFAULT_STYLE = Style()
 
 # Parser states.
-_GROUND, _ESC, _CSI, _OSC, _OSC_ESC, _CHARSET = range(6)
+_GROUND, _ESC, _CSI, _OSC, _OSC_ESC, _CHARSET, _CSI_IGNORE = range(7)
+MAX_CSI_PARAMS = 256
 
 
 class VtScreen:
@@ -164,6 +165,13 @@ class VtScreen:
         return len(self._params.split(";")) if self._params else 0
 
     def _apply_csi(self, final):
+        # Only implement decimal parameters and the private modes we support.
+        # Other CSI forms must not reach integer conversion or alter the screen.
+        params = self._params
+        if params.startswith("?") and final in ("h", "l"):
+            params = params[1:]
+        if any(character not in "0123456789;" for character in params):
+            return
         count = lambda index=0: max(1, self._param(index))
         if final == "A":
             self.row -= count()
@@ -193,6 +201,8 @@ class VtScreen:
                 for line in range(self.row + 1, self.rows):
                     self._erase(line, 0, self.columns)
             elif mode == 1:
+                for line in range(self.row):
+                    self._erase(line, 0, self.columns)
                 self._erase(self.row, 0, min(self.column + 1, self.columns))
             else:
                 for line in range(self.rows):
@@ -295,7 +305,7 @@ class VtScreen:
         if mode == 5 and index + 1 < len(params):
             return params[index + 1] % 256, index + 1
         if mode == 2 and index + 3 < len(params):
-            return (params[index + 1], params[index + 2], params[index + 3]), index + 3
+            return tuple(min(255, value) for value in params[index + 1:index + 4]), index + 3
         return None, index
 
     def _apply_mode(self, enable):
@@ -366,6 +376,7 @@ class VtScreen:
                         self._saved_cursor = (self.row, self.column)
                     elif character == "8":
                         self.row, self.column = self._saved_cursor
+                        self._clamp_cursor()
                     elif character == "D":
                         self._line_feed()
                     elif character == "M":
@@ -375,13 +386,21 @@ class VtScreen:
                         self.column = 0
                     elif character == "c":
                         self._reset()
-            elif state == _CSI:
-                if character.isdigit() or character == ";" or character == "?":
-                    self._params += character
-                else:
+            elif state in (_CSI, _CSI_IGNORE):
+                if character == "\x1b":
+                    self._state = _ESC
+                elif character in ("\x18", "\x1a"):
                     self._state = _GROUND
-                    if character.isalpha() or character in "@`~":
+                elif "@" <= character <= "~":
+                    self._state = _GROUND
+                    if state == _CSI:
                         self._apply_csi(character)
+                elif state == _CSI:
+                    if " " <= character <= "?" and len(self._params) < MAX_CSI_PARAMS:
+                        self._params += character
+                    else:
+                        # Consume the rest without retaining unbounded parameters.
+                        self._state = _CSI_IGNORE
             elif state == _OSC:
                 if character == "\x07":
                     self._state = _GROUND
