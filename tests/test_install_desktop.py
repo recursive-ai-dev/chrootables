@@ -62,7 +62,9 @@ class DesktopInstallerTests(unittest.TestCase):
                 if action is None:
                     self.assertTrue(application.launch([], None))
                 else:
-                    application.launch_action(action, None)
+                    # Older Gio typelibs expose this as a static function;
+                    # passing the instance explicitly also works with GioUnix.
+                    desktop_api.DesktopAppInfo.launch_action(application, action, None)
                 deadline = time.monotonic() + 5
                 while not output.exists() and time.monotonic() < deadline:
                     time.sleep(0.01)
