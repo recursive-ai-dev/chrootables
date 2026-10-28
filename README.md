@@ -11,7 +11,7 @@ point. The Qt desktop and the Bash terminal interface use the same image store.
 On Ubuntu 26.04, install the locally built package with:
 
 ```bash
-sudo apt install ./dist/chrootables_3.2.0-1_all.deb
+sudo apt install ./dist/chrootables_1.0.0-1_all.deb
 chrootables-desktop
 ```
 
@@ -30,7 +30,7 @@ Build the package without root or pip dependencies:
 The build writes the `.deb` and a `.deb.sha256` checksum to `dist/`. Verify it:
 
 ```bash
-(cd dist && sha256sum -c chrootables_3.2.0-1_all.deb.sha256)
+(cd dist && sha256sum -c chrootables_1.0.0-1_all.deb.sha256)
 ```
 
 Builds are reproducible across directories and umasks. `SOURCE_DATE_EPOCH`

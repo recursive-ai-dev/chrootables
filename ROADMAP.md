@@ -1,6 +1,6 @@
 # Chrootables Roadmap
 
-Status as of 2026-10-27. v3.2.0 adds searchable workspace notes, saved library
+Status as of 2026-10-27. v1.0.0 adds searchable workspace notes, saved library
 and session preferences, terminal scrollback/clipboard support, structured host
 diagnostics, and reproducible Debian packages. Qt desktop and Bash CLI share one
 image store. Debian 12/13 profiles, snapshots, disposable sessions, shared folders,

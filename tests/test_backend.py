@@ -147,7 +147,7 @@ class StoreTests(unittest.TestCase):
     def test_doctor_preserves_structured_report_and_readiness(self):
         for ready in (True, False):
             report = {"schema_version": 1, "ready": ready, "output": "Host health",
-                      "host": "Linux", "architecture": "x86_64", "version": "3.2.0",
+                      "host": "Linux", "architecture": "x86_64", "version": "1.0.0",
                       "store": str(self.path), "errors": 0 if ready else 1, "warnings": 0,
                       "checks": [{"id": "archive-keys", "status": "ok" if ready else "error",
                                   "message": "Archive keys", "remedy": "Run --setup"}],
@@ -170,7 +170,7 @@ class StoreTests(unittest.TestCase):
 
     def test_doctor_rejects_bad_checks_counts_and_storage_fields(self):
         report = {"schema_version": 1, "ready": True, "output": "Host health", "errors": 0,
-                  "warnings": 0, "host": "Linux", "architecture": "x86_64", "version": "3.2.0",
+                  "warnings": 0, "host": "Linux", "architecture": "x86_64", "version": "1.0.0",
                   "store": str(self.path), "checks": [],
                   "storage": {"available": True, "free_bytes": 1024, "total_bytes": 2048}}
         valid_check = {"id": "a", "status": "ok", "message": "Ready", "remedy": ""}

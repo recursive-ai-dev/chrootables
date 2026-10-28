@@ -1,6 +1,9 @@
 # Changelog
 
-## v3.2.0 — 2026-10-27
+The current release is numbered `1.0.0`. Earlier development release numbers
+are retained below as historical records.
+
+## v1.0.0 — 2026-10-27
 
 - Search personal workspace notes alongside names, profiles and releases.
   Notes are saved per user, workspace and store; editing during a background
