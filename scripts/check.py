@@ -39,6 +39,7 @@ def main():
     run(sys.executable, "-m", "compileall", "-q", "chrootables", "scripts", "tests")
     run(sys.executable, "-m", "py_compile", "chrootables-desktop")
     run(sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py", "-v")
+    run(sys.executable, "scripts/benchmark.py")
     run(str(ROOT / "chrootable-manager"), "--demo", "--dashboard")
     with tempfile.TemporaryDirectory(prefix="chrootables-check-") as directory:
         screenshot = Path(directory) / "desktop.png"

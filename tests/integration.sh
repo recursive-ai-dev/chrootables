@@ -40,6 +40,7 @@ if [[ $profile == python ]]; then
     "$manager_path" --exec persistent-test -- python3 -c 'import venv, ssl; print("Python profile ready")'
 fi
 "$manager_path" --exec persistent-test -- /bin/sh -c 'printf original > /persistent-marker'
+"$manager_path" --exec persistent-test --restricted-dev -- /bin/sh -ec 'test -c /dev/null; test -c /dev/urandom; test -c /dev/ptmx; test ! -e /dev/loop-control; test ! -e /dev/sda'
 mount -o loop,ro "$CHROOTABLE_HOME/images/persistent-test.img" "$inspect_mount"
 test "$(cat "$inspect_mount/persistent-marker")" = original
 umount "$inspect_mount"
@@ -139,5 +140,18 @@ test -e "$CHROOTABLE_HOME/snapshots/persistent-test/clean.img"
 "$manager_path" --exec persistent-test -- test -e /persistent-marker
 "$manager_path" --drop-snapshot persistent-test clean --yes
 test ! -e "$CHROOTABLE_HOME/snapshots/persistent-test/clean.img"
+
+# Every real operation publishes its identity/stage durably. Guest exit 17 and
+# intentionally rejected share mounts may fail; none may remain interrupted.
+"$manager_path" --operations --json >"$test_root/operations.json"
+python3 - "$test_root/operations.json" <<'PY'
+import json, pathlib, sys
+operations = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert operations, 'No durable operations were recorded'
+assert all(item['status'] in ('completed', 'failed') and not item['active'] for item in operations), operations
+assert all(pathlib.Path(item['log']).is_file() for item in operations), operations
+assert any(item['action'] == 'restore' and item['status'] == 'completed' for item in operations), operations
+print('Durable operation records passed')
+PY
 
 printf 'integration checks passed\n'

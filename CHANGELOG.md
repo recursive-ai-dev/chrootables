@@ -1,7 +1,36 @@
 # Changelog
 
-The current release is numbered `1.0.0`. Earlier development release numbers
+The current release is numbered `1.1.0`. Earlier development release numbers
 are retained below as historical records.
+
+## v1.1.0 — 2026-10-27
+
+- Add durable operation IDs/stages, isolated per-operation log streaming and
+  explicit recovery of interrupted image/metadata publication. Validate retained
+  file identities before recovery; identify interrupted work in host diagnostics.
+- Describe image capacity accurately as sparse, without a reservation guarantee;
+  check free host space before expansion and image copying.
+- Show operation phases and elapsed time, preserve log reading position when
+  output following is disabled, and keep concurrent workspace output separate.
+- Search recovery/history views, retain selected checkpoint/log identities across
+  filtering and refresh, show allocated snapshot/export/log storage, and preview
+  the scope and size of checkpoint deletion.
+- Support smaller displays, scrolling compact layouts, keyboard navigation and
+  persisted 100/125/150% text scaling.
+- Render ANSI 256/RGB colors, hidden cursors and text attributes correctly. Handle
+  combining accents and East Asian wide cells in terminal editing, wrapping,
+  selection, copying and resizing; full emoji grapheme shaping remains unsupported.
+- Enforce inventory/render latency budgets with a realistic rootless benchmark;
+  avoid redundant shell lock-probe subprocesses while preserving live busy state.
+- Read desktop profiles, supported releases and capacity limits from the CLI's
+  versioned capability response.
+- Share reproducible package staging and protected artifact publication across
+  DEB, RPM and host-runtime AppImage builds. Never install/download build tools
+  implicitly; explicitly fetched AppImage tools and runtime are checksum-pinned.
+- Add native package installation/upgrade/removal checks and AppImage runtime
+  checks in CI; correct Debian's split Qt dependency names and run privileged
+  minimal/Python integration on release branches.
+- License the project and packaged application under Apache-2.0.
 
 ## v1.0.0 — 2026-10-27
 

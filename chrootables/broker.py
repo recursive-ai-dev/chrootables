@@ -42,7 +42,10 @@ def serve(store, input_stream=sys.stdin, output_stream=sys.stdout, *, writable=F
                 if not mutation_lock.acquire(blocking=False):
                     raise RuntimeError("Another operation is running. Wait for it to finish.")
                 try:
-                    code = store.operate(action, params, lambda value: send({"id": identifier, "event": "output", "text": value}))
+                    code = store.operate(
+                        action, params,
+                        lambda value: send({"id": identifier, "event": "output", "text": value}),
+                        progress=lambda value: send({"id": identifier, "event": "phase", "text": value}))
                     if code:
                         raise RuntimeError(f"{action.replace('-', ' ').capitalize()} failed (exit {code}). See the task output for details.")
                     data = {"exit_code": code}

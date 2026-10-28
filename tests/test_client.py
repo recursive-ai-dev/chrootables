@@ -32,6 +32,7 @@ class ClientTests(unittest.TestCase):
         invalid = [None, [], {}, {"event": "ready"},
                    {"event": "ready", "writable": "false"},
                    {"event": "output", "id": 1, "text": None},
+                   {"event": "phase", "id": 1, "text": []},
                    {"event": "output", "id": [], "text": "bad"},
                    {"event": "output", "id": True, "text": "bad"},
                    {"event": "output", "id": 2**40, "text": "bad"},
@@ -114,6 +115,16 @@ class ClientTests(unittest.TestCase):
         self.process.readAllStandardOutput.return_value = payload[15:]
         self.client.read(self.process)
         callback.assert_called_once_with(True, "log")
+
+    def test_phase_updates_do_not_consume_operation_callback(self):
+        callback, phase = Mock(), Mock()
+        self.client.phase.connect(phase)
+        identifier = self.client.request("clone", {"name": "lab", "target": "copy"}, callback)
+        self.read({"event": "phase", "id": identifier, "text": "Copying image"})
+        phase.assert_called_once_with(identifier, "Copying image")
+        callback.assert_not_called()
+        self.read({"event": "result", "id": identifier, "ok": True, "data": {"exit_code": 0}})
+        callback.assert_called_once_with(True, {"exit_code": 0})
 
     def test_write_failure_and_unserializable_request_do_not_leak_callbacks(self):
         callback = Mock()

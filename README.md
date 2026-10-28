@@ -4,51 +4,91 @@ A native Linux desktop workbench for Debian image environments. Create a workspa
 open a terminal, experiment in a disposable session, and return to a saved recovery
 point. The Qt desktop and the Bash terminal interface use the same image store.
 
-## Launch
+## Install version 1.1.0
 
-### Ubuntu / Debian package
+Download packages and SHA256 checksums from the
+[1.1.0 release](https://github.com/recursive-ai-dev/chrootables/releases/tag/v1.1.0).
+The native packages install Python/Qt and workspace prerequisites through your
+host package manager. Launch the desktop as your normal user; workspace changes
+request administrator access when needed.
 
-On Ubuntu 26.04, install the locally built package with:
+### Ubuntu / Debian
 
 ```bash
-sudo apt install ./dist/chrootables_1.0.0-1_all.deb
+sudo apt install ./chrootables_1.1.0-1_all.deb
 chrootables-desktop
 ```
 
-APT installs the Qt bindings and workspace prerequisites. The package adds an
-application-menu entry and the `chrootable-manager` CLI. Its desktop launcher uses
-`/usr/bin/python3`, so a Homebrew Python or activated virtual environment does not
-override Ubuntu's Python and Qt packages. Launch the desktop as your normal user;
-workspace operations request administrator access when needed.
+The verified Ubuntu host is 26.04. Debian Trixie and newer hosts need distro
+PySide6 6.8+; older releases may not provide suitable bindings. Packaged launchers
+use `/usr/bin/python3`, so activated virtual environments and Homebrew Python do
+not override distribution Qt packages. The package also installs the CLI, an
+application-menu entry and manual pages.
 
-Build the package without root or pip dependencies:
+### Fedora
+
+```bash
+sudo dnf install ./chrootables-1.1.0-1.noarch.rpm
+chrootables-desktop
+```
+
+The RPM uses the same application/helper layout as the Debian package. Fedora is
+the tested RPM target; compatibility with RHEL derivatives is not yet verified.
+
+### AppImage · x86_64
+
+```bash
+chmod +x Chrootables-1.1.0-1-x86_64.AppImage
+./Chrootables-1.1.0-1-x86_64.AppImage
+```
+
+This is a **host-runtime AppImage**: it requires `/usr/bin/python3` 3.10+ and
+system PySide6 6.8+; it does not bundle Python or Qt. On Ubuntu 26.04 install
+`python3-pyside6.qtwidgets`; on Fedora install `python3-pyside6`. The launcher
+extracts its payload before authenticating its helper, allowing administrator
+operations to find the application outside a user-only FUSE mount. Workspace
+prerequisites are still needed on the host. Use `--demo` for a read-only tour.
+
+Each artifact has a `.sha256` sidecar. Verify it in the download directory, for
+example:
+
+```bash
+sha256sum -c chrootables_1.1.0-1_all.deb.sha256
+```
+
+Removing a native package leaves `/var/lib/chrootable-manager` intact. Installed
+help is available through `man chrootables-desktop` and `man chrootable-manager`.
+
+### Build packages
+
+Builds run without root and never install or download prerequisites implicitly.
+Install `dpkg-deb` for Debian packages or `rpmbuild` for RPM packages, then run:
 
 ```bash
 /usr/bin/python3 scripts/build-deb.py
+/usr/bin/python3 scripts/build-rpm.py
+/usr/bin/python3 scripts/build-packages.py  # Debian and RPM
 ```
 
-The build writes the `.deb` and a `.deb.sha256` checksum to `dist/`. Verify it:
+AppImage tools are fetched only through a separate explicit command. Both the
+builder and runtime downloads are pinned by SHA256:
 
 ```bash
-(cd dist && sha256sum -c chrootables_1.0.0-1_all.deb.sha256)
+/usr/bin/python3 scripts/fetch-build-tools.py --output "$HOME/.cache/chrootables/build-tools"
+export APPIMAGETOOL="$HOME/.cache/chrootables/build-tools/appimagetool-1.9.1-x86_64.AppImage"
+export APPIMAGE_RUNTIME_FILE="$HOME/.cache/chrootables/build-tools/runtime-x86_64"
+/usr/bin/python3 scripts/build-appimage.py
+/usr/bin/python3 scripts/build-packages.py --all
 ```
 
-Builds are reproducible across directories and umasks. `SOURCE_DATE_EPOCH`
-controls timestamps (default: 2026-10-27 00:00 UTC). Use `--revision 2` for a
-new Debian revision, or `--output /path/to/artifacts` for another destination.
-An identical rebuild is accepted; replacing an existing package with changed
-contents requires `--force`. CI publishes the package and checksum as artifacts.
-Installed help is available through `man chrootables-desktop` and
-`man chrootable-manager`.
-
-The build requires `dpkg-deb` (from `dpkg`). The package contains portable Python
-and Bash code (`Architecture: all`); the verified host architecture is amd64.
-It requires distro PySide6 6.8 or newer, so older Ubuntu/Debian releases may not
-provide suitable dependencies. Remove it with `sudo apt remove chrootables`;
-workspace images in `/var/lib/chrootable-manager` remain intact.
-
-The repository currently has no upstream license file. The builder does not
-invent one; choose and add a license before publishing packages for redistribution.
+Artifacts and checksums go into `dist/`. Use `--output /path/to/artifacts` or
+`--revision 2` to choose another destination/revision. An identical rebuild is
+accepted; changed output requires `--force`. A conflicting package or checksum
+is preserved when `--force` is absent. Debian and AppImage builds are checked
+across output directories and umasks; reproducibility assumes the same pinned
+build tools. `SOURCE_DATE_EPOCH` controls timestamps, with a stable default of
+2026-10-27 00:00 UTC. `--deb-only`, `--rpm-only`, and `--appimage-only` select one
+format; those flags and `--all` are mutually exclusive.
 
 ### From a checkout
 
@@ -101,11 +141,21 @@ For a clearly labeled, read-only tour with sample data:
   recover workspaces whose original images were deleted.
 - Clone, expand, change lifecycle, repair ext4 filesystems, and export `.tar.gz`
   archives to a chosen location. Existing destination files are never overwritten.
-- Watch operation output, inspect history and logs, and check host prerequisites.
+- Follow operation stages and elapsed time; pause output following to read earlier
+  diagnostics while work continues. Each task streams only its own operation log.
+- Search recovery points and activity by workspace, checkpoint, date or action;
+  filter failed operations and keep the selected record across refreshes.
+- Inspect allocated snapshot/export/log storage and preview the exact recovery
+  point and its allocated size before deleting it.
+- Choose 100%, 125% or 150% text scaling. Compact layouts keep workspace and
+  recovery actions reachable on 1024×768 displays.
+- Inspect history and logs, and check host prerequisites.
 - Scroll through 2,000 lines of terminal history with the wheel or
   `Shift+PageUp`/`Shift+PageDown`. Select text with the mouse, copy with
   `Ctrl+Shift+C`, and paste with `Ctrl+Shift+V`. Shells that request bracketed
-  paste receive it; large pastes do not block the desktop.
+  paste receive it; large pastes do not block the desktop. ANSI colors, text
+  attributes, cursor visibility, combining accents and East Asian wide characters
+  are supported.
 - Use `Ctrl+N` to create, `Ctrl+F` to search, `Ctrl+Enter` to open a terminal, and
   `F5` to refresh. Workspace status refreshes every six seconds.
 
@@ -115,8 +165,9 @@ does not save these settings.
 
 The desktop currently manages Debian images. It does not implement an OCI app
 store or graphical application exports. The embedded terminal pane implements a
-compact VT/ANSI subset; for full terminal fidelity use the external terminal
-button in the session window.
+compact VT/ANSI subset; full emoji grapheme shaping and complete terminal
+emulation remain outside its scope. For full terminal fidelity use the external
+terminal button in the session window.
 
 ## Support matrix
 
@@ -155,6 +206,24 @@ conflicts with other terminals and managers. Closing the desktop is blocked whil
 an operation is active, so an image copy or filesystem repair can finish. If the
 window disappears unexpectedly, the helper finishes the running operation before
 exiting. Successful operations and failures are recorded in the store's journal.
+Durable operation records retain the current stage and identify incomplete
+publication after an abrupt interruption. Use the read-only commands:
+
+```bash
+chrootable-manager --operations --json
+chrootable-manager --doctor --json
+```
+
+When diagnostics identify a recoverable staged publication, complete that
+specific transaction with administrator access:
+
+```bash
+sudo chrootable-manager --recover-operation OPERATION_ID --yes
+```
+
+Recovery validates the recorded file identities and refuses active operations or
+unsafe paths. Incomplete work before publication remains available for inspection;
+recovery does not automatically delete partial files or resume a bootstrap.
 
 Exports remain in the protected store and are copied to your chosen destination by
 a child process running as your normal user. The privileged helper opens the
@@ -171,14 +240,19 @@ snapshots/    offline recovery images, grouped by workspace
 exports/      compressed filesystem archives
 archive/      optional offline package archives (--archive-sync)
 logs/         operation diagnostics
+operations/   durable operation stages and interrupted-publication records
 activity.tsv  completed operation history
 ```
 
 Use a different store with `./chrootables-desktop --store /srv/chrootables`, or set
 `CHROOTABLE_HOME` for the CLI. The store must be owned by root for mutations and
-must not be writable by other users. Images are fixed-capacity ext4 files; initial
-creation checks free space and allocates capacity. Clones and snapshots use
-reflinks when the host filesystem supports them.
+must not be writable by other users. Images are fixed-capacity ext4 files backed by **sparse host files**. Creation,
+expansion and copying check available host space conservatively, but do not
+reserve the entire image capacity; monitor host free space as workspaces grow.
+Clones and snapshots use reflinks when the host filesystem supports them.
+Storage totals count allocated file blocks; shared CoW extents can appear in
+multiple totals, so they do not predict exact bytes reclaimed. Export/log totals
+refresh on directory changes and within 30 seconds of existing-file growth.
 
 Persistent sessions write directly to the image. Disposable sessions use a
 read-only image with a temporary OverlayFS upper layer in RAM. Their filesystem
@@ -288,7 +362,12 @@ pins do not support Python 3.15. Distribution-provided Qt bindings may support
 additional Python versions. Run the checks with the same interpreter used to
 install the bindings (for example, `.venv/bin/python scripts/check.py`).
 
-The check command runs syntax checks, the full unit suite, both demos, and a
+The CLI is the capability authority: `chrootable-manager --capabilities --json`
+exposes profiles, releases, size limits and session options. The desktop reads it
+once at startup, and parity tests protect both interfaces from drifting.
+
+The check command runs syntax checks, the full unit suite, performance gates,
+both demos, and a
 Debian package build when `dpkg-deb` is available. Build artifacts are temporary.
 Use `--build-deb` to require packaging tools and
 `--require-desktop-integration` to require PyGObject and `desktop-file-validate`.
@@ -296,7 +375,20 @@ On Debian, the latter dependencies are provided by `python3-gi`,
 `gir1.2-glib-2.0`, and `desktop-file-utils`; use the distribution Python or a
 virtual environment with access to system site packages. Missing optional
 integrations are reported as skipped tests. CI requires desktop integration on
-both distributions and the package build on Debian.
+both distributions and the package build on Debian. CI also builds RPM and
+AppImage artifacts, checks fresh native-package installation/upgrade/removal,
+and verifies that package removal preserves workspace data. Release branches and
+manual workflow runs execute the privileged integration suite for both minimal
+and Python profiles. `scripts/check-installed.py --prefix /path/to/extracted/usr`
+checks a packaged CLI, capabilities, diagnostics, helper and desktop demo without
+creating a real store.
+
+The rootless benchmark uses 24 workspaces, 48 snapshots, 80 history entries and
+real lock files. It gates median fresh inventory at 80 ms, cached inventory at
+10 ms and unchanged synchronous rendering at 2 ms, and also reports p95 latency.
+Fresh application caches are tested with warmed OS caches; queued Qt painting
+is outside the render timing. Run `python3 scripts/benchmark.py --json` for the
+measurements. Live lock acquisition/release must remain visible while caching.
 
 Tests cover command validation, real CLI inventory and lock state, protected
 exports, stdio broker behavior, Qt navigation, creation validation, and a real
@@ -316,3 +408,9 @@ It checks persistent writes, disposable rollback, network isolation, shared fold
 writes and read-only access, cloning,
 snapshots, automatic recovery on restore, expansion, repair, export, deletion and
 restoring a deleted workspace. Its temporary store is removed afterward.
+
+## License
+
+Chrootables is licensed under [Apache-2.0](LICENSE). Native packages and the
+AppImage include the license text. Python, Qt and other host dependencies retain
+their own licenses.

@@ -12,21 +12,52 @@ import stat
 import subprocess
 import threading
 import time
+import uuid
 
 ROOT = Path(__file__).resolve().parent.parent
 MANAGER = ROOT / "chrootable-manager"
 DEFAULT_STORE = Path("/var/lib/chrootable-manager")
-PROFILES = {
-    "minimal": ("Clean slate", "A minimal Debian system. Make it your own.", 2),
-    "build": ("Build studio", "C / C++, make, Git, curl and pkg-config.", 4),
-    "python": ("Python lab", "Python 3, virtual environments, pip and Git.", 4),
-    "network": ("Network toolkit", "DNS tools, ping, curl and an SSH client.", 2),
-    "rust": ("Rust studio", "Rust toolchain, cargo and Git.", 6),
-    "go": ("Go studio", "Go toolchain and Git.", 6),
-    "web": ("Web lab", "Node.js, npm and Git.", 4),
-}
 NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 MUTATIONS = {"create", "clone", "snapshot", "restore", "drop-snapshot", "resize", "mode", "repair", "delete", "export", "setup"}
+
+
+def load_capabilities():
+    """Use the installed CLI as the desktop's capability authority, once at start."""
+    try:
+        result = subprocess.run([str(MANAGER), "--capabilities", "--json"],
+                                capture_output=True, text=True, timeout=5,
+                                env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "CHROOTABLE_AUTO_INSTALL": "0"})
+        data = json.loads(result.stdout)
+        limits = data["limits"]
+        valid = (result.returncode == 0 and type(data.get("schema_version")) is int
+                 and data["schema_version"] == 1
+                 and all(type(limits[key]) is int for key in ("min_size_mib", "max_size_mib"))
+                 and 512 <= limits["min_size_mib"] <= limits["max_size_mib"] <= 1048576)
+        for key in ("profiles", "suites"):
+            items = data[key]
+            valid = (valid and isinstance(items, list) and bool(items)
+                     and all(isinstance(item, dict) and isinstance(item.get("id"), str)
+                             and NAME_RE.fullmatch(item["id"])
+                             and isinstance(item.get("title"), str) for item in items)
+                     and len({item["id"] for item in items}) == len(items))
+        valid = (valid and all(isinstance(item.get("description"), str)
+                              and type(item.get("recommended_size_mib")) is int
+                              and limits["min_size_mib"] <= item["recommended_size_mib"] <= limits["max_size_mib"]
+                              for item in data["profiles"]))
+        if not valid:
+            raise ValueError("invalid fields")
+        return data
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError("Could not read installed workspace manager capabilities: " + str(error)) from error
+    except (ValueError, KeyError, TypeError, AttributeError) as error:
+        raise RuntimeError("The installed workspace manager returned invalid capabilities.") from error
+
+
+CAPABILITIES = load_capabilities()
+PROFILES = {item["id"]: (item["title"], item["description"],
+                         max(1, item["recommended_size_mib"] // 1024))
+            for item in CAPABILITIES["profiles"]}
+SUITES = {item["id"]: item["title"] for item in CAPABILITIES["suites"]}
 
 
 def name(value):
@@ -36,7 +67,8 @@ def name(value):
 
 
 def size(value):
-    if isinstance(value, bool) or not isinstance(value, int) or not 512 <= value <= 1048576:
+    if (type(value) is not int or not
+            CAPABILITIES["limits"]["min_size_mib"] <= value <= CAPABILITIES["limits"]["max_size_mib"]):
         raise ValueError("Capacity must be between 512 MiB and 1 TiB.")
     return str(value)
 
@@ -57,7 +89,7 @@ def build_command(action, params):
         mode = params.get("lifecycle", "persistent")
         profile = params.get("profile", "minimal")
         suite = params.get("suite", "trixie")
-        if mode not in ("persistent", "ephemeral") or profile not in PROFILES or suite not in ("trixie", "bookworm"):
+        if mode not in ("persistent", "ephemeral") or profile not in PROFILES or suite not in SUITES:
             raise ValueError("Unsupported lifecycle, profile or Debian release.")
         args += [size(params.get("size_mib")), mode, profile]
         env["CHROOTABLE_DEBIAN_SUITE"] = suite
@@ -172,6 +204,9 @@ class Store:
         self._activity_sig = None
         self._activity_cache = []
         self._inventory_lock = threading.Lock()
+        self._storage_cache = {}
+        self._storage_signature = None
+        self._storage_checked = 0.0
 
     def environment(self, extra=None):
         result = {
@@ -191,7 +226,7 @@ class Store:
         # Check directories explicitly: glob can silently conceal permission errors.
         image_dir_entries = None
         if self.path.exists():
-            for part in (self.path, self.path / "images", self.path / "snapshots", self.path / "logs"):
+            for part in (self.path, self.path / "images", self.path / "snapshots", self.path / "logs", self.path / "exports"):
                 if part.is_symlink():
                     raise ValueError("Store directories must not be symlinks.")
                 if part.exists():
@@ -240,7 +275,7 @@ class Store:
                             if len(self._snap_meta_cache) >= 2048:
                                 self._snap_meta_cache.clear()
                             self._snap_meta_cache[cache_key] = created_at
-                    raw_snapshots.append((folder.name, image.name[:-4], img_st.st_size // 1048576, created_at))
+                    raw_snapshots.append((folder.name, image.name[:-4], img_st.st_size // 1048576, created_at, img_st.st_blocks * 512))
         images_sig = (tuple(image_dir_entries), tuple(sorted(snap_counts.items()))) if image_dir_entries is not None else None
         if self._images_sig is not None and images_sig is not None and images_sig == self._images_sig:
             images = []
@@ -249,16 +284,23 @@ class Store:
                 status = _probe_lock_status(images_root / (item["name"] + ".img.lock"))
                 images.append(item if item["status"] == status else {**item, "status": status})
         else:
-            result = subprocess.run([str(MANAGER), "--list", "--json"], env=self.environment(), capture_output=True, text=True, timeout=20)
+            # The helper probes locks in-process on both cold and cached reads.
+            # Avoid one CLI subprocess per image solely to repeat that probe.
+            result = subprocess.run([str(MANAGER), "--list", "--json"],
+                                    env=self.environment({"CHROOTABLE_LIST_PROBE_LOCKS": "0"}),
+                                    capture_output=True, text=True, timeout=20)
             if result.returncode:
                 raise PermissionError(result.stderr.strip() or "Cannot read the workspace store.")
             images = json.loads(result.stdout)
+            images = [{**item, "status": _probe_lock_status(self.path / "images" / (item["name"] + ".img.lock"))}
+                      for item in images]
             self._images_sig = images_sig
             self._images_cache = images
         image_names = {x["name"] for x in images}
         snapshots = [
-            {"name": ws_name, "label": label, "size_mib": size_mib, "created_at": created_at, "orphan": ws_name not in image_names}
-            for ws_name, label, size_mib, created_at in raw_snapshots
+            {"name": ws_name, "label": label, "size_mib": size_mib, "created_at": created_at,
+             "allocated_bytes": allocated, "orphan": ws_name not in image_names}
+            for ws_name, label, size_mib, created_at, allocated in raw_snapshots
         ]
         activity_path = self.path / "activity.tsv"
         try:
@@ -284,7 +326,47 @@ class Store:
             existing = existing.parent
         usage = shutil.disk_usage(existing)
         return {"images": images, "snapshots": snapshots, "activity": activity,
-                "store": str(self.path), "free_bytes": usage.free, "total_bytes": usage.total}
+                "store": str(self.path), "free_bytes": usage.free, "total_bytes": usage.total,
+                "storage": self.storage_summary(images, snapshots)}
+
+    def storage_summary(self, images, snapshots):
+        """Report allocated blocks, caching archive/log scans between changes.
+
+        Shared CoW extents can be counted in more than one file. Archive/log sizes
+        refresh immediately after directory changes, and at most 30 seconds after
+        an existing log is appended; workspace locks are still probed every poll.
+        """
+        directories = [self.path / "exports", self.path / "logs"]
+        signature = []
+        for directory in directories:
+            try:
+                info = directory.lstat()
+                if not stat.S_ISDIR(info.st_mode):
+                    raise ValueError("Store directories must be regular directories.")
+                signature.append((info.st_ino, info.st_mtime_ns))
+            except FileNotFoundError:
+                signature.append(None)
+        now = time.monotonic()
+        if signature != self._storage_signature or now - self._storage_checked >= 30:
+            totals = {}
+            for directory, stamp in zip(directories, signature):
+                total = 0
+                if stamp is not None:
+                    with os.scandir(directory) as entries:
+                        for entry in entries:
+                            try:
+                                info = entry.stat(follow_symlinks=False)
+                            except FileNotFoundError:
+                                continue
+                            if stat.S_ISREG(info.st_mode):
+                                total += info.st_blocks * 512
+                totals[directory.name + "_bytes"] = total
+            self._storage_cache = totals
+            self._storage_signature = signature
+            self._storage_checked = now
+        return {**self._storage_cache,
+                "images_bytes": sum(item["allocated_bytes"] for item in images),
+                "snapshots_bytes": sum(item["allocated_bytes"] for item in snapshots)}
 
     def logs(self, target, selected_log=None):
         name(target)
@@ -343,15 +425,28 @@ class Store:
             raise RuntimeError("Host health returned invalid storage capacity.")
         return report
 
-    def operate(self, action, params, output):
+    def operate(self, action, params, output, progress=None):
         args, extra = build_command(action, params)
-        env = self.environment(extra)
-        started = time.time()
+        operation_id = uuid.uuid4().hex
+        env = self.environment({**extra, "CHROOTABLE_OPERATION_ID": operation_id})
+        operation_log = self.path / "logs" / (operation_id + ".log")
         # A reader thread drains the child while the main thread tails its operation log.
         process = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
         archives = []
         def drain():
             for line in process.stdout:
+                if line.startswith("CHROOTABLE_EVENT "):
+                    try:
+                        event = json.loads(line[len("CHROOTABLE_EVENT "):])
+                    except (ValueError, TypeError):
+                        event = None
+                    if (isinstance(event, dict) and event.get("id") == operation_id
+                            and isinstance(event.get("stage"), str)
+                            and 0 < len(event["stage"]) <= 256
+                            and not any(ord(character) < 32 for character in event["stage"])):
+                        if progress:
+                            progress(event["stage"])
+                        continue
                 candidate = Path(line.strip())
                 if action == "export" and candidate.parent == self.path / "exports" and candidate.suffixes[-2:] == [".tar", ".gz"]:
                     archives.append(candidate)
@@ -360,9 +455,8 @@ class Store:
         reader.start()
         offsets = {}
         stats = {}
-        logs_dir = self.path / "logs"
         def tail_file(log_path, info):
-            if not stat.S_ISREG(info.st_mode) or info.st_mtime < started:
+            if not stat.S_ISREG(info.st_mode):
                 return
             sig = (info.st_mtime_ns, info.st_size)
             if stats.get(log_path) == sig:
@@ -375,29 +469,17 @@ class Store:
             if chunk:
                 output(chunk)
         def tail():
-            if logs_dir.is_dir() and not logs_dir.is_symlink():
-                try:
-                    with os.scandir(logs_dir) as entries:
-                        for entry in entries:
-                            if entry.name.endswith(".log") and not entry.is_symlink():
-                                try:
-                                    tail_file(entry.path, entry.stat(follow_symlinks=False))
-                                except (FileNotFoundError, OSError):
-                                    continue
-                except OSError:
-                    pass
-            if action == "setup":
-                dep_log = "/var/log/chrootable-manager-dependencies.log"
-                try:
-                    tail_file(dep_log, os.lstat(dep_log))
-                except (FileNotFoundError, OSError):
-                    pass
+            try:
+                tail_file(str(operation_log), operation_log.lstat())
+            except (FileNotFoundError, OSError):
+                pass
         while process.poll() is None:
             tail()
             time.sleep(0.2)
         reader.join()
         process.stdout.close()
         tail()
+        self._storage_signature = None
         if process.returncode == 0 and action == "export" and params.get("destination"):
             if len(archives) != 1:
                 raise RuntimeError("Could not identify the completed export archive.")

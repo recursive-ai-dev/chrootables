@@ -3,3 +3,9 @@ __pycache__/
 .venv/
 .venv-test/
 .pytest_cache/
+
+# Generated release artifacts are uploaded to GitHub Releases.
+dist/*.deb
+dist/*.rpm
+dist/*.AppImage
+dist/*.sha256

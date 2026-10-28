@@ -1,3 +1,6 @@
+import re
+
+
 STYLE = """
 QWidget { background: #121719; color: #e7eeeb; font-family: 'Noto Sans', sans-serif; font-size: 13px; }
 QMainWindow, QDialog { background: #121719; }
@@ -58,3 +61,10 @@ QCheckBox::indicator { width: 15px; height: 15px; border: 1px solid #60766c; bor
 QCheckBox::indicator:checked { background: #a8edc9; border-color: #a8edc9; }
 QDialogButtonBox { background: transparent; }
 """
+
+
+def scaled_style(percent=100):
+    """Scale text without scaling layout spacing or control hit targets."""
+    factor = max(100, min(150, int(percent))) / 100
+    return re.sub(r"font-size: (\d+)px", lambda match:
+                  f"font-size: {round(int(match.group(1)) * factor)}px", STYLE)

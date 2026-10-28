@@ -29,6 +29,12 @@ List the minimal, build, python, network, rust, go and web profiles.
 Check host readiness and store capacity without installing packages.
 JSON output includes individual checks, errors, warnings and storage byte counts.
 .TP
+.B --capabilities --json
+Show versioned profiles, releases, size limits and session options.
+.TP
+.B --operations [--json]
+Inspect durable operation IDs, stages and interrupted work.
+.TP
 .B --activity
 Show recent operation history.
 .TP
@@ -43,7 +49,7 @@ Show detailed usage or the version.
 .SH CREATE AND USE
 .TP
 .B --create NAME SIZE_MIB persistent|ephemeral [PROFILE]
-Create an image, reserving its entire capacity. Sizes range from 512 MiB to 1 TiB.
+Create a sparse image after checking host free space; capacity is not reserved. Sizes range from 512 MiB to 1 TiB.
 .TP
 .B --archive-sync SUITE [PROFILE...]
 Download signed bootstrap and profile packages for offline creation.
@@ -94,6 +100,10 @@ Save current state as a recovery point, then restore a snapshot.
 .TP
 .B --drop-snapshot NAME LABEL --yes
 Permanently remove one snapshot.
+.TP
+.B --recover-operation ID --yes
+Finish an interrupted staged image publication after validating recorded files.
+Active operations and unsafe or inconsistent records are refused.
 .TP
 .B --repair NAME --yes
 Force an ext4 filesystem check and repair.

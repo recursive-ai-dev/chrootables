@@ -14,6 +14,7 @@ import signal
 import struct
 import subprocess
 import termios
+import unicodedata
 
 from PySide6.QtCore import QObject, QSocketNotifier, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter
@@ -30,7 +31,7 @@ REVERSE = 1 << 3
 
 # XTerm palette, indices 0-15; None follows the widget theme.
 PALETTE = {
-    0: None, 1: (197, 34, 43), 2: (42, 161, 78), 3: (196, 160, 23),
+    0: (0, 0, 0), 1: (197, 34, 43), 2: (42, 161, 78), 3: (196, 160, 23),
     4: (48, 118, 215), 5: (161, 74, 168), 6: (56, 178, 197), 7: (211, 215, 207),
     8: (85, 87, 83), 9: (239, 41, 41), 10: (135, 208, 92), 11: (252, 233, 79),
     12: (114, 159, 207), 13: (173, 127, 168), 14: (52, 220, 229), 15: (238, 238, 236),
@@ -73,6 +74,29 @@ class Style:
 
 
 DEFAULT_STYLE = Style()
+
+
+def cell_width(text):
+    """Columns occupied by a cell's base character and combining marks.
+
+    Ambiguous-width characters use one column, matching western locales.
+    Empty text marks the second column of a wide character.
+    """
+    return max((0 if unicodedata.combining(character) or
+                unicodedata.category(character) in ("Mn", "Me", "Cf") else
+                2 if unicodedata.east_asian_width(character) in ("W", "F") else 1
+                for character in text), default=0)
+
+
+def normalize_cells(line):
+    """Remove wide characters split by editing or clipping the cell grid."""
+    for index, (text, style) in enumerate(line):
+        if not text:
+            if not index or cell_width(line[index - 1][0]) != 2:
+                line[index] = (" ", DEFAULT_STYLE)
+        elif cell_width(text) == 2 and (index + 1 == len(line) or line[index + 1][0]):
+            line[index] = (" ", DEFAULT_STYLE)
+    return line
 
 # Parser states.
 _GROUND, _ESC, _CSI, _OSC, _OSC_ESC, _CHARSET, _CSI_IGNORE = range(7)
@@ -141,13 +165,37 @@ class VtScreen:
             self.row -= 1
 
     def _put(self, character):
-        if self.column >= self.columns:
+        width = cell_width(character)
+        if not width:
+            column = self.column - 1
+            row = self.row
+            if column < 0 and row:
+                row, column = row - 1, self.columns - 1
+            while column > 0 and not self.lines[row][column][0]:
+                column -= 1
+            if column >= 0:
+                text, style = self.lines[row][column]
+                self.lines[row][column] = (text + character, style)
+            return
+        if width > self.columns:
+            character, width = "\ufffd", 1
+        if self.column >= self.columns or self.column + width > self.columns:
             self.column = 0
             self._line_feed()
+        self._erase(self.row, self.column, self.column + width)
         self.lines[self.row][self.column] = (character, self.style)
-        self.column += 1
+        if width == 2:
+            self.lines[self.row][self.column + 1] = ("", self.style)
+        self.column += width
 
     def _erase(self, line, start, end):
+        start, end = max(0, start), min(self.columns, end)
+        if start >= end:
+            return
+        if start and not self.lines[line][start][0]:
+            start -= 1
+        if end < self.columns and not self.lines[line][end][0]:
+            end += 1
         self.lines[line][start:end] = [(" ", DEFAULT_STYLE)] * (end - start)
 
     def _insert_blanks(self, count):
@@ -155,12 +203,14 @@ class VtScreen:
         count = min(count, self.columns - self.column)
         line[self.column:self.column] = [(" ", self.style)] * count
         del line[self.columns:]
+        normalize_cells(line)
 
     def _delete_cells(self, count):
         line = self.lines[self.row]
         count = min(count, self.columns - self.column)
         del line[self.column:self.column + count]
         line.extend([(" ", DEFAULT_STYLE)] * count)
+        normalize_cells(line)
 
     # -- sequence handling ---------------------------------------------------
 
@@ -440,6 +490,7 @@ class VtScreen:
             for index, line in enumerate(lines[:rows]):
                 width = min(columns, len(line))
                 result[index][:width] = line[:width]
+                normalize_cells(result[index])
             return result
 
         self.lines = resized(self.lines)
@@ -462,7 +513,7 @@ class VtScreen:
         offset = max(0, min(offset, len(self.history)))
         lines = list(self.history) + self.lines
         start = len(self.history) - offset
-        return [(line[:self.columns] + self._blank_line())[:self.columns]
+        return [normalize_cells((line[:self.columns] + self._blank_line())[:self.columns])
                 for line in lines[start:start + self.rows]]
 
 
@@ -678,8 +729,15 @@ class TerminalPane(QWidget):
         if color is None:
             return QColor(default)
         if isinstance(color, int):
-            rgb = PALETTE.get(color % 16)
-            return QColor(default) if rgb is None else QColor(*rgb)
+            color = max(0, min(255, color))
+            if color < 16:
+                return QColor(*PALETTE[color])
+            if color < 232:
+                value = color - 16
+                levels = (0, 95, 135, 175, 215, 255)
+                return QColor(levels[value // 36], levels[(value // 6) % 6], levels[value % 6])
+            level = 8 + (color - 232) * 10
+            return QColor(level, level, level)
         return QColor(*color)
 
     def paintEvent(self, event):
@@ -687,29 +745,46 @@ class TerminalPane(QWidget):
         background = QColor("#1c1c1c")
         foreground = QColor("#e6e6e2")
         painter.fillRect(self.rect(), background)
-        painter.setFont(self.font)
+        fonts = {}
+        last_flags = None
         for row, line in enumerate(self.screen.viewport(self.scroll_offset)):
             y = row * self.cell_height
-            run_start = 0
-            previous = line[0][1]
-            for column in range(1, len(line) + 1):
-                style = line[column][1] if column < len(line) else None
-                if style != previous:
-                    flags = previous.flags
-                    fill = previous.bg
-                    text_color = previous.fg
-                    if flags & REVERSE:
-                        fill, text_color = text_color, fill
-                    painter.fillRect(run_start * self.cell_width, y,
-                                     (column - run_start) * self.cell_width,
-                                     self.cell_height,
-                                     self._brush(fill, "#1c1c1c"))
-                    painter.setPen(self._brush(text_color, "#e6e6e2"))
-                    text = "".join(line[index][0] for index in range(run_start, column))
-                    painter.drawText(run_start * self.cell_width,
-                                     y + self._metrics.ascent(), text)
-                    run_start = column
-                    previous = style
+            column = 0
+            while column < len(line):
+                text, style = line[column]
+                if not text:
+                    column += 1
+                    continue
+                width = max(1, cell_width(text))
+                # Batch ordinary monospaced text; wide and combining cells
+                # keep explicit grid positions rather than font advances.
+                if len(text) == 1 and text.isascii():
+                    end = column + 1
+                    while end < len(line):
+                        next_text, next_style = line[end]
+                        if next_style != style or len(next_text) != 1 or not next_text.isascii():
+                            break
+                        text += next_text
+                        end += 1
+                    width = end - column
+                fill = self._brush(style.bg, "#1c1c1c")
+                text_color = self._brush(style.fg, "#e6e6e2")
+                if style.flags & REVERSE:
+                    fill, text_color = text_color, fill
+                painter.fillRect(column * self.cell_width, y, width * self.cell_width,
+                                 self.cell_height, fill)
+                if style.flags != last_flags:
+                    if style.flags not in fonts:
+                        font = QFont(self.font)
+                        font.setBold(bool(style.flags & BOLD))
+                        font.setItalic(bool(style.flags & ITALIC))
+                        font.setUnderline(bool(style.flags & UNDERLINE))
+                        fonts[style.flags] = font
+                    painter.setFont(fonts[style.flags])
+                    last_flags = style.flags
+                painter.setPen(text_color)
+                painter.drawText(column * self.cell_width, y + self._metrics.ascent(), text)
+                column += width
         if self._selection_start is not None and self._selection_end is not None:
             start, end = sorted((self._selection_start, self._selection_end))
             for row in range(start[0], end[0] + 1):
@@ -718,9 +793,9 @@ class TerminalPane(QWidget):
                 painter.fillRect(left * self.cell_width, row * self.cell_height,
                                  (right - left) * self.cell_width, self.cell_height,
                                  QColor(100, 160, 220, 100))
-        if (not self.scroll_offset and self._cursor_shown and self.process is not None
+        if (not self.scroll_offset and self._cursor_shown and self.screen.cursor_visible and self.process is not None
                 and self.process.running):
-            painter.fillRect(self.screen.column * self.cell_width,
+            painter.fillRect(min(self.screen.column, self.screen.columns - 1) * self.cell_width,
                              self.screen.row * self.cell_height,
                              self.cell_width, self.cell_height, foreground)
 
@@ -808,11 +883,15 @@ class TerminalPane(QWidget):
         if self._selection_start is None or self._selection_end is None:
             return ""
         start, end = sorted((self._selection_start, self._selection_end))
+        if start == end:
+            return ""
         lines = self.screen.viewport(self.scroll_offset)
         selected = []
         for row in range(start[0], end[0] + 1):
             left = start[1] if row == start[0] else 0
             right = end[1] if row == end[0] else self.screen.columns
+            if left < len(lines[row]) and left and not lines[row][left][0]:
+                left -= 1
             selected.append("".join(cell[0] for cell in lines[row][left:right]).rstrip())
         return "\n".join(selected)
 

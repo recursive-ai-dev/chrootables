@@ -1,8 +1,11 @@
 name: CI
 
+permissions:
+  contents: read
+
 on:
   push:
-    branches: [main]
+    branches: [main, 'release/**']
   pull_request:
   workflow_dispatch:
 
@@ -14,18 +17,19 @@ jobs:
       matrix:
         container: [fedora:latest, debian:trixie]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     container: ${{ matrix.container }}
     env:
       QT_QPA_PLATFORM: offscreen
     steps:
       - name: Install dependencies (Fedora)
         if: startsWith(matrix.container, 'fedora')
-        run: dnf install -y --setopt=install_weak_deps=False git python3-pyside6 python3-gobject-base desktop-file-utils
+        run: dnf install -y --setopt=install_weak_deps=False git python3-pyside6 python3-gobject-base desktop-file-utils rpm-build
       - name: Install dependencies (Debian)
         if: startsWith(matrix.container, 'debian')
         run: |
           apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git python3-pyside6 python3-gi gir1.2-glib-2.0 desktop-file-utils dpkg
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git python3-pyside6.qtcore python3-pyside6.qtgui python3-pyside6.qtwidgets python3-pyside6.qttest python3-gi gir1.2-glib-2.0 desktop-file-utils dpkg
       - uses: actions/checkout@v4
       - name: Verify (Fedora)
         if: startsWith(matrix.container, 'fedora')
@@ -35,21 +39,100 @@ jobs:
         run: python3 scripts/check.py --require-desktop-integration --build-deb
       - name: Build installable Debian artifact
         if: startsWith(matrix.container, 'debian')
-        run: python3 scripts/build-deb.py
+        run: python3 scripts/build-deb.py --output /tmp/chrootables-artifacts
+      - name: Verify Debian installation, upgrade and removal
+        if: startsWith(matrix.container, 'debian')
+        run: |
+          apt-get install -y --no-install-recommends /tmp/chrootables-artifacts/chrootables_*_all.deb
+          python3 scripts/check-installed.py
+          mkdir -p /var/lib/chrootable-manager
+          printf retained > /var/lib/chrootable-manager/.package-preservation-check
+          python3 scripts/build-deb.py --revision 2 --output /tmp/upgrade
+          apt-get install -y --no-install-recommends /tmp/upgrade/chrootables_*_all.deb
+          python3 scripts/check-installed.py
+          apt-get remove -y chrootables
+          test "$(cat /var/lib/chrootable-manager/.package-preservation-check)" = retained
+      - name: Build installable RPM artifact
+        if: startsWith(matrix.container, 'fedora')
+        run: python3 scripts/build-rpm.py --output /tmp/chrootables-artifacts
+      - name: Verify RPM installation, upgrade and removal
+        if: startsWith(matrix.container, 'fedora')
+        run: |
+          dnf install -y --setopt=install_weak_deps=False /tmp/chrootables-artifacts/chrootables-*.noarch.rpm
+          python3 scripts/check-installed.py
+          mkdir -p /var/lib/chrootable-manager
+          printf retained > /var/lib/chrootable-manager/.package-preservation-check
+          python3 scripts/build-rpm.py --revision 2 --output /tmp/upgrade
+          dnf install -y --setopt=install_weak_deps=False /tmp/upgrade/chrootables-*.noarch.rpm
+          python3 scripts/check-installed.py
+          dnf remove -y chrootables
+          test "$(cat /var/lib/chrootable-manager/.package-preservation-check)" = retained
       - name: Upload Debian package and checksum
         if: startsWith(matrix.container, 'debian')
         uses: actions/upload-artifact@v4
         with:
           name: chrootables-debian
           path: |
-            dist/*.deb
-            dist/*.deb.sha256
+            /tmp/chrootables-artifacts/*.deb
+            /tmp/chrootables-artifacts/*.deb.sha256
+          if-no-files-found: error
+      - name: Upload RPM package and checksum
+        if: startsWith(matrix.container, 'fedora')
+        uses: actions/upload-artifact@v4
+        with:
+          name: chrootables-rpm
+          path: |
+            /tmp/chrootables-artifacts/*.rpm
+            /tmp/chrootables-artifacts/*.rpm.sha256
+          if-no-files-found: error
+
+  appimage:
+    name: AppImage (x86_64, host Python and Qt)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container: ubuntu:26.04
+    env:
+      QT_QPA_PLATFORM: offscreen
+      APPIMAGETOOL: /tmp/appimage-tools/appimagetool-1.9.1-x86_64.AppImage
+      APPIMAGE_RUNTIME_FILE: /tmp/appimage-tools/runtime-x86_64
+      APPIMAGE_EXTRACT_AND_RUN: '1'
+    steps:
+      - name: Install build and host runtime dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git python3 python3-pyside6.qtwidgets ca-certificates squashfs-tools file
+      - uses: actions/checkout@v4
+      - name: Fetch checksum-pinned AppImage tools
+        run: python3 scripts/fetch-build-tools.py --output /tmp/appimage-tools
+      - name: Verify AppImage artifact contracts
+        run: python3 -m unittest discover -s tests -p test_packages.py -v
+      - name: Build AppImage twice and verify reproducibility
+        run: |
+          python3 scripts/build-appimage.py --output /tmp/chrootables-artifacts
+          python3 scripts/build-appimage.py --output /tmp/rebuild
+          cmp /tmp/chrootables-artifacts/Chrootables-*.AppImage /tmp/rebuild/Chrootables-*.AppImage
+      - name: Verify extracted package and portable launcher
+        run: |
+          cd /tmp
+          /tmp/chrootables-artifacts/Chrootables-*.AppImage --appimage-extract
+          cd "$GITHUB_WORKSPACE"
+          python3 scripts/check-installed.py --prefix /tmp/squashfs-root/usr
+          /tmp/chrootables-artifacts/Chrootables-*.AppImage --version
+          /tmp/chrootables-artifacts/Chrootables-*.AppImage --demo --screenshot /tmp/appimage-demo.png
+          test -s /tmp/appimage-demo.png
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chrootables-appimage
+          path: |
+            /tmp/chrootables-artifacts/*.AppImage
+            /tmp/chrootables-artifacts/*.AppImage.sha256
           if-no-files-found: error
 
   integration:
-    name: integration (root, opt-in)
-    if: github.event_name == 'workflow_dispatch'
+    name: integration (root, release/manual)
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/heads/release/')
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     container:
       image: debian:trixie
       options: --privileged
@@ -63,3 +146,4 @@ jobs:
         run: |
           ./chrootable-manager --setup
           tests/integration.sh
+          tests/integration.sh python

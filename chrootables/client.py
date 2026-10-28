@@ -19,6 +19,9 @@ def valid_result(action, data):
     if action == "inventory":
         if not fields(data, integers=("free_bytes", "total_bytes")):
             return False
+        if "storage" in data and not fields(data["storage"], integers=(
+                "images_bytes", "snapshots_bytes", "exports_bytes", "logs_bytes")):
+            return False
         schemas = {
             "images": (("name", "status", "lifecycle", "suite", "profile", "architecture",
                         "created_at", "last_used_at", "origin"),
@@ -26,9 +29,12 @@ def valid_result(action, data):
             "snapshots": (("name", "label", "created_at"), ("size_mib",)),
             "activity": (("time", "action", "name", "status", "log"), ()),
         }
-        return all(isinstance(data.get(key), list)
+        return (all(isinstance(data.get(key), list)
                    and all(fields(item, *schema) for item in data[key])
                    for key, schema in schemas.items())
+                and all("allocated_bytes" not in item or
+                        type(item["allocated_bytes"]) is int and item["allocated_bytes"] >= 0
+                        for item in data["snapshots"]))
     return fields(data, integers=("exit_code",))
 
 
@@ -43,7 +49,7 @@ def valid_message(message):
     identifier = message.get("id")
     if type(identifier) is not int or not 0 < identifier <= 2147483647:
         return False
-    if event == "output":
+    if event in ("output", "phase"):
         return isinstance(message.get("text"), str)
     if event == "result" and type(message.get("ok")) is bool:
         return ("data" in message if message["ok"] else
@@ -62,6 +68,7 @@ class Client(QObject):
     ready = Signal(bool)
     disconnected = Signal(str)
     output = Signal(int, str)
+    phase = Signal(int, str)
 
     def __init__(self, store, parent=None):
         super().__init__(parent)
@@ -146,6 +153,8 @@ class Client(QObject):
                 self.writable = message["writable"]
                 self.is_ready = True
                 self.ready.emit(self.writable)
+            elif event == "phase":
+                self.phase.emit(message["id"], message["text"])
             elif event == "result":
                 callback = self.callbacks.pop(message.get("id"), None)
                 if callback:

@@ -40,6 +40,37 @@ class VtScreenTests(unittest.TestCase):
         screen.feed("x" * 12)
         self.assertEqual((screen.row, screen.column), (1, 7))
 
+    def test_unicode_combining_and_wide_characters_keep_cell_positions(self):
+        screen = VtScreen(3, 6)
+        screen.feed("Ae")
+        screen.feed("\u0301界B")
+        self.assertEqual(screen.lines[0][1][0], "e\u0301")
+        self.assertEqual(screen.lines[0][2][0], "界")
+        self.assertEqual(screen.lines[0][3][0], "")
+        self.assertEqual(screen.column, 5)
+        screen.feed("界")
+        self.assertEqual((screen.row, screen.column), (1, 2))
+        self.assertEqual(screen.plain().splitlines()[:2], ["Ae\u0301界B", "界"])
+
+    def test_wide_overwrite_erase_and_edit_do_not_leave_half_characters(self):
+        screen = VtScreen(3, 20)
+        screen.feed("A界B\x1b[1;3Hx")
+        self.assertEqual(screen.plain().splitlines()[0], "A xB")
+        screen.feed("\rA界B\x1b[1;3H\x1b[X")
+        self.assertEqual(screen.plain().splitlines()[0], "A  B")
+        screen.feed("\rA界B\x1b[1;3H\x1b[@")
+        self.assertNotIn("界", screen.plain())
+        screen.feed("\rA界B\x1b[1;3H\x1b[P")
+        self.assertNotIn("界", screen.plain())
+
+    def test_resize_clips_entire_wide_character_and_preserves_combining_text(self):
+        screen = VtScreen(3, 30)
+        screen.feed("e\u0301" + "x" * 18 + "界")
+        screen.resize(3, 20)
+        self.assertEqual(screen.lines[0][0][0], "e\u0301")
+        self.assertEqual(screen.lines[0][-1][0], " ")
+        self.assertNotIn("界", screen.plain())
+
     def test_carriage_return_line_feed_and_backspace(self):
         screen = VtScreen(3, 20)
         screen.feed("one\r\ntwo")
@@ -402,6 +433,40 @@ class TerminalPaneTests(unittest.TestCase):
             process.terminate()
             self.assertTrue(pump(self.app, lambda: process._finished))
             pane.close()
+
+    def test_256_color_palette_and_hidden_cursor_are_rendered(self):
+        pane = TerminalPane()
+        self.addCleanup(pane.close)
+        self.assertEqual(pane._brush(0, "#ffffff").getRgb()[:3], (0, 0, 0))
+        self.assertEqual(pane._brush(196, "#ffffff").getRgb()[:3], (255, 0, 0))
+        self.assertEqual(pane._brush(46, "#ffffff").getRgb()[:3], (0, 255, 0))
+        self.assertEqual(pane._brush(232, "#ffffff").getRgb()[:3], (8, 8, 8))
+        self.assertEqual(pane._brush(255, "#ffffff").getRgb()[:3], (238, 238, 238))
+        pane.resize(400, 100)
+        pane.show()
+        self.app.processEvents()
+        pane.process = Mock(running=True)
+        pane._cursor_shown = True
+        pane.screen.feed("abc")
+        x = pane.screen.column * pane.cell_width
+        self.assertEqual(pane.grab().toImage().pixelColor(x, 0).name(), "#e6e6e2")
+        pane.screen.feed("\x1b[?25l")
+        self.assertEqual(pane.grab().toImage().pixelColor(x, 0).name(), "#1c1c1c")
+        pane.screen.feed("\r\x1b[7m ")
+        self.assertEqual(pane.grab().toImage().pixelColor(0, 0).name(), "#e6e6e2")
+
+    def test_attributes_reach_painter_and_wide_selection_copies_once(self):
+        pane = TerminalPane()
+        self.addCleanup(pane.close)
+        pane.screen.feed("\x1b[1;3;4m界e\u0301")
+        with patch("chrootables.terminal.QPainter") as painter:
+            pane.paintEvent(None)
+        fonts = [call.args[0] for call in painter.return_value.setFont.call_args_list]
+        self.assertTrue(any(font.bold() and font.italic() and font.underline() for font in fonts))
+        pane._selection_start, pane._selection_end = (0, 0), (0, 3)
+        self.assertEqual(pane.selected_text(), "界e\u0301")
+        pane._selection_start, pane._selection_end = (0, 1), (0, 2)
+        self.assertEqual(pane.selected_text(), "界")
 
     def test_history_navigation_after_exit_and_anchor_during_output(self):
         pane = TerminalPane()

@@ -154,11 +154,13 @@ class DesktopTests(unittest.TestCase):
     def test_corrupt_saved_geometry_does_not_prevent_startup(self):
         self.settings.setValue("window/geometry", 123)
         self.settings.setValue("window/splitter", ["invalid", "sizes"])
+        self.settings.setValue("appearance/text_scale", "invalid")
         with patch("chrootables.app.QSettings", return_value=self.settings), \
                 patch("chrootables.app.QTimer.singleShot"):
             window = Window(self.window.store)
             self.addCleanup(window.close)
         self.assertGreater(window.width(), 0)
+        self.assertEqual(window.text_scale.currentData(), 100)
 
     def test_health_distinguishes_store_configuration_from_dependencies(self):
         self.enable_shared_folder_controls()
@@ -577,6 +579,88 @@ class DesktopTests(unittest.TestCase):
         with patch.object(self.window, "show_log") as show_log:
             self.window.activity_log()
         show_log.assert_not_called()
+
+    def test_recovery_filter_actions_keep_identity_after_refresh(self):
+        selected = self.window.data["snapshots"][-1].copy()
+        self.window.recovery_search.setText(selected["label"])
+        self.window.recovery_table.selectRow(0)
+        self.assertEqual(self.window.chosen_snapshot(), selected)
+        self.window.data["snapshots"].reverse()
+        self.window.render()
+        with patch.object(self.window, "confirm", return_value=True), patch.object(self.window, "perform") as perform:
+            self.window.restore()
+        perform.assert_called_once_with("restore", {"name": selected["name"], "target": selected["label"], "confirmed": True})
+        self.window.recovery_search.setText("no-matching-recovery")
+        self.assertIsNone(self.window.chosen_snapshot())
+        self.assertFalse(self.window.restore_button.isEnabled())
+
+    def test_activity_filters_keep_selected_log_identity(self):
+        self.window.data["activity"].append({"time": "2026-10-27T10:00:00", "name": "failed-workspace", "action": "create", "status": "failed", "log": "failed.log"})
+        self.window.render()
+        self.window.activity_filter.setCurrentIndex(1)
+        self.window.activity_search.setText("failed-workspace")
+        self.assertEqual(self.window.activity_table.rowCount(), 1)
+        self.window.activity_table.selectRow(0)
+        self.window.data["activity"].reverse()
+        self.window.render()
+        with patch.object(self.window, "show_log") as show_log:
+            self.window.demo = False
+            self.window.activity_log()
+        show_log.assert_called_once_with("failed-workspace", "failed.log")
+
+    def test_snapshot_cleanup_preview_contains_scope_and_allocated_storage(self):
+        item = self.window.data["snapshots"][0]
+        item["allocated_bytes"] = 123 * 1048576
+        self.window.recovery_table.selectRow(0)
+        with patch.object(self.window, "confirm", return_value=False) as confirm, patch.object(self.window, "perform") as perform:
+            self.window.drop_snapshot()
+        self.assertIn("123 MiB", confirm.call_args.args[1])
+        self.assertIn("Only this recovery point", confirm.call_args.args[1])
+        perform.assert_not_called()
+
+    def test_operation_output_can_pause_follow_and_shows_elapsed_phase(self):
+        self.window.task_panel.show()
+        self.window.append_output("line\n" * 300)
+        self.app.processEvents()
+        self.window.follow_output.setChecked(False)
+        scroll = self.window.task_output.verticalScrollBar()
+        scroll.setValue(10)
+        self.window.append_output("more\n" * 40)
+        self.assertEqual(scroll.value(), 10)
+        self.window.follow_output.setChecked(True)
+        self.window.append_output("last\n")
+        self.assertEqual(scroll.value(), scroll.maximum())
+        with patch("chrootables.app.time.monotonic", return_value=125):
+            self.window.task_started = 60
+            self.window.set_task_phase("Downloading packages")
+        self.assertEqual(self.window.task_phase.text(), "Downloading packages · 01:05 elapsed")
+        self.window.task_started = None
+
+    def test_compact_layout_text_scale_and_view_search_shortcut(self):
+        self.window.resize(1024, 768)
+        self.app.processEvents()
+        self.assertLessEqual(self.window.minimumSizeHint().width(), 1024)
+        self.assertLessEqual(self.window.minimumSizeHint().height(), 768)
+        self.window.navigate(1)
+        self.window.focus_search()
+        self.assertEqual(self.window.focusWidget(), self.window.recovery_search)
+        self.window.text_scale.setCurrentIndex(1)
+        self.app.processEvents()
+        self.window.resize(1024, 768)
+        self.app.processEvents()
+        self.assertIn("font-size: 16px", self.window.styleSheet())
+        self.assertEqual(self.window.splitter.orientation(), Qt.Orientation.Vertical)
+        self.assertEqual(self.window.content_scroll.horizontalScrollBar().maximum(), 0)
+        self.window.activateWindow()
+        self.window.recovery_search.setFocus()
+        self.app.processEvents()
+        QTest.keyClick(self.window.recovery_search, Qt.Key.Key_3, Qt.KeyboardModifier.AltModifier)
+        self.app.processEvents()
+        self.assertEqual(self.window.current_view, 2)
+        QTest.keyClick(self.window, Qt.Key.Key_F, Qt.KeyboardModifier.ControlModifier)
+        self.app.processEvents()
+        self.assertEqual(self.window.focusWidget(), self.window.activity_search)
+        self.assertFalse(self.settings.contains("appearance/text_scale"))
 
 
 if __name__ == "__main__":

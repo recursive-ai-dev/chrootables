@@ -426,7 +426,8 @@ assert store.inventory()['images'][0]['status'] == 'ready'
         self.assertIn("diagnostic output", "".join(output))
 
     def test_operation_log_append_during_read_is_streamed_once(self):
-        log = self.path / "logs/lab-clone.log"
+        operation_id = "a" * 32
+        log = self.path / "logs" / (operation_id + ".log")
         log.write_text("first\n")
         process = Mock(stdout=io.StringIO(), returncode=0)
         process.poll.side_effect = [None, 0]
@@ -443,12 +444,60 @@ assert store.inventory()['images'][0]['status'] == 'ready'
 
         output = []
         with patch("chrootables.backend.subprocess.Popen", return_value=process), \
+             patch("chrootables.backend.uuid.uuid4", return_value=Mock(hex=operation_id)), \
              patch("chrootables.backend.time.time", return_value=0), \
              patch("chrootables.backend.time.sleep"), \
              patch("chrootables.backend.os.open", side_effect=append_before_open):
             code = self.store.operate("clone", {"name": "lab", "target": "copy"}, output.append)
         self.assertEqual(code, 0)
         self.assertEqual("".join(output), "first\nsecond\n")
+
+    def test_operation_tails_only_its_log_and_forwards_matching_phases(self):
+        operation_id = "b" * 32
+        (self.path / "logs" / (operation_id + ".log")).write_text("own log\n")
+        (self.path / "logs/other-workspace.log").write_text("unrelated output\n")
+        stream = ("CHROOTABLE_EVENT " + json.dumps({"id": operation_id, "stage": "Copying image"}) + "\n"
+                  "CHROOTABLE_EVENT " + json.dumps({"id": "c" * 32, "stage": "Other task"}) + "\n"
+                  "normal output\n")
+        process = Mock(stdout=io.StringIO(stream), returncode=0)
+        process.poll.return_value = 0
+        output, phases = [], []
+        with patch("chrootables.backend.subprocess.Popen", return_value=process) as spawn, \
+                patch("chrootables.backend.uuid.uuid4", return_value=Mock(hex=operation_id)), \
+                patch("chrootables.backend.os.scandir", side_effect=AssertionError("must not scan logs")):
+            code = self.store.operate("clone", {"name": "lab", "target": "copy"}, output.append, progress=phases.append)
+        self.assertEqual(code, 0)
+        self.assertEqual(phases, ["Copying image"])
+        text = "".join(output)
+        self.assertIn("own log", text)
+        self.assertIn("normal output", text)
+        self.assertNotIn("unrelated output", text)
+        self.assertEqual(spawn.call_args.kwargs["env"]["CHROOTABLE_OPERATION_ID"], operation_id)
+
+    def test_storage_summary_counts_snapshots_exports_and_logs_without_following_links(self):
+        image = self.image()
+        folder = self.path / "snapshots/lab"
+        folder.mkdir()
+        snapshot = folder / "clean.img"
+        snapshot.write_bytes(b"snapshot" * 1024)
+        exports = self.path / "exports"
+        exports.mkdir()
+        archive = exports / "lab.tar.gz"
+        archive.write_bytes(b"archive" * 1024)
+        (exports / "outside-link").symlink_to(image)
+        log = self.path / "logs/operation.log"
+        log.write_text("operation output")
+        report = self.store.inventory()
+        self.assertEqual(report["snapshots"][0]["allocated_bytes"], snapshot.stat().st_blocks * 512)
+        self.assertEqual(report["storage"], {
+            "images_bytes": image.stat().st_blocks * 512,
+            "snapshots_bytes": snapshot.stat().st_blocks * 512,
+            "exports_bytes": archive.stat().st_blocks * 512,
+            "logs_bytes": log.stat().st_blocks * 512})
+        new_archive = exports / "second.tar.gz"
+        new_archive.write_bytes(b"second export")
+        refreshed = self.store.inventory()["storage"]
+        self.assertEqual(refreshed["exports_bytes"], (archive.stat().st_blocks + new_archive.stat().st_blocks) * 512)
 
     def test_resolver_setup_does_not_use_uninitialized_local(self):
         work = self.path / "work"

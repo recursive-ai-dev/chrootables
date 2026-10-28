@@ -8,6 +8,7 @@ from hashlib import sha256
 import json
 from pathlib import Path
 import sys
+import time
 
 from PySide6.QtCore import Qt, QEvent, QSettings, QSize, QTimer, QProcess
 from PySide6.QtGui import QColor, QFont, QIcon, QKeySequence, QPainter, QPen, QPixmap, QShortcut, QTextCursor
@@ -17,12 +18,12 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem, QStackedWidget, QSplitter, QScrollArea,
     QDialog, QDialogButtonBox, QFormLayout, QGridLayout, QMessageBox, QPlainTextEdit,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
-    QProgressBar, QMenu, QFileDialog,
+    QProgressBar, QMenu, QFileDialog, QLayout,
 )
 from . import __version__
-from .backend import DEFAULT_STORE, ROOT, PROFILES, name, shared_folder, session_command, terminal_command
+from .backend import DEFAULT_STORE, ROOT, PROFILES, SUITES, name, shared_folder, session_command, terminal_command
 from .client import Client
-from .style import STYLE
+from .style import STYLE, scaled_style
 from .terminal import TerminalWindow
 
 
@@ -128,8 +129,8 @@ class CreateDialog(QDialog):
             self.profile.addItem(title, key)
         self.profile_description = label(PROFILES["minimal"][1], "muted", True)
         self.suite = QComboBox()
-        self.suite.addItem("Debian 13 · Trixie", "trixie")
-        self.suite.addItem("Debian 12 · Bookworm", "bookworm")
+        for key, title in SUITES.items():
+            self.suite.addItem(title, key)
         self.size_input = QSpinBox()
         self.size_input.setRange(1, 1024)
         self.size_input.setValue(2)
@@ -144,7 +145,7 @@ class CreateDialog(QDialog):
         form.addRow("Image capacity", self.size_input)
         form.addRow("Session lifecycle", self.lifecycle)
         layout.addLayout(form)
-        layout.addWidget(label("Debian packages are verified by debootstrap. Creation downloads a base system and reserves the image capacity on disk.", "muted", True))
+        layout.addWidget(label("Debian packages are verified by debootstrap. Creation checks available capacity and downloads a base system. Sparse image files grow as data is written; free space is not reserved.", "muted", True))
         self.error = label("", "banner", True)
         layout.addWidget(self.error)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
@@ -296,7 +297,7 @@ class Window(QMainWindow):
         self.setWindowTitle("Chrootables")
         self.setWindowIcon(QIcon(glyph(size=64)))
         self.resize(1360, 920)
-        self.setMinimumSize(1180, 780)
+        self.setMinimumSize(900, 640)
         self.store = Path(store)
         self.demo = demo
         self.settings = QSettings("Chrootables", "Desktop")
@@ -312,6 +313,8 @@ class Window(QMainWindow):
         self.refreshing = False
         self.pending_action = None
         self.last_task = ""
+        self.task_started = None
+        self.task_phase_text = ""
         self.health_ready = False
         self.missing_dependencies = False
         self.store_locked = False
@@ -323,7 +326,13 @@ class Window(QMainWindow):
         self.client.ready.connect(self.connected)
         self.client.disconnected.connect(self.disconnected)
         self.client.output.connect(lambda identifier, text: self.append_output(text))
+        self.client.phase.connect(lambda identifier, text: self.set_task_phase(text))
         self.build_ui()
+        self.task_timer = QTimer(self)
+        self.task_timer.setInterval(1000)
+        self.task_timer.timeout.connect(self.update_task_elapsed)
+        self.task_timer.start()
+        self.change_text_scale()
         if not demo:
             geometry = self.settings.value("window/geometry")
             if geometry is not None:
@@ -343,6 +352,9 @@ class Window(QMainWindow):
         for keys, callback in [("Ctrl+N", self.create), ("Ctrl+F", self.focus_search), ("F5", self.refresh), ("Ctrl+Return", self.open_terminal)]:
             shortcut = QShortcut(QKeySequence(keys), self)
             shortcut.activated.connect(callback)
+        for index in range(4):
+            shortcut = QShortcut(QKeySequence(f"Alt+{index + 1}"), self)
+            shortcut.activated.connect(lambda i=index: self.navigate(i))
         if demo:
             self.load_demo()
         else:
@@ -352,17 +364,18 @@ class Window(QMainWindow):
         central, horizontal = box(horizontal=True, spacing=0)
         self.setCentralWidget(central)
         sidebar = QFrame()
+        self.sidebar = sidebar
         sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(218)
+        sidebar.setMinimumWidth(178)
         side = QVBoxLayout(sidebar)
-        side.setContentsMargins(20, 30, 20, 24)
+        side.setContentsMargins(12, 18, 12, 16)
         side.setSpacing(9)
         logo = label("")
         logo.setPixmap(glyph(size=45))
         side.addWidget(logo)
         side.addSpacing(6)
-        side.addWidget(label("chrootables", "brand"))
-        side.addWidget(label("A little space. No limits.", "muted"))
+        side.addWidget(label("chrootables", "brand", True))
+        side.addWidget(label("A little space. No limits.", "muted", True))
         side.addSpacing(35)
         side.addWidget(label("WORKBENCH", "eyebrow"))
         self.nav = []
@@ -374,22 +387,45 @@ class Window(QMainWindow):
         self.nav[0].setChecked(True)
         side.addStretch()
         side.addWidget(label("LOCAL ENGINE", "eyebrow"))
-        side.addWidget(label("Debian image workspaces", "muted"))
-        self.access_label = label("Connecting…", "muted")
+        side.addWidget(label("Debian image workspaces", "muted", True))
+        self.access_label = label("Connecting…", "muted", True)
         side.addWidget(self.access_label)
-        self.unlock_button = button("Unlock workspace store", self.unlock)
+        self.unlock_button = button("Unlock store", self.unlock)
+        self.unlock_button.setToolTip("Unlock workspace store")
+        self.unlock_button.setStyleSheet("padding: 8px 5px;")
         side.addWidget(self.unlock_button)
+        self.text_scale = QComboBox()
+        self.text_scale.setAccessibleName("Interface text size")
+        for value in (100, 125, 150):
+            self.text_scale.addItem(f"Text size · {value}%", value)
+        try:
+            saved_scale = int(self.settings.value("appearance/text_scale", 100)) if not self.demo else 100
+        except (TypeError, ValueError):
+            saved_scale = 100
+        self.text_scale.setCurrentIndex(max(0, self.text_scale.findData(saved_scale)))
+        self.text_scale.currentIndexChanged.connect(self.change_text_scale)
+        side.addWidget(self.text_scale)
         side.addSpacing(14)
         side.addWidget(label(f"DESKTOP {__version__}", "eyebrow"))
-        horizontal.addWidget(sidebar)
+        self.sidebar_scroll = QScrollArea()
+        self.sidebar_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.sidebar_scroll.setWidgetResizable(True)
+        self.sidebar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.sidebar_scroll.setWidget(sidebar)
+        self.sidebar_scroll.setFixedWidth(196)
+        horizontal.addWidget(self.sidebar_scroll)
 
-        content, self.content_layout = box(margins=30, spacing=18)
-        horizontal.addWidget(content, 1)
+        content, self.content_layout = box(margins=16, spacing=12)
+        self.content_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        self.content_scroll = QScrollArea()
+        self.content_scroll.setWidgetResizable(True)
+        self.content_scroll.setWidget(content)
+        horizontal.addWidget(self.content_scroll, 1)
         top, row = box(horizontal=True)
         headings, titles = box(spacing=6)
         self.eyebrow = label("WORKSPACE LIBRARY", "eyebrow")
-        self.heading = label("Your Linux, on your terms.", "title")
-        self.subtitle = label("Build, break, rewind. Keep your host out of the experiment.", "subtitle")
+        self.heading = label("Your Linux, on your terms.", "title", True)
+        self.subtitle = label("Build, break, rewind. Keep your host out of the experiment.", "subtitle", True)
         titles.addWidget(self.eyebrow)
         titles.addWidget(self.heading)
         titles.addWidget(self.subtitle)
@@ -427,6 +463,14 @@ class Window(QMainWindow):
         self.hide_task = button("Hide", self.task_panel.hide, "quiet")
         task_row.addWidget(self.hide_task)
         task_layout.addWidget(task_top)
+        task_status, task_status_row = box(horizontal=True, spacing=8)
+        self.task_phase = label("", "muted", True)
+        task_status_row.addWidget(self.task_phase, 1)
+        self.follow_output = QCheckBox("Follow output")
+        self.follow_output.setChecked(True)
+        self.follow_output.setAccessibleName("Follow operation output")
+        task_status_row.addWidget(self.follow_output)
+        task_layout.addWidget(task_status)
         self.task_progress = QProgressBar()
         self.task_progress.setRange(0, 0)
         self.task_progress.setTextVisible(False)
@@ -434,21 +478,21 @@ class Window(QMainWindow):
         self.task_output = QPlainTextEdit()
         self.task_output.setReadOnly(True)
         self.task_output.setMaximumBlockCount(4000)
-        self.task_output.setFixedHeight(165)
+        self.task_output.setFixedHeight(100)
         task_layout.addWidget(self.task_output)
         self.task_panel.hide()
         self.content_layout.addWidget(self.task_panel)
         footer, footer_row = box(horizontal=True)
-        self.status = label("Reading local workspaces…", "muted")
+        self.status = label("Reading local workspaces…", "muted", True)
         footer_row.addWidget(self.status, 1)
         self.task_reopen = button("Task output ↗", self.task_panel.show, "quiet")
         self.task_reopen.hide()
         footer_row.addWidget(self.task_reopen)
-        footer_row.addWidget(label("Ctrl N  create    /    Ctrl F  search", "muted"))
+        footer_row.addWidget(label("Alt 1–4  views", "muted"))
         self.content_layout.addWidget(footer)
 
     def build_library(self):
-        page, layout = box(spacing=20)
+        page, layout = box(spacing=12)
         metrics, row = box(horizontal=True, spacing=12)
         self.metrics = []
         for title, subtitle in [("WORKSPACES", "Your local environments"), ("IN USE", "Sessions or operations"), ("RECOVERY POINTS", "Room to experiment"), ("HOST FREE", "Available for images")]:
@@ -456,11 +500,11 @@ class Window(QMainWindow):
             card.setObjectName("card")
             column = QVBoxLayout(card)
             column.setContentsMargins(17, 16, 17, 16)
-            column.addWidget(label(title, "eyebrow"))
+            column.addWidget(label(title, "eyebrow", True))
             value = label("—", "metric")
             self.metrics.append(value)
             column.addWidget(value)
-            column.addWidget(label(subtitle, "muted"))
+            column.addWidget(label(subtitle, "muted", True))
             row.addWidget(card, 1)
         layout.addWidget(metrics)
         tools, row = box(horizontal=True)
@@ -496,14 +540,14 @@ class Window(QMainWindow):
         self.splitter = QSplitter()
         self.splitter.setHandleWidth(16)
         self.workspaces = QListWidget()
-        self.workspaces.setMinimumWidth(390)
+        self.workspaces.setMinimumWidth(280)
         self.workspaces.setUniformItemSizes(True)
         self.workspaces.currentItemChanged.connect(self.select_workspace)
         self.workspaces.itemDoubleClicked.connect(lambda _: self.open_terminal())
         self.splitter.addWidget(self.workspaces)
         self.details = QScrollArea()
         self.details.setWidgetResizable(True)
-        self.details.setMinimumWidth(320)
+        self.details.setMinimumWidth(280)
         self.build_detail_card()
         self.splitter.addWidget(self.details)
         self.splitter.setSizes([620, 350])
@@ -543,9 +587,17 @@ class Window(QMainWindow):
         page, layout = box(spacing=16)
         layout.addWidget(label("Restore with a safety net", "section"))
         layout.addWidget(label("A restore first saves your current image. Recovery points survive workspace deletion.", "muted", True))
+        self.storage_summary = label("", "muted", True)
+        layout.addWidget(self.storage_summary)
+        self.recovery_search = QLineEdit()
+        self.recovery_search.setPlaceholderText("Search recovery points by workspace, label or date…")
+        self.recovery_search.setAccessibleName("Search recovery points")
+        self.recovery_search.setClearButtonEnabled(True)
+        self.recovery_search.textChanged.connect(self.render_recovery)
+        layout.addWidget(self.recovery_search)
         self.recovery_table = self.make_table(["Workspace", "Recovery point", "Capacity", "Saved"])
         layout.addWidget(self.recovery_table, 1)
-        self.recovery_empty = label("No recovery points yet. Select a workspace and choose Save snapshot.", "muted")
+        self.recovery_empty = label("No recovery points yet. Select a workspace and choose Save snapshot.", "muted", True)
         layout.addWidget(self.recovery_empty)
         actions, row = box(horizontal=True)
         row.addStretch()
@@ -561,6 +613,19 @@ class Window(QMainWindow):
         page, layout = box(spacing=16)
         layout.addWidget(label("The story of your workspaces", "section"))
         layout.addWidget(label("Completed operations, session history and their full diagnostic output.", "muted"))
+        tools, row = box(horizontal=True)
+        self.activity_search = QLineEdit()
+        self.activity_search.setPlaceholderText("Search operations by workspace, action or date…")
+        self.activity_search.setAccessibleName("Search operation history")
+        self.activity_search.setClearButtonEnabled(True)
+        self.activity_search.textChanged.connect(self.render_activity)
+        row.addWidget(self.activity_search, 1)
+        self.activity_filter = QComboBox()
+        self.activity_filter.setAccessibleName("Filter operation results")
+        self.activity_filter.addItems(["All results", "Failed", "Completed"])
+        self.activity_filter.currentIndexChanged.connect(self.render_activity)
+        row.addWidget(self.activity_filter)
+        layout.addWidget(tools)
         self.activity_table = self.make_table(["When", "Operation", "Workspace", "Result"])
         self.activity_table.itemDoubleClicked.connect(lambda _: self.activity_log())
         layout.addWidget(self.activity_table, 1)
@@ -574,8 +639,9 @@ class Window(QMainWindow):
 
     def build_health(self):
         page, layout = box(spacing=16)
+        layout.addWidget(label("Ready before you press Create", "section", True))
         header, row = box(horizontal=True)
-        row.addWidget(label("Ready before you press Create", "section"), 1)
+        row.addStretch()
         row.addWidget(button("Run checks", self.check_health))
         row.addWidget(button("Copy report", lambda: QApplication.clipboard().setText(self.health_output.toPlainText()), "quiet"))
         self.setup_button = button("Install missing dependencies", self.setup, "primary")
@@ -610,7 +676,7 @@ class Window(QMainWindow):
 
     def connected(self, writable):
         self.access_label.setText("●  Administrator connected" if writable else "●  Read-only connection")
-        self.unlock_button.setText("Lock workspace store" if writable else "Unlock workspace store")
+        self.unlock_button.setText("Lock store" if writable else "Unlock store")
         self.unlock_button.setEnabled(True)
         self.refresh()
         self.check_health()
@@ -677,13 +743,40 @@ class Window(QMainWindow):
         for widget, value in zip(self.metrics, values):
             widget.setText(value)
         self.render_library()
-        self.fill_table(self.recovery_table, [[x["name"] + (" · deleted" if x.get("orphan") else ""), x["label"], capacity(x["size_mib"]), when(x["created_at"])] for x in self.data["snapshots"]],
-                        [[x["name"], x["label"]] for x in self.data["snapshots"]])
-        self.recovery_empty.setVisible(not self.data["snapshots"])
-        self.fill_table(self.activity_table, [[when(x["time"]), x["action"].replace("-", " ").capitalize(), x["name"], "Completed" if x["status"] == "ok" else "Failed"] for x in self.data["activity"]],
-                        [[x["time"], x["action"], x["name"], x["log"]] for x in self.data["activity"]])
-        self.activity_empty.setVisible(not self.data["activity"])
+        self.render_recovery()
+        self.render_activity()
         self.update_controls()
+
+    def render_recovery(self):
+        query = self.recovery_search.text().casefold().strip()
+        items = [item for item in self.data["snapshots"] if query in
+                 f"{item['name']} {item['label']} {item.get('created_at', '')} {'deleted' if item.get('orphan') else ''}".casefold()]
+        self.fill_table(self.recovery_table, [[x["name"] + (" · deleted" if x.get("orphan") else ""), x["label"], capacity(x["size_mib"]), when(x["created_at"])] for x in items],
+                        [[x["name"], x["label"]] for x in items])
+        self.recovery_empty.setText("No matching recovery points." if query else
+                                    "No recovery points yet. Select a workspace and choose Save snapshot.")
+        self.recovery_empty.setVisible(not items)
+        storage = self.data.get("storage")
+        if storage:
+            self.storage_summary.setText("Allocated storage · " + " · ".join(
+                f"{title}: {byte_size(storage.get(key, 0))}" for title, key in
+                [("Images", "images_bytes"), ("Recovery points", "snapshots_bytes"),
+                 ("Exports", "exports_bytes"), ("Logs", "logs_bytes")]) +
+                ". Shared blocks can make actual reclaimed space smaller.")
+        else:
+            self.storage_summary.setText(f"{len(self.data['snapshots'])} recovery points. Select a point to preview deletion and its allocated storage.")
+        self.update_controls()
+
+    def render_activity(self):
+        query = self.activity_search.text().casefold().strip()
+        mode = self.activity_filter.currentIndex()
+        items = [item for item in self.data["activity"] if query in
+                 f"{item['name']} {item['action'].replace('-', ' ')} {item['time']}".casefold()
+                 and (mode == 0 or (item["status"] != "ok" if mode == 1 else item["status"] == "ok"))]
+        self.fill_table(self.activity_table, [[when(x["time"]), x["action"].replace("-", " ").capitalize(), x["name"], "Completed" if x["status"] == "ok" else "Failed"] for x in items],
+                        [[x["time"], x["action"], x["name"], x["log"]] for x in items])
+        self.activity_empty.setText("No matching operations." if query or mode else "Your first operation will appear here.")
+        self.activity_empty.setVisible(not items)
 
     def fill_table(self, table, rows, keys):
         if table.property("rendered_rows") == [rows, keys]:
@@ -794,13 +887,14 @@ class Window(QMainWindow):
         for title, callback in [("Clone workspace…", self.clone), ("Expand capacity…", self.resize_image),
                                 ("Switch to disposable", self.change_mode),
                                 ("Export filesystem archive…", self.export), ("View latest log", self.workspace_log),
+                                ("View recovery points", self.workspace_recovery),
                                 ("Copy image path", lambda: QApplication.clipboard().setText((self.selected_data() or {}).get("path", ""))),
                                 ("Check and repair…", self.repair), ("Delete workspace…", self.delete)]:
             action = menu.addAction(title)
             action.triggered.connect(callback)
             if callback == self.change_mode:
                 self.mode_action = action
-            if title not in ("View latest log", "Copy image path"):
+            if title not in ("View latest log", "Copy image path", "View recovery points"):
                 self.mutating_actions.append(action)
         self.more_button.setMenu(menu)
         row.addWidget(self.more_button)
@@ -1047,9 +1141,17 @@ class Window(QMainWindow):
         self.render_library()
 
     def focus_search(self):
-        self.navigate(0)
-        self.search.setFocus()
-        self.search.selectAll()
+        search = {0: self.search, 1: self.recovery_search, 2: self.activity_search}.get(self.current_view)
+        if search is None:
+            self.navigate(0)
+            search = self.search
+        search.setFocus()
+        search.selectAll()
+
+    def workspace_recovery(self):
+        if self.selected:
+            self.recovery_search.setText(self.selected)
+            self.navigate(1)
 
     def create(self):
         if self.busy:
@@ -1118,8 +1220,9 @@ class Window(QMainWindow):
             self.perform("export", {"name": target, "destination": destination})
 
     def chosen_snapshot(self):
-        row = self.recovery_table.currentRow()
-        return self.data["snapshots"][row] if 0 <= row < len(self.data["snapshots"]) else None
+        current = self.recovery_table.item(self.recovery_table.currentRow(), 0)
+        key = current.data(Qt.ItemDataRole.UserRole) if current else None
+        return next((item for item in self.data["snapshots"] if [item["name"], item["label"]] == key), None)
 
     def restore(self):
         item = self.chosen_snapshot()
@@ -1128,7 +1231,12 @@ class Window(QMainWindow):
 
     def drop_snapshot(self):
         item = self.chosen_snapshot()
-        if item and self.confirm("Delete recovery point", f"Permanently delete {item['label']} for {item['name']}? This cannot be undone."):
+        if not item:
+            return
+        allocated = (f"Allocated file size: {byte_size(item['allocated_bytes'])}. Actual reclaimed space can be smaller when blocks are shared.\n\n"
+                     if "allocated_bytes" in item else "")
+        if self.confirm("Delete recovery point", f"Permanently delete {item['label']} for {item['name']}?\n\n" + allocated +
+                        "Only this recovery point is removed. The current workspace and other recovery points remain. This cannot be undone."):
             self.perform("drop-snapshot", {"name": item["name"], "target": item["label"], "confirmed": True})
 
     def perform(self, action, params):
@@ -1146,6 +1254,9 @@ class Window(QMainWindow):
     def run_operation(self, action, params):
         self.busy = True
         self.last_task = action.replace("-", " ").capitalize() + (" · " + params["name"] if params.get("name") else "")
+        self.task_started = time.monotonic()
+        self.task_phase_text = "Starting"
+        self.update_task_elapsed()
         self.task_title.setText(self.last_task)
         self.task_output.clear()
         self.task_panel.show()
@@ -1155,6 +1266,9 @@ class Window(QMainWindow):
         self.render_library()
         def done(ok, result):
             self.busy = False
+            self.set_task_phase("Completed" if ok else "Failed")
+            self.update_task_elapsed()
+            self.task_started = None
             self.task_progress.hide()
             self.task_title.setText(("✓  " if ok else "!  ") + self.last_task + (" completed" if ok else " failed"))
             if not ok:
@@ -1180,11 +1294,54 @@ class Window(QMainWindow):
         self.drop_snapshot_button.setEnabled(has_snapshot and not self.busy and not self.demo)
 
     def append_output(self, text):
+        scrollbar = self.task_output.verticalScrollBar()
+        position = scrollbar.value()
+        old_cursor = self.task_output.textCursor()
         cursor = self.task_output.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         cursor.insertText(text)
-        self.task_output.setTextCursor(cursor)
-        self.task_output.ensureCursorVisible()
+        if self.follow_output.isChecked():
+            self.task_output.setTextCursor(cursor)
+            self.task_output.ensureCursorVisible()
+            scrollbar.setValue(scrollbar.maximum())
+        else:
+            self.task_output.setTextCursor(old_cursor)
+            scrollbar.setValue(position)
+
+    def set_task_phase(self, text):
+        if self.task_started is not None:
+            self.task_phase_text = text
+            self.update_task_elapsed()
+
+    def update_task_elapsed(self):
+        if self.task_started is not None:
+            seconds = max(0, int(time.monotonic() - self.task_started))
+            minutes, seconds = divmod(seconds, 60)
+            self.task_phase.setText(f"{self.task_phase_text} · {minutes:02d}:{seconds:02d} elapsed")
+
+    def change_text_scale(self):
+        scale = self.text_scale.currentData() or 100
+        self.sidebar.setMinimumWidth(round(178 * scale / 100))
+        self.sidebar_scroll.setFixedWidth(round(178 * scale / 100) + 18)
+        self.setStyleSheet(scaled_style(scale))
+        self.update_compact_layout()
+        if not self.demo:
+            self.settings.setValue("appearance/text_scale", scale)
+
+    def update_compact_layout(self):
+        scale = self.text_scale.currentData() or 100
+        compact = self.width() - self.sidebar_scroll.width() < round(760 * scale / 100)
+        orientation = Qt.Orientation.Vertical if compact else Qt.Orientation.Horizontal
+        if self.splitter.orientation() != orientation:
+            self.splitter.setOrientation(orientation)
+            self.workspaces.setMinimumHeight(180 if compact else 0)
+            self.details.setMinimumHeight(220 if compact else 0)
+            self.splitter.setSizes([260, 420] if compact else [620, 350])
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "splitter"):
+            self.update_compact_layout()
 
     def open_terminal(self, checked=False, disposable=False):
         data = self.selected_data()
@@ -1251,9 +1408,11 @@ class Window(QMainWindow):
             self.show_log(self.selected)
 
     def activity_log(self):
-        row = self.activity_table.currentRow()
-        if 0 <= row < len(self.data["activity"]):
-            entry = self.data["activity"][row]
+        current = self.activity_table.item(self.activity_table.currentRow(), 0)
+        key = current.data(Qt.ItemDataRole.UserRole) if current else None
+        entry = next((item for item in self.data["activity"] if
+                      [item["time"], item["action"], item["name"], item["log"]] == key), None)
+        if entry:
             self.show_log(entry["name"], entry["log"])
 
     def show_log(self, target, selected_log=None):
@@ -1308,6 +1467,7 @@ class Window(QMainWindow):
             event.ignore()
             return
         self.timer.stop()
+        self.task_timer.stop()
         if not self.demo:
             self.settings.setValue("window/geometry", self.saveGeometry())
             self.settings.setValue("window/splitter", self.splitter.sizes())

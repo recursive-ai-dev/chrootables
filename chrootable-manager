@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 
 APP_NAME="Chrootable Manager"
-APP_VERSION=1.0.0
+APP_VERSION=1.1.0
 SCRIPT_PATH=${BASH_SOURCE[0]}
 STORE_DIR=${CHROOTABLE_HOME:-/var/lib/chrootable-manager}
 DEBIAN_SUITE=${CHROOTABLE_DEBIAN_SUITE:-stable}
@@ -11,8 +11,8 @@ DEBIAN_MIRROR=${CHROOTABLE_DEBIAN_MIRROR:-https://deb.debian.org/debian}
 NON_INTERACTIVE=1
 DEMO=0
 REQUIRED_COMMANDS=(awk basename chmod chroot cp date dd debootstrap df dpkg du e2fsck find flock gpgv
-    gzip hostname install ip losetup mkdir mkfs.ext4 mktemp mount mountpoint mv readlink
-    resize2fs rm rmdir sha256sum stat tail tar truncate umount unshare wget whiptail xz)
+    gzip hostname install ip ln losetup mkdir mkfs.ext4 mknod mktemp mount mountpoint mv readlink
+    resize2fs rm rmdir sha256sum stat sync tail tar truncate umount unshare wget whiptail xz)
 
 configure_paths() {
     IMAGE_DIR="$STORE_DIR/images"
@@ -20,6 +20,7 @@ configure_paths() {
     EXPORT_DIR="$STORE_DIR/exports"
     SNAPSHOT_DIR="$STORE_DIR/snapshots"
     ARCHIVE_DIR="$STORE_DIR/archive"
+    OPERATIONS_DIR="$STORE_DIR/operations"
 }
 configure_paths
 
@@ -27,8 +28,9 @@ fail() { printf 'Error: %s\n' "$*" >&2; return 1; }
 info() { printf '%s\n' "$*" >&2; }
 valid_name() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; }
 valid_size_mib() {
-    [[ $1 =~ ^[1-9][0-9]*$ ]] && { (( ${#1} < 7 )) || { (( ${#1} == 7 )) && [[ $1 < 1048577 ]]; }; }
+    [[ $1 =~ ^[1-9][0-9]*$ ]] && (( ${#1} <= 7 )) && (( $1 >= 512 && $1 <= 1048576 ))
 }
+valid_operation_id() { [[ $1 =~ ^[a-f0-9]{32}$ ]]; }
 valid_lifecycle() { [[ $1 == persistent || $1 == ephemeral ]]; }
 valid_profile() { [[ $1 == minimal || $1 == build || $1 == python || $1 == network || $1 == rust || $1 == go || $1 == web ]]; }
 valid_profiles() {
@@ -131,6 +133,10 @@ lock_image() {
     if ! flock -n "$new_fd"; then
         exec {new_fd}>&-
         fail "This chrootable is already in use: $(basename "$image" .img)"; return 1
+    fi
+    if ! check_pending_publications "$image"; then
+        exec {new_fd}>&-
+        return 1
     fi
     printf -v "$2" '%s' "$new_fd"
 }
@@ -248,12 +254,12 @@ init_store() {
         }
     fi
     local directory
-    for directory in "$IMAGE_DIR" "$LOG_DIR" "$EXPORT_DIR" "$SNAPSHOT_DIR"; do
+    for directory in "$IMAGE_DIR" "$LOG_DIR" "$EXPORT_DIR" "$SNAPSHOT_DIR" "$OPERATIONS_DIR"; do
         [[ ! -L $directory ]] || { fail "Store subdirectories must not be symlinks: $directory"; return 1; }
     done
     [[ -d $STORE_DIR ]] || install -d -m 0700 "$STORE_DIR" || return
-    [[ -d $IMAGE_DIR && -d $LOG_DIR && -d $EXPORT_DIR && -d $SNAPSHOT_DIR ]] ||
-        install -d -m 0700 "$IMAGE_DIR" "$LOG_DIR" "$EXPORT_DIR" "$SNAPSHOT_DIR"
+    [[ -d $IMAGE_DIR && -d $LOG_DIR && -d $EXPORT_DIR && -d $SNAPSHOT_DIR && -d $OPERATIONS_DIR ]] ||
+        install -d -m 0700 "$IMAGE_DIR" "$LOG_DIR" "$EXPORT_DIR" "$SNAPSHOT_DIR" "$OPERATIONS_DIR"
 }
 check_readable_store() {
     [[ ! -e $STORE_DIR || ( -r $STORE_DIR && -x $STORE_DIR ) ]] || { fail "Store is not readable. Run with sudo to view $STORE_DIR"; return 1; }
@@ -266,17 +272,131 @@ record_event() {
     printf '%s\t%s\t%s\t%s\t%s\n' "$(timestamp)" "$1" "$2" "$3" "$4" >>"$STORE_DIR/activity.tsv"
     exec {descriptor}>&-
 }
+# State files contain constrained identifiers and store-relative paths. Never source
+# them: even a damaged record must not become executable shell input.
+read_operation_state() {
+    local path=$1 field value
+    local -n result=$2
+    result=()
+    [[ -f $path && ! -L $path ]] || return 1
+    while IFS='=' read -r field value || [[ -n $field || -n $value ]]; do
+        [[ $field =~ ^[a-z_]+$ ]] || return 1
+        [[ -z ${result[$field]+present} ]] || return 1
+        case $field in
+            format|id|pid|process_start|status|stage|action|name|pending|destination|image_inode|image_size|meta_inode|meta_size)
+                result[$field]=$value ;;
+            *) return 1 ;;
+        esac
+    done <"$path"
+    [[ ${result[format]:-} == 1 && ${path##*/} == "${result[id]:-}.state" ]] && valid_operation_id "${result[id]:-}" &&
+        [[ ${result[pid]:-} =~ ^[1-9][0-9]*$ && ${result[process_start]:-} =~ ^[0-9]+$ &&
+           ${result[status]:-} =~ ^(running|completed|failed|interrupted|recovered)$ &&
+           ${result[stage]:-} =~ ^[a-z][a-z0-9-]{0,47}$ &&
+           ${result[action]:-} =~ ^[a-z][a-z0-9-]{0,31}$ ]] && valid_name "${result[name]:-}"
+}
+process_start_time() {
+    local line
+    local -a fields=()
+    [[ -r /proc/$1/stat ]] || return 1
+    IFS= read -r line <"/proc/$1/stat" || return
+    # A process name can contain spaces and parentheses; fields follow the final ).
+    read -r -a fields <<<"${line##*) }"
+    [[ ${fields[19]:-} =~ ^[0-9]+$ ]] || return 1
+    printf '%s' "${fields[19]}"
+}
+operation_is_alive() {
+    local -n operation_state=$1
+    local current
+    current=$(process_start_time "${operation_state[pid]}") || return 1
+    [[ $current == "${operation_state[process_start]}" ]]
+}
+durable_sync() { sync -f -- "$1"; }
+write_operation_state() {
+    [[ -n ${OP_ID:-} ]] || return 0
+    local temporary
+    temporary=$(mktemp "$OPERATIONS_DIR/.$OP_ID.XXXXXX") || return
+    if ! printf 'format=1\nid=%s\npid=%s\nprocess_start=%s\nstatus=%s\nstage=%s\naction=%s\nname=%s\npending=%s\ndestination=%s\nimage_inode=%s\nimage_size=%s\nmeta_inode=%s\nmeta_size=%s\n' \
+        "$OP_ID" "$OP_PID" "$OP_PROCESS_START" "$OP_STATUS" "$OP_STAGE" "$OPERATION" "$OP_NAME" \
+        "${OP_PENDING:-}" "${OP_DESTINATION:-}" "${OP_IMAGE_INODE:-}" "${OP_IMAGE_SIZE:-}" \
+        "${OP_META_INODE:-}" "${OP_META_SIZE:-}" >"$temporary" ||
+        ! durable_sync "$temporary" || ! mv -T -- "$temporary" "$OPERATIONS_DIR/$OP_ID.state"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    durable_sync "$OPERATIONS_DIR"
+}
+operation_stage() {
+    [[ -n ${OP_ID:-} ]] || return 0
+    OP_STAGE=$1
+    write_operation_state || return
+    [[ -n ${CHROOTABLE_OPERATION_ID:-} || ${CHROOTABLE_EVENTS:-0} == 1 ]] || return 0
+    {
+        printf 'CHROOTABLE_EVENT {"id":'; json_string "$OP_ID"
+        printf ',"stage":'; json_string "$OP_STAGE"
+        printf ',"log":'; json_string "$OP_LOG"
+        printf '}\n'
+    } >&2
+}
+check_pending_publications() {
+    local image=$1 record target
+    local -A state=()
+    [[ ! -L $OPERATIONS_DIR ]] || { fail "Operation records must not be symlinks."; return 1; }
+    for record in "$OPERATIONS_DIR/"*.state; do
+        [[ -f $record && ! -L $record ]] || continue
+        read_operation_state "$record" state || { fail "Invalid operation record: $record. Inspect the store before continuing."; return 1; }
+        [[ ${state[id]} != "${RECOVERING_OPERATION:-}" ]] || continue
+        [[ ${state[stage]} == publish-* && ${state[status]} != completed && ${state[status]} != recovered ]] || continue
+        target=${state[destination]:-}
+        if [[ $target == "images/${image##*/}" ]]; then
+            fail "Interrupted publication ${state[id]} must be recovered first: $0 --recover-operation ${state[id]} --yes"
+            return 1
+        fi
+        if [[ $target == snapshots/* ]]; then
+            target=${target#snapshots/}; target=${target%%/*}
+            if [[ $image == "$IMAGE_DIR/$target.img" ]]; then
+                fail "Interrupted publication ${state[id]} must be recovered first: $0 --recover-operation ${state[id]} --yes"
+                return 1
+            fi
+        fi
+    done
+}
 begin_operation() {
-    OPERATION=$1; OP_NAME=$2; PENDING=; WORK=
-    OP_LOG=$(mktemp "$LOG_DIR/$2-$1-$(date +%Y%m%d-%H%M%S)-XXXXXX.log") || return
+    OPERATION=$1; OP_NAME=$2; PENDING=; WORK=; OP_PENDING=; OP_DESTINATION=
+    OP_IMAGE_INODE=; OP_IMAGE_SIZE=; OP_META_INODE=; OP_META_SIZE=
+    OP_ID=${CHROOTABLE_OPERATION_ID:-}
+    if [[ -z $OP_ID ]]; then
+        IFS= read -r OP_ID </proc/sys/kernel/random/uuid || return
+        OP_ID=${OP_ID//-/}
+    fi
+    valid_operation_id "$OP_ID" || { fail "CHROOTABLE_OPERATION_ID must be 32 lowercase hexadecimal characters."; return 1; }
+    [[ ! -L $OPERATIONS_DIR ]] || { fail "Operation records must not be symlinks."; return 1; }
+    [[ -d $OPERATIONS_DIR ]] || install -d -m 0700 "$OPERATIONS_DIR" || return
+    OP_LOG="$LOG_DIR/$OP_ID.log"
+    ( set -o noclobber; : >"$OP_LOG" ) 2>/dev/null || { fail "Operation ID already has a log: $OP_ID"; return 1; }
+    [[ ! -e $OPERATIONS_DIR/$OP_ID.state && ! -L $OPERATIONS_DIR/$OP_ID.state ]] || { fail "Operation ID already exists: $OP_ID"; return 1; }
+    OP_PID=$BASHPID
+    OP_PROCESS_START=$(process_start_time "$OP_PID") || return
+    OP_STATUS=running; OP_STAGE=starting
     printf '%s  %s  %s\n' "$(timestamp)" "$1" "$2" >>"$OP_LOG"
     trap finish_operation EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
+    operation_stage starting
 }
 finish_operation() {
     local status=$?
-    if [[ -n ${PENDING:-} ]]; then rm -f -- "$PENDING" "$PENDING.meta" || true; fi
+    # Publication is a recoverable two-file transaction. Retain both the staged
+    # image and its record after a failure; explicit recovery can finish it.
+    if [[ ${OP_STAGE:-} == publish-* && $status != 0 ]]; then
+        OP_STATUS=interrupted
+        write_operation_state || true
+    else
+        if [[ -n ${PENDING:-} ]]; then rm -f -- "$PENDING" "$PENDING.meta" || true; fi
+        OP_PENDING=; OP_DESTINATION=
+        if (( status == 0 )); then OP_STATUS=completed; OP_STAGE=completed
+        else OP_STATUS=failed; OP_STAGE=failed; fi
+        operation_stage "$OP_STAGE" || true
+    fi
     if [[ -n ${ARCHIVE_STAGING:-} ]]; then rm -rf --one-file-system -- "$ARCHIVE_STAGING" || true; fi
     if [[ -n ${WORK:-} ]]; then
         rm -f -- "$WORK/started" "$WORK/resolv.conf" "$WORK/resolv.conf.tmp" || true
@@ -296,8 +416,132 @@ make_workdir() { WORK=$(mktemp -d /run/chrootable-manager.XXXXXX); }
 run_worker() { unshare --mount --uts --ipc --pid --fork --kill-child "$SCRIPT_PATH" --worker "$@"; }
 publish_image() {
     local pending=$1 destination=$2
+    OP_PENDING=${pending#"$STORE_DIR/"}
+    OP_DESTINATION=${destination#"$STORE_DIR/"}
+    read -r OP_IMAGE_INODE OP_IMAGE_SIZE < <(stat -c '%i %s' -- "$pending") || return
+    read -r OP_META_INODE OP_META_SIZE < <(stat -c '%i %s' -- "$pending.meta") || return
+    durable_sync "$pending" && durable_sync "$pending.meta" || return
+    operation_stage publish-prepared || return
     mv -T -- "$pending.meta" "$destination.meta" || return
+    durable_sync "$destination.meta" && durable_sync "${destination%/*}" || return
+    operation_stage publish-metadata || return
     mv -T -- "$pending" "$destination" || return
+    durable_sync "${destination%/*}" || return
+    OP_PENDING=; OP_DESTINATION=
+    operation_stage published
+}
+matches_publication_file() {
+    local path=$1 expected_inode=$2 expected_size=$3 inode bytes
+    [[ $expected_inode =~ ^[1-9][0-9]*$ && $expected_size =~ ^[0-9]+$ && -f $path && ! -L $path ]] || return 1
+    read -r inode bytes < <(stat -c '%i %s' -- "$path") || return
+    [[ $inode == "$expected_inode" && $bytes == "$expected_size" ]]
+}
+publication_paths_valid() {
+    local pending=$1 destination=$2 folder base
+    [[ $pending != /* && $destination != /* && ${pending%/*} == "${destination%/*}" ]] || return 1
+    base=${pending##*/}
+    [[ $base =~ ^\.[A-Za-z0-9][A-Za-z0-9._-]{0,63}\.[A-Za-z0-9]{6}\.partial$ ]] || return 1
+    case $destination in
+        images/*.img)
+            base=${destination#images/}; base=${base%.img}; valid_name "$base" || return ;;
+        snapshots/*/*.img)
+            folder=${destination#snapshots/}; folder=${folder%%/*}
+            base=${destination##*/}; base=${base%.img}
+            valid_name "$folder" && valid_name "$base" || return
+            [[ $destination == "snapshots/$folder/$base.img" && ! -L $SNAPSHOT_DIR/$folder ]] || return 1 ;;
+        *) return 1 ;;
+    esac
+    [[ ! -L $STORE_DIR/$pending && ! -L $STORE_DIR/$pending.meta &&
+       ! -L $STORE_DIR/$destination && ! -L $STORE_DIR/$destination.meta ]]
+}
+recover_operation() (
+    local identifier=$1 record pending destination lock_name descriptor
+    local -A state=()
+    valid_operation_id "$identifier" || { fail "Invalid operation ID."; return 1; }
+    record="$OPERATIONS_DIR/$identifier.state"
+    read_operation_state "$record" state && [[ ${state[id]} == "$identifier" ]] || { fail "Operation record is missing or invalid."; return 1; }
+    ! operation_is_alive state || { fail "This operation is still running. Wait for it to finish."; return 1; }
+    [[ ${state[status]} != completed && ${state[status]} != recovered && ${state[stage]} == publish-* ]] || {
+        fail "No staged publication can be safely completed. Inspect $LOG_DIR/$identifier.log; partial data has been retained."
+        return 1
+    }
+    pending=${state[pending]:-}; destination=${state[destination]:-}
+    publication_paths_valid "$pending" "$destination" || { fail "Unsafe publication paths in operation record. Nothing was changed."; return 1; }
+    if [[ $destination == images/* ]]; then lock_name=${destination#images/}; lock_name=${lock_name%.img}
+    else lock_name=${destination#snapshots/}; lock_name=${lock_name%%/*}; fi
+    RECOVERING_OPERATION=$identifier
+    lock_image "$IMAGE_DIR/$lock_name.img" descriptor || return
+    # Re-read under the destination lock before changing any staged files.
+    read_operation_state "$record" state && [[ ${state[pending]:-} == "$pending" && ${state[destination]:-} == "$destination" && ${state[stage]} == publish-* ]] || {
+        fail "Operation changed while acquiring its lock. Refresh and try again."; return 1;
+    }
+    OP_ID=$identifier; OP_PID=$BASHPID; OP_PROCESS_START=$(process_start_time "$OP_PID") || return
+    OPERATION=${state[action]}; OP_NAME=${state[name]}; OP_STATUS=interrupted; OP_STAGE=${state[stage]}
+    OP_PENDING=$pending; OP_DESTINATION=$destination; OP_LOG="$LOG_DIR/$identifier.log"
+    OP_IMAGE_INODE=${state[image_inode]:-}; OP_IMAGE_SIZE=${state[image_size]:-}
+    OP_META_INODE=${state[meta_inode]:-}; OP_META_SIZE=${state[meta_size]:-}
+    pending="$STORE_DIR/$pending"; destination="$STORE_DIR/$destination"
+    if [[ -e $destination ]]; then assert_offline "$destination" || return; fi
+    if [[ -f $pending ]]; then
+        matches_publication_file "$pending" "$OP_IMAGE_INODE" "$OP_IMAGE_SIZE" || {
+            fail "The staged image no longer matches its operation record. Nothing was changed."; return 1;
+        }
+        assert_offline "$pending" || return
+        if [[ -f $pending.meta ]]; then
+            matches_publication_file "$pending.meta" "$OP_META_INODE" "$OP_META_SIZE" || {
+                fail "The staged metadata no longer matches its operation record. Nothing was changed."; return 1;
+            }
+            mv -T -- "$pending.meta" "$destination.meta" || return
+            durable_sync "$destination.meta" && durable_sync "${destination%/*}" || return
+            operation_stage publish-metadata || return
+        else
+            matches_publication_file "$destination.meta" "$OP_META_INODE" "$OP_META_SIZE" || {
+                fail "The staged metadata is missing or changed. Nothing was published."; return 1;
+            }
+        fi
+        mv -T -- "$pending" "$destination" || return
+        durable_sync "${destination%/*}" || return
+    else
+        matches_publication_file "$destination" "$OP_IMAGE_INODE" "$OP_IMAGE_SIZE" &&
+            matches_publication_file "$destination.meta" "$OP_META_INODE" "$OP_META_SIZE" && [[ ! -e $pending.meta ]] || {
+            fail "Publication files are missing or inconsistent. Nothing was changed."; return 1;
+        }
+    fi
+    OP_PENDING=; OP_DESTINATION=; OP_STATUS=recovered
+    operation_stage recovered || return
+    record_event recover "$OP_NAME" ok "$OP_LOG" || return
+    info "Recovered publication $identifier. Image and metadata are consistent."
+)
+list_operations() {
+    local record comma= status active
+    local -A state=()
+    [[ ${1:-text} != json ]] || printf '['
+    for record in "$OPERATIONS_DIR/"*.state; do
+        [[ -f $record && ! -L $record ]] || continue
+        read_operation_state "$record" state || { fail "Invalid operation record: $record"; return 1; }
+        active=false; operation_is_alive state && active=true
+        status=${state[status]}
+        [[ $status != running || $active == true ]] || status=interrupted
+        if [[ ${1:-text} == json ]]; then
+            printf '%s{"id":' "$comma"; json_string "${state[id]}"
+            printf ',"action":'; json_string "${state[action]}"
+            printf ',"name":'; json_string "${state[name]}"
+            printf ',"status":'; json_string "$status"
+            printf ',"stage":'; json_string "${state[stage]}"
+            printf ',"log":'; json_string "$LOG_DIR/${state[id]}.log"
+            printf ',"active":%s}' "$active"; comma=,
+        else
+            printf '%s\t%s\t%s\t%s\t%s\n' "${state[id]}" "${state[action]}" "${state[name]}" "$status" "${state[stage]}"
+        fi
+    done
+    [[ ${1:-text} != json ]] || printf ']\n'
+}
+preflight_free_space() {
+    local required=$1 available
+    [[ $required =~ ^[0-9]+$ ]] || { fail "Could not determine required copy capacity."; return 1; }
+    { read -r _; read -r _ _ _ available _; } < <(LC_ALL=C df -PB1 -- "$STORE_DIR") || return
+    [[ $available =~ ^[0-9]+$ ]] || { fail "Could not determine available store space."; return 1; }
+    (( available >= required )) || { fail "Not enough free space: need $required bytes, have $available. Sparse capacity is not reserved."; return 1; }
 }
 
 profile_packages() {
@@ -321,6 +565,22 @@ list_profiles() {
         rust '6 GiB' 'Rust toolchain, cargo, Git, curl, pkg-config' \
         go '6 GiB' 'Go toolchain, Git, curl' \
         web '4 GiB' 'Node.js, npm, Git, curl'
+}
+capabilities() {
+    # The desktop reads this once; keep IDs and limits aligned with CLI validators.
+    printf '%s\n' '{"schema_version":1,"profiles":[
+{"id":"minimal","title":"Clean slate","description":"A minimal Debian system. Make it your own.","recommended_size_mib":2048},
+{"id":"build","title":"Build studio","description":"C / C++, make, Git, curl and pkg-config.","recommended_size_mib":4096},
+{"id":"python","title":"Python lab","description":"Python 3, virtual environments, pip and Git.","recommended_size_mib":4096},
+{"id":"network","title":"Network toolkit","description":"DNS tools, ping, curl and an SSH client.","recommended_size_mib":2048},
+{"id":"rust","title":"Rust studio","description":"Rust toolchain, cargo and Git.","recommended_size_mib":6144},
+{"id":"go","title":"Go studio","description":"Go toolchain and Git.","recommended_size_mib":6144},
+{"id":"web","title":"Web lab","description":"Node.js, npm and Git.","recommended_size_mib":4096}],
+"suites":[{"id":"trixie","title":"Debian 13 (Trixie)"},{"id":"bookworm","title":"Debian 12 (Bookworm)"}],
+"limits":{"min_size_mib":512,"max_size_mib":1048576},
+"session_options":["disposable","isolated","share","read_only","restricted_dev"],
+"storage":{"allocation":"sparse","capacity_reserved":false},
+"operation_events":{"prefix":"CHROOTABLE_EVENT ","id_environment":"CHROOTABLE_OPERATION_ID","log_pattern":"logs/<id>.log"}}'
 }
 
 # -- Offline package archive -----------------------------------------------
@@ -358,6 +618,7 @@ archive_sync() (
     begin_operation archive "$suite" || return
     make_workdir || return
     ARCHIVE_STAGING=$(mktemp -d "$ARCHIVE_DIR/.$suite-$arch.XXXXXX") || return
+    OP_PENDING=${ARCHIVE_STAGING#"$STORE_DIR/"}; operation_stage downloading-archive || return
     info "Downloading Debian $suite ($arch) packages for: minimal ${profiles[*]}. Log: $OP_LOG"
     mkdir -p "$ARCHIVE_STAGING/scratch" "$ARCHIVE_STAGING/debs" "$ARCHIVE_STAGING/lists" || return
     # apt downloads as _apt, which must be able to traverse the scratch root.
@@ -429,8 +690,6 @@ allocate_image() {
     local target=$1 size_mib=$2
     if truncate -s "${size_mib}M" "$target" >>"$OP_LOG" 2>&1; then
         return 0
-    elif command -v fallocate >/dev/null 2>&1 && fallocate -l "${size_mib}M" "$target" >>"$OP_LOG" 2>&1; then
-        return 0
     fi
     dd if=/dev/zero of="$target" bs=1M count="$size_mib" status=none conv=fsync >>"$OP_LOG" 2>&1
 }
@@ -438,7 +697,7 @@ allocate_image() {
 create_image() (
     local name=$1 size=$2 lifecycle=$3 profile=${4:-minimal} image descriptor arch
     unused_image "$name" || return
-    valid_size_mib "$size" || { fail "Size must be a whole number from 1 to 1048576 MiB."; return 1; }
+    valid_size_mib "$size" || { fail "Size must be a whole number from 512 to 1048576 MiB."; return 1; }
     valid_lifecycle "$lifecycle" || { fail "Lifecycle must be persistent or ephemeral."; return 1; }
     valid_profile "$profile" || { fail "Unknown profile: $profile. See --profiles."; return 1; }
     valid_suite "$DEBIAN_SUITE" || { fail "Invalid Debian suite: $DEBIAN_SUITE"; return 1; }
@@ -446,16 +705,17 @@ create_image() (
     image="$IMAGE_DIR/$name.img"
     lock_image "$image" descriptor || return
     unused_image "$name" || return
-    local available
-    { read -r _; read -r _ _ _ available _; } < <(df -PB1 "$STORE_DIR") || return
-    (( available >= size * 1048576 )) || { fail "Not enough free space for a ${size} MiB image."; return 1; }
+    preflight_free_space "$((size * 1048576))" || return
     begin_operation create "$name" || return
     PENDING=$(mktemp "$IMAGE_DIR/.$name.XXXXXX.partial") || return
+    OP_PENDING=${PENDING#"$STORE_DIR/"}; operation_stage allocating || return
     make_workdir || return
     arch=$(dpkg --print-architecture) || return
     info "Creating $name / Debian $DEBIAN_SUITE / $profile / $size MiB. Log: $OP_LOG"
     allocate_image "$PENDING" "$size" || return
+    operation_stage formatting || return
     mkfs.ext4 -F -L "${name:0:16}" "$PENDING" >>"$OP_LOG" 2>&1 || return
+    operation_stage bootstrapping || return
     run_worker create "$PENDING" "$WORK" "$name" "$arch" "$profile" >>"$OP_LOG" 2>&1 || return
     write_metadata "$PENDING" "$lifecycle" "$DEBIAN_SUITE" "$arch" "$size" "$(timestamp)" never "$profile" || return
     publish_image "$PENDING" "$image" || return
@@ -471,8 +731,10 @@ clone_image() (
     lock_image "$destination" destination_lock || return
     unused_image "$name" || return
     source_name=${source##*/}; source_name=${source_name%.img}
+    preflight_free_space "$(allocated_bytes "$source")" || return
     begin_operation clone "$source_name" || return
     PENDING=$(mktemp "$IMAGE_DIR/.$name.XXXXXX.partial") || return
+    OP_PENDING=${PENDING#"$STORE_DIR/"}; operation_stage copying || return
     cp --reflink=auto --sparse=always -- "$source" "$PENDING" >>"$OP_LOG" 2>&1 || return
     copy_metadata "$source" "$PENDING" "$(timestamp)" never "$source_name" || return
     publish_image "$PENDING" "$destination" || return
@@ -492,8 +754,11 @@ resize_image() (
     # stale expansion check after another resize has already finished.
     current=$(image_size_mib "$image") || return
     valid_size_mib "$requested" && (( requested > current )) || { fail "Choose a size larger than $current MiB (maximum 1048576)."; return 1; }
+    preflight_free_space "$(((requested - current) * 1048576))" || return
     begin_operation resize "$(basename "$image" .img)" || return
+    operation_stage checking-filesystem || return
     fsck_preflight "$image" "$OP_LOG" || return
+    operation_stage expanding || return
     truncate -s "${requested}M" "$image" >>"$OP_LOG" 2>&1 || return
     resize2fs "$image" >>"$OP_LOG" 2>&1 || return
     metadata_set "$image" size_mib "$requested" || return
@@ -504,6 +769,7 @@ repair_image() (
     lock_image "$image" descriptor || return
     assert_offline "$image" || return
     begin_operation repair "$(basename "$image" .img)" || return
+    operation_stage repairing-filesystem || return
     e2fsck -f -y "$image" >>"$OP_LOG" 2>&1 || status=$?
     (( status <= 1 )) || return "$status"
     info "Filesystem repair completed. Log: $OP_LOG"
@@ -516,6 +782,7 @@ export_image() (
     begin_operation export "$name" || return
     make_workdir || return
     PENDING=$(mktemp "$EXPORT_DIR/.$name.XXXXXX.partial") || return
+    OP_PENDING=${PENDING#"$STORE_DIR/"}; operation_stage exporting || return
     token=${PENDING%.partial}; token=${token##*.}
     archive="$EXPORT_DIR/$name-$(date +%Y%m%d-%H%M%S)-$token.tar.gz"
     run_worker export "$image" "$WORK" "$PENDING" >>"$OP_LOG" 2>&1 || return
@@ -528,6 +795,7 @@ set_lifecycle() (
     valid_lifecycle "$lifecycle" || { fail "Lifecycle must be persistent or ephemeral."; return 1; }
     lock_image "$image" descriptor || return
     begin_operation mode "$(basename "$image" .img)" || return
+    operation_stage updating-metadata || return
     metadata_set "$image" lifecycle "$lifecycle" || return
     info "'$(basename "$image" .img)' now uses $lifecycle sessions."
 )
@@ -536,6 +804,7 @@ delete_image() (
     lock_image "$image" descriptor || return
     assert_offline "$image" || return
     begin_operation delete "$(basename "$image" .img)" || return
+    operation_stage deleting || return
     rm -f -- "$image" "$image.meta" "$image.mode" || return
     info "Deleted '$(basename "$image" .img)'. Snapshots and exports were retained."
 )
@@ -551,8 +820,10 @@ save_snapshot_locked() {
     name=$(basename "$image" .img)
     destination=$(snapshot_path "$name" "$label") || return
     [[ ! -e $destination && ! -L $destination ]] || { fail "Snapshot '$label' already exists."; return 1; }
+    preflight_free_space "$(allocated_bytes "$image")" || return
     install -d -m 0700 "$SNAPSHOT_DIR/$name" || return
     PENDING=$(mktemp "$SNAPSHOT_DIR/$name/.$label.XXXXXX.partial") || return
+    OP_PENDING=${PENDING#"$STORE_DIR/"}; operation_stage copying-snapshot || return
     cp --reflink=auto --sparse=always -- "$image" "$PENDING" >>"$OP_LOG" 2>&1 || return
     copy_metadata "$image" "$PENDING" || return
     metadata_set "$PENDING" snapshot_at "$(timestamp)" || return
@@ -582,7 +853,9 @@ restore_image() (
         recovery="before-restore-$(date +%Y%m%d-%H%M%S)-$BASHPID"
         save_snapshot_locked "$image" "$recovery" || return
     fi
+    preflight_free_space "$(allocated_bytes "$snapshot")" || return
     PENDING=$(mktemp "$IMAGE_DIR/.$name.XXXXXX.partial") || return
+    OP_PENDING=${PENDING#"$STORE_DIR/"}; operation_stage copying-restore || return
     cp --reflink=auto --sparse=always -- "$snapshot" "$PENDING" >>"$OP_LOG" 2>&1 || return
     copy_metadata "$snapshot" "$PENDING" || return
     publish_image "$PENDING" "$image" || return
@@ -596,6 +869,7 @@ drop_snapshot() (
     lock_image "$IMAGE_DIR/$name.img" descriptor || return
     assert_offline "$snapshot" || return
     begin_operation drop-snapshot "$name" || return
+    operation_stage deleting-snapshot || return
     rm -f -- "$snapshot" "$snapshot.meta" || return
     info "Deleted snapshot '$name / $label'."
 )
@@ -629,6 +903,7 @@ enter_chrootable() (
     assert_offline "$image" || return
     begin_operation session "$name" || return
     make_workdir || return
+    operation_stage starting-session || return
     local -a namespace=(--mount --uts --ipc --pid --fork --kill-child)
     [[ $network != isolated ]] || namespace+=(--net)
     unshare "${namespace[@]}" "$SCRIPT_PATH" --worker enter "$image" "$WORK" "$name" "$lifecycle" "$network" "$share" "$read_only" "$@" || status=$?
@@ -710,8 +985,10 @@ mount_restricted_devices() {
     # Opt-in reduced /dev: a fresh tmpfs with only the character devices a
     # Debian shell needs. No host device nodes are exposed.
     local dev="$WORKER_ROOT/dev"
-    mkdir -p "$dev/pts" || return
+    mkdir -p "$dev" || return
     mount -t tmpfs -o mode=0755,nosuid tmpfs "$dev" || return
+    # Create mountpoints inside the new tmpfs, after it hides the guest /dev.
+    mkdir -p "$dev/pts" || return
     mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts "$dev/pts" || return
     ln -s pts/ptmx "$dev/ptmx" || return
     ln -s /proc/self/fd "$dev/fd" && ln -s /proc/self/fd/0 "$dev/stdin" &&
@@ -867,7 +1144,11 @@ image_json() {
     local image=$1 bytes=${2:-} blocks=${3:-} name key value comma= status=ready lifecycle=persistent suite=unknown architecture=unknown
     local profile=minimal created_at=unknown last_used_at=never origin=unknown mkey mval snaps=0 file
     name=${image##*/}; name=${name%.img}
-    if [[ -f $image.lock && ! -L $image.lock ]]; then
+    # The desktop probes locks in-process after its initial JSON inventory, just
+    # as it does on cached polls. Only list_images supplies this internal switch.
+    if [[ ${4:-1} == 0 ]]; then
+        status=unknown
+    elif [[ -f $image.lock && ! -L $image.lock ]]; then
         status=$(image_status "$image")
     fi
     if [[ -f $image.meta && ! -L $image.meta ]]; then
@@ -920,7 +1201,7 @@ list_images() {
         name=${image##*/}; name=${name%.img}
         read -r bytes blocks <<<"${stat_lines[$idx]:-0 0}"
         idx=$((idx + 1))
-        if [[ $format == json ]]; then printf '%s' "$comma"; image_json "$image" "$bytes" "$blocks"; comma=,
+        if [[ $format == json ]]; then printf '%s' "$comma"; image_json "$image" "$bytes" "$blocks" "${CHROOTABLE_LIST_PROBE_LOCKS:-1}"; comma=,
         else printf '%s\t%s\t%s MiB\n' "$name" "$(image_lifecycle "$image")" "$((bytes / 1048576))"; fi
     done
     [[ $format != json ]] || printf ']\n'
@@ -1057,7 +1338,17 @@ show_logs() {
             [[ $entry_name == "$name" && -n $entry_log ]] && valid_logs[$entry_log]=1
         done <"$STORE_DIR/activity.tsv"
     fi
-    for log in "$LOG_DIR/$name-"*.log; do
+    # New operation-ID logs are associated by the journal, not filename prefix.
+    # Legacy stores without a journal retain the original name-prefix fallback.
+    local -a candidates=()
+    if (( has_journal )); then
+        for log in "${!valid_logs[@]}"; do
+            [[ ${log%/*} == "$LOG_DIR" ]] && candidates+=("$log")
+        done
+    else
+        candidates=("$LOG_DIR/$name-"*.log)
+    fi
+    for log in "${candidates[@]}"; do
         [[ -f $log && ! -L $log ]] || continue
         # Use the journal to avoid treating logs for "foo-bar" as logs for "foo".
         (( ! has_journal )) || [[ -n ${valid_logs[$log]:-} ]] || continue
@@ -1091,7 +1382,8 @@ doctor_report() {
     printf 'Mount permissions are not tested by this read-only check.\n'
 }
 doctor() {
-    local command fs namespace owner permissions probe disk header line i comma= report
+    local command fs namespace owner permissions probe disk header line i comma= report record remedy
+    local -A operation=()
     local health_host health_arch health_errors=0 health_warnings=0
     local free_bytes=0 total_bytes=0 storage_available=false
     local -a health_ids=() health_statuses=() health_messages=() health_remedies=()
@@ -1148,11 +1440,27 @@ doctor() {
         else
             doctor_check store-access info 'Store needs administrator access.' 'Unlock the store in the desktop to view and modify workspaces.'
         fi
-        for probe in images logs exports snapshots; do
+        for probe in images logs exports snapshots operations; do
             if [[ -L $STORE_DIR/$probe ]]; then
                 doctor_check "store:$probe" error "Store subdirectory is a symlink: $probe" 'Choose a store with real subdirectories before performing administrator operations.'
             fi
         done
+        if [[ -d $OPERATIONS_DIR && ! -L $OPERATIONS_DIR && -r $OPERATIONS_DIR && -x $OPERATIONS_DIR ]]; then
+            for record in "$OPERATIONS_DIR/"*.state; do
+                [[ -f $record && ! -L $record ]] || continue
+                if ! read_operation_state "$record" operation; then
+                    doctor_check "operation:${record##*/}" error "An operation record is invalid: ${record##*/}" 'Inspect the protected operations directory before making changes.'
+                elif [[ ${operation[status]} == running || ${operation[status]} == interrupted ]]; then
+                    if ! operation_is_alive operation; then
+                        remedy="Inspect $LOG_DIR/${operation[id]}.log and retained partial files before retrying."
+                        if [[ ${operation[stage]} == publish-* ]]; then
+                            remedy="Finish the staged publication with sudo $0 --recover-operation ${operation[id]} --yes."
+                        fi
+                        doctor_check "operation:${operation[id]}" warning "Interrupted ${operation[action]} for ${operation[name]} at stage ${operation[stage]}." "$remedy"
+                    fi
+                fi
+            done
+        fi
     else
         doctor_check store-access info 'Store will be created on the first write operation.'
     fi
@@ -1166,7 +1474,7 @@ doctor() {
             if [[ $total_bytes =~ ^[0-9]+$ && $free_bytes =~ ^[0-9]+$ ]]; then
                 storage_available=true
                 if (( free_bytes < 2147483648 )); then
-                    doctor_check store-capacity warning "Less than 2 GiB is available on the store filesystem ($free_bytes bytes)." 'Free space or choose a larger store; creation reserves the requested image capacity.'
+                    doctor_check store-capacity warning "Less than 2 GiB is available on the store filesystem ($free_bytes bytes)." 'Free space or choose a larger store; images are sparse and their capacity is not reserved.'
                 else
                     doctor_check store-capacity ok "Store filesystem has $(human_bytes "$free_bytes") available."
                 fi
@@ -1372,7 +1680,7 @@ cleanup_demo() {
         rm -f -- "$IMAGE_DIR/$name.img" "$IMAGE_DIR/$name.img.meta"
     done
     rm -f -- "$SNAPSHOT_DIR/build-lab/clean-base.img" "$SNAPSHOT_DIR/build-lab/clean-base.img.meta"
-    rmdir "$SNAPSHOT_DIR/build-lab" "$IMAGE_DIR" "$LOG_DIR" "$EXPORT_DIR" "$SNAPSHOT_DIR" "$STORE_DIR"
+    rmdir "$SNAPSHOT_DIR/build-lab" "$IMAGE_DIR" "$LOG_DIR" "$EXPORT_DIR" "$SNAPSHOT_DIR" "$OPERATIONS_DIR" "$STORE_DIR"
 }
 run_demo() (
     DEMO=1
@@ -1412,6 +1720,8 @@ Explore (no root required when the store is readable)
   --list [--json]                   Inventory; TSV by default
   --inspect NAME [--json]           Image details and metadata
   --profiles                       Available creation profiles
+  --capabilities --json             Versioned profiles, releases and limits
+  --operations [--json]             Operation IDs, stages and interrupted work
   --snapshots NAME                  List recovery points, even after deletion
   --activity                       Recent operation history
   --logs NAME                      Last completed operation log (200 lines)
@@ -1444,9 +1754,11 @@ Recovery and maintenance (root required)
   --repair NAME --yes              Forced ext4 repair
   --delete NAME --yes              Delete image; keep snapshots and exports
   --setup                          Install missing host dependencies
+  --recover-operation ID --yes      Finish an interrupted staged publication
 
-Profiles: minimal (default), build, python, network.
-Sizes are MiB, up to 1048576 (1 TiB). Creation fully allocates the image.
+Profiles: minimal (default), build, python, network, rust, go, web.
+Sizes are MiB, from 512 to 1048576 (1 TiB). Images are sparse; capacity is not
+reserved. Create, expansion and copies check free space before starting.
 Shared folders appear at /shared for that session. HOST_DIR must be an existing
 absolute directory other than /. Add --read-only to prevent ordinary writes.
 Host folder changes persist, including in disposable sessions.
@@ -1503,6 +1815,9 @@ validate_session_arguments() {
 validate_cli() {
     case ${1:-} in
         --help|-h|--version|--dashboard|--profiles|--activity|--setup) [[ $# == 1 ]] ;;
+        --capabilities) [[ $# == 2 && $2 == --json ]] ;;
+        --operations) [[ $# == 1 || ( $# == 2 && $2 == --json ) ]] ;;
+        --recover-operation) [[ $# == 3 && $3 == --yes ]] && valid_operation_id "$2" ;;
         --doctor) [[ $# == 1 || ( $# == 2 && $2 == --json ) ]] ;;
         --list) [[ $# == 1 || ( $# == 2 && $2 == --json ) ]] ;;
         --demo) [[ $# == 1 || ( $# == 2 && $2 == --dashboard ) ]] ;;
@@ -1523,10 +1838,12 @@ run_cli() {
     local image operation=$1 lifecycle
     case $operation in
         --help|-h) usage ;; --version) printf '%s\n' "$APP_VERSION" ;;
-        --profiles) list_profiles ;; --doctor) doctor "${2:+json}" ;; --demo) run_demo "${2:-}" ;;
+        --profiles) list_profiles ;; --capabilities) capabilities ;; --operations) list_operations "${2:+json}" ;;
+        --doctor) doctor "${2:+json}" ;; --demo) run_demo "${2:-}" ;;
         --dashboard) dashboard ;; --list) list_images "${2:+json}" ;;
         --activity) activity ;; --logs) show_logs "$2" ;; --snapshots) list_snapshots "$2" ;;
         --setup) info "All host dependencies are available." ;;
+        --recover-operation) recover_operation "$2" ;;
         --archive-sync) shift; archive_sync "$@" ;;
         --create) create_image "$2" "$3" "$4" "${5:-minimal}" ;;
         --restore) restore_image "$2" "$3" ;;
@@ -1562,10 +1879,14 @@ main() {
     fi
     validate_cli "$@" || { usage_error; return 2; }
     case $1 in
-        --help|-h|--version|--profiles|--doctor|--demo) ;;
-        --dashboard|--list|--inspect|--activity|--logs|--snapshots) check_readable_store || return ;;
+        --help|-h|--version|--profiles|--capabilities|--doctor|--demo) ;;
+        --dashboard|--list|--inspect|--activity|--logs|--snapshots|--operations) check_readable_store || return ;;
+        --setup)
+            NON_INTERACTIVE=0
+            require_root && init_store && begin_operation setup host || return
+            CHROOTABLE_DEP_LOG="$OP_LOG" check_prerequisites || return ;;
+        --recover-operation) require_root && init_store || return ;;
         *)
-            [[ $1 != --setup ]] || NON_INTERACTIVE=0
             require_root && check_prerequisites && init_store || return ;;
     esac
     run_cli "$@"

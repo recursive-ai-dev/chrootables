@@ -1,28 +1,32 @@
 # Chrootables Roadmap
 
-Status as of 2026-10-27. v1.0.0 adds searchable workspace notes, saved library
-and session preferences, terminal scrollback/clipboard support, structured host
-diagnostics, and reproducible Debian packages. Qt desktop and Bash CLI share one
-image store. Debian 12/13 profiles, snapshots, disposable sessions, shared folders,
-restricted devices, and offline bootstrap archives are implemented. Historical
-audit reports remain under `docs/`; root integration is an opt-in test suite.
+Status as of 2026-10-27. v1.1.0 adds durable operation stages and interrupted
+publication recovery, sparse-capacity checks, isolated task logs, searchable
+recovery/history, storage totals, smaller-display/text-scaling support, improved
+terminal rendering and Unicode cell widths, canonical CLI capabilities, and
+verified DEB/RPM/host-runtime AppImage packaging. The project is Apache-2.0.
+Qt desktop and Bash CLI continue to share one image store and the trusted-root
+execution model. Historical audit reports remain under `docs/`.
 
 ## Release checks
 
-- Keep the audit findings as regression baselines: any change must keep the
-  measured latency budgets (24-workspace inventory <= 80 ms, per-render
-  main-thread work <= 2 ms on background polls).
+- Keep the audit findings as regression baselines. `scripts/benchmark.py` gates
+  median fresh inventory <= 80 ms, cached inventory <= 10 ms and unchanged
+  synchronous background rendering <= 2 ms on 24 workspaces with live lock files;
+  p95 latency is reported alongside the gate results.
 - Run `scripts/check.py --require-desktop-integration --build-deb`, the package
   installation simulation, and the opt-in root integration suite before publishing.
-- Choose an upstream license and add its metadata before public redistribution.
+- Keep Apache-2.0 metadata and the upstream license text in every package.
 - Commit and tag releases only when requested by the maintainer.
 
 ## Phase 1 — Release engineering
 
-- Implemented: GitHub Actions checks on Fedora and Debian, an opt-in root
-  integration job, and downloadable `.deb`/SHA256 artifacts.
-- Next: signed package repositories (COPR, PPA or OBS), source packages and
-  automated installation/upgrade/removal verification in disposable systems.
+- Implemented: GitHub Actions checks on Fedora and Debian; isolated package
+  installation/upgrade/removal checks; DEB/RPM/AppImage builds and SHA256
+  artifacts; explicitly pinned AppImage tools/runtime; root minimal/Python
+  integration on release branches and manual runs.
+- Next: signed package repositories (COPR, PPA or OBS), source packages,
+  signed release provenance, and a separately evaluated self-contained AppImage.
   Keep `scripts/install-desktop.py` as the source-checkout path.
 - Release hygiene: audit reports live under `docs/` as historical baselines;
   maintain the CHANGELOG for each release.
@@ -41,11 +45,23 @@ audit reports remain under `docs/`; root integration is an opt-in test suite.
 Evaluate before building; these are the README's explicit "does not implement"
 items, so each needs a decision, not just code:
 
-- Implemented: embedded PTY terminal with a compact VT/ANSI subset. Improve
-  Unicode cell widths and full-screen terminal fidelity as a separate track.
+- Implemented: embedded PTY terminal with ANSI colors/text attributes, combining
+  marks and East Asian wide-cell support. Full emoji grapheme shaping and complete
+  full-screen terminal fidelity remain a separate track.
 - Ubuntu and derivatives as additional suites alongside Debian.
 - OCI app store / graphical application export — requires a separate product
   decision and execution model.
+
+## Next product work
+
+- Storage retention policies and export cleanup previews after validating a
+  predictable recovery/retention contract; existing checkpoint deletion remains
+  explicit and scoped to the selected snapshot.
+- Operation-specific safe cancellation and resumable bootstraps. Interrupted
+  publication can be recovered now; earlier-stage partials are retained for
+  inspection rather than automatically resumed or deleted.
+- Workspace import/portable backup bundles, with format validation and
+  round-trip recovery tests before exposing imports in the desktop.
 
 ## Phase 4 — Security model (long term)
 

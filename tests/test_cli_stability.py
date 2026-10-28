@@ -1,4 +1,5 @@
 """Exercise CLI failure paths using temporary images and no privileged operations."""
+import fcntl
 import json
 from pathlib import Path
 import subprocess
@@ -44,6 +45,21 @@ resize_image "$IMAGE_DIR/lab.img" 2
         self.assertIn("larger than 3 MiB", result.stderr)
         self.assertEqual(self.image.stat().st_size, 3 * 1024 * 1024)
         self.assertFalse((self.store / "filesystem-operations").exists())
+
+    def test_internal_list_lock_probe_switch_does_not_affect_inspect_or_mutations(self):
+        lock = Path(str(self.image) + ".lock")
+        with lock.open("a") as descriptor:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            for setting, expected in (("1", "busy"), ("0", "unknown")):
+                result = self.bash('CHROOTABLE_LIST_PROBE_LOCKS=$1 list_images json', setting)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout)[0]["status"], expected)
+            inspect = self.bash('CHROOTABLE_LIST_PROBE_LOCKS=0 run_cli --inspect lab --json')
+            self.assertEqual(inspect.returncode, 0, inspect.stderr)
+            self.assertEqual(json.loads(inspect.stdout)["status"], "busy")
+            mutation = self.bash('CHROOTABLE_LIST_PROBE_LOCKS=0 lock_image "$IMAGE_DIR/lab.img" held')
+            self.assertNotEqual(mutation.returncode, 0)
+            self.assertIn("already in use", mutation.stderr)
 
     def test_inventory_propagates_partial_stat_failure(self):
         # stat can fail for one image removed after globbing while continuing
