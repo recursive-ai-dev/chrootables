@@ -1,5 +1,7 @@
+*.deb
 __pycache__/
 *.pyc
 .venv/
+.venv-test/
 .pytest_cache/
 dist/

@@ -8,7 +8,7 @@ from unittest.mock import patch
 from PySide6.QtWidgets import QApplication, QDialog
 from PySide6.QtTest import QTest
 from PySide6.QtCore import Qt, QSettings
-from chrootables.app import Window, CreateDialog
+from chrootables.app import Window, CreateDialog, NotesDialog
 from chrootables.style import STYLE
 
 
@@ -49,6 +49,130 @@ class DesktopTests(unittest.TestCase):
         self.window.search.setText("missing")
         self.assertEqual(self.window.library_stack.currentIndex(), 1)
         self.assertEqual(self.window.empty_title.text(), "No matching workspaces.")
+
+    def workspace_order(self):
+        return [self.window.workspaces.item(row).data(Qt.ItemDataRole.UserRole)["name"]
+                for row in range(self.window.workspaces.count())]
+
+    def test_sort_modes_keep_selection_and_put_unused_workspaces_last(self):
+        self.window.favorites = {"network-sandbox"}
+        self.window.render_library()
+        self.assertEqual(self.workspace_order()[0], "network-sandbox")
+        self.window.sort.setCurrentIndex(self.window.sort.findData("name"))
+        self.assertEqual(self.workspace_order(), ["build-studio", "clean-slate", "network-sandbox", "python-playground"])
+        self.window.sort.setCurrentIndex(self.window.sort.findData("recent"))
+        self.assertEqual(self.workspace_order(), ["build-studio", "python-playground", "clean-slate", "network-sandbox"])
+        self.window.sort.setCurrentIndex(self.window.sort.findData("created"))
+        self.assertEqual(self.workspace_order()[0], "clean-slate")
+        for key in ("capacity", "allocated"):
+            self.window.sort.setCurrentIndex(self.window.sort.findData(key))
+            self.assertEqual(self.workspace_order()[0], "build-studio")
+        self.assertEqual(self.window.selected, "python-playground")
+        self.window.filter.setCurrentIndex(2)
+        self.assertEqual(self.window.library_count.text(), "2 of 4 workspaces")
+
+    def test_session_preferences_survive_reopen_without_folder(self):
+        self.enable_shared_folder_controls()
+        self.window.offline.setChecked(True)
+        self.window.restricted.setChecked(True)
+        self.window.save_notes("python-playground", "Project launch instructions")
+        self.window.save_shared_folder("python-playground", self.shared_directory(), True)
+        self.window.clear_shared_folder()
+        reopened = self.another_demo_window()
+        self.enable_shared_folder_controls(reopened)
+        reopened.network_choices.clear()
+        reopened.restricted_choices.clear()
+        reopened.notes_cache.clear()
+        reopened.render_library()
+        self.assertTrue(reopened.offline.isChecked())
+        self.assertTrue(reopened.restricted.isChecked())
+        self.assertEqual(reopened.workspace_notes("python-playground"), "Project launch instructions")
+        self.assertEqual(reopened.shared_folder_choice("python-playground"), ("", False))
+        other_store = self.another_demo_window(Path(self.directory.name) / "other-store")
+        self.enable_shared_folder_controls(other_store)
+        self.assertFalse(other_store.session_choice("python-playground", "isolated"))
+        self.assertEqual(other_store.workspace_notes("python-playground"), "")
+
+    def test_notes_are_searchable_and_modal_save_keeps_original_workspace(self):
+        self.enable_shared_folder_controls()
+        def refresh_selection():
+            self.window.selected = "clean-slate"
+            self.window.render_library()
+            return QDialog.DialogCode.Accepted
+        with patch("chrootables.app.NotesDialog") as dialog:
+            dialog.return_value.exec.side_effect = refresh_selection
+            dialog.return_value.value.return_value = "Run make galaxy"
+            self.window.edit_notes()
+        self.assertEqual(self.window.workspace_notes("python-playground"), "Run make galaxy")
+        self.assertEqual(self.window.workspace_notes("clean-slate"), "")
+        self.window.search.setText("GALAXY")
+        self.assertEqual(self.workspace_order(), ["python-playground"])
+        self.assertEqual(self.window.notes_preview.text(), "Run make galaxy")
+        with self.assertRaises(ValueError):
+            self.window.save_notes("python-playground", "x" * 4001)
+
+    def test_notes_dialog_limits_and_demo_has_no_preference_writes(self):
+        dialog = NotesDialog("lab", "hello", self.window)
+        self.assertTrue(dialog.save_button.isEnabled())
+        dialog.editor.setPlainText("x" * 4001)
+        self.assertFalse(dialog.save_button.isEnabled())
+        dialog.editor.setPlainText(" hello ")
+        self.assertEqual(dialog.value(), "hello")
+        self.assertTrue(dialog.save_button.isEnabled())
+        self.assertFalse(self.window.notes_button.isEnabled())
+        with patch.object(self.settings, "setValue") as write:
+            self.window.save_notes("python-playground", "ignored")
+            self.window.sort.setCurrentIndex(1)
+            self.window.filter.setCurrentIndex(1)
+            self.window.save_session_choice("isolated", True)
+            self.window.close()
+        write.assert_not_called()
+
+    def test_sort_and_filter_saved_per_store_and_bad_preferences_fall_back(self):
+        self.enable_shared_folder_controls()
+        self.window.sort.setCurrentIndex(self.window.sort.findData("capacity"))
+        self.window.filter.setCurrentIndex(2)
+        with patch("chrootables.app.QSettings", return_value=self.settings), \
+                patch("chrootables.app.QTimer.singleShot"):
+            reopened = Window(self.window.store)
+            different = Window(Path(self.directory.name) / "different")
+            self.addCleanup(reopened.close)
+            self.addCleanup(different.close)
+        self.assertEqual(reopened.sort.currentData(), "capacity")
+        self.assertEqual(reopened.filter.currentIndex(), 2)
+        self.assertEqual(different.sort.currentData(), "favorites")
+        self.assertEqual(different.filter.currentIndex(), 0)
+        self.settings.setValue(self.window.session_settings_prefix + "/sort", "obsolete-sort")
+        self.settings.setValue(self.window.session_settings_prefix + "/filter", "obsolete-filter")
+        with patch("chrootables.app.QSettings", return_value=self.settings), \
+                patch("chrootables.app.QTimer.singleShot"):
+            fallback = Window(self.window.store)
+            self.addCleanup(fallback.close)
+        self.assertEqual(fallback.sort.currentIndex(), 0)
+        self.assertEqual(fallback.filter.currentIndex(), 0)
+
+    def test_corrupt_saved_geometry_does_not_prevent_startup(self):
+        self.settings.setValue("window/geometry", 123)
+        self.settings.setValue("window/splitter", ["invalid", "sizes"])
+        with patch("chrootables.app.QSettings", return_value=self.settings), \
+                patch("chrootables.app.QTimer.singleShot"):
+            window = Window(self.window.store)
+            self.addCleanup(window.close)
+        self.assertGreater(window.width(), 0)
+
+    def test_health_distinguishes_store_configuration_from_dependencies(self):
+        self.enable_shared_folder_controls()
+        self.window.client.is_ready = True
+        report = {"ready": False, "output": "Store ownership needs fixing", "errors": 1,
+                  "warnings": 2, "checks": [{"id": "store-permissions", "status": "error"}]}
+        with patch.object(self.window.client, "request", side_effect=lambda action, params, done: done(True, report)):
+            self.window.check_health()
+            self.assertFalse(self.window.setup_button.isEnabled())
+            self.assertIn("blocking issues", self.window.notice_text.text())
+            self.assertIn("2 warnings", self.window.health_summary.text())
+            report["checks"] = [{"id": "command:debootstrap", "status": "error"}]
+            self.window.check_health()
+            self.assertTrue(self.window.setup_button.isEnabled())
 
     def test_recovery_and_activity_navigation(self):
         QTest.mouseClick(self.window.nav[1], Qt.MouseButton.LeftButton)

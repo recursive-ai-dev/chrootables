@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QPoint, Qt
 from PySide6.QtWidgets import QApplication
 from PySide6.QtTest import QTest
 
@@ -57,6 +57,52 @@ class VtScreenTests(unittest.TestCase):
         for line in range(5):
             screen.feed(f"L{line}\r\n")
         self.assertEqual(screen.plain().splitlines(), ["L3", "L4"])
+
+    def test_scrollback_is_bounded_and_viewport_preserves_order(self):
+        screen = VtScreen(3, 20, scrollback=4)
+        for line in range(8):
+            screen.feed(f"L{line}\r\n")
+        self.assertEqual(len(screen.history), 4)
+        self.assertEqual(screen.history_count, 6)
+        visible = lambda offset: ["".join(cell[0] for cell in line).rstrip()
+                                  for line in screen.viewport(offset)]
+        self.assertEqual(visible(0), ["L6", "L7", ""])
+        self.assertEqual(visible(2), ["L4", "L5", "L6"])
+        self.assertEqual(visible(999), ["L2", "L3", "L4"])
+
+    def test_scrollback_excludes_alt_screen_and_partial_scroll_regions(self):
+        screen = VtScreen(3, 20)
+        screen.feed("original\r\n\r\n\r\n")
+        self.assertEqual(len(screen.history), 1)
+        screen.feed("\x1b[?1049h" + "alternate\r\n" * 6)
+        self.assertEqual(len(screen.history), 1)
+        self.assertIs(screen.viewport(1), screen.lines)
+        screen.feed("\x1b[?1049l\x1b[1;2r\x1b[2;1H\n\n")
+        self.assertEqual(len(screen.history), 1)
+
+    def test_history_resizes_for_display_and_clear_scrollback_keeps_screen(self):
+        screen = VtScreen(3, 40)
+        screen.feed("x" * 35 + "\r\nkept\r\n\r\n")
+        screen.resize(3, 20)
+        self.assertTrue(all(len(line) == 20 for line in screen.viewport(1)))
+        screen.resize(3, 50)
+        self.assertEqual("".join(cell[0] for cell in screen.viewport(1)[0]).rstrip(), "x" * 35)
+        before = screen.plain()
+        screen.feed("\x1b[3J")
+        self.assertFalse(screen.history)
+        self.assertEqual(screen.plain(), before)
+
+    def test_bracketed_paste_modes_and_reset(self):
+        screen = VtScreen(3, 20)
+        self.assertFalse(screen.bracketed_paste)
+        screen.feed("\x1b[?2004h")
+        self.assertTrue(screen.bracketed_paste)
+        screen.feed("\x1b[?2004l")
+        self.assertFalse(screen.bracketed_paste)
+        screen.feed("\x1b[?2004h\x1b[?1049htext\x1bc")
+        self.assertFalse(screen.bracketed_paste)
+        self.assertFalse(screen._alt_active)
+        self.assertIsNone(screen._primary)
 
     def test_cursor_addressing_and_erase(self):
         screen = VtScreen(4, 20)
@@ -286,6 +332,37 @@ class PtyProcessTests(unittest.TestCase):
         process.terminate()
         self.assertTrue(pump(self.app, lambda: bool(code)))
 
+    def test_partial_writes_and_backpressure_retain_input_in_order(self):
+        child = Mock()
+        child.poll.return_value = None
+        with patch("chrootables.terminal.subprocess.Popen", return_value=child):
+            process = PtyProcess(["fake-child"])
+        with patch("chrootables.terminal.os.write", side_effect=[2, BlockingIOError(), 4]) as write:
+            process.write(b"abc")
+            self.assertEqual(process._pending_input, b"c")
+            process.write(b"def")
+            self.assertEqual(process._pending_input, b"cdef")
+            process._flush_input()
+            self.assertEqual(process._pending_input, b"")
+            self.assertEqual([bytes(call.args[1]) for call in write.call_args_list],
+                             [b"abc", b"cdef", b"cdef"])
+            self.assertFalse(process._write_notifier.isEnabled())
+        process._readable()  # No slave: close the mock session's descriptor.
+        process._reaper.stop()
+
+    def test_large_paste_does_not_block_gui_when_guest_stops_reading(self):
+        process = PtyProcess(["/bin/sh", "-c", "printf READY; sleep 30"])
+        output = []
+        process.output.connect(output.append)
+        self.assertTrue(pump(self.app, lambda: "READY" in "".join(output)))
+        started = time.monotonic()
+        process.write(b"x" * 500000)
+        self.assertLess(time.monotonic() - started, .5)
+        self.assertTrue(process._pending_input)
+        process.terminate()
+        self.assertTrue(pump(self.app, lambda: process._finished))
+        self.assertFalse(process._pending_input)
+
     def test_split_utf8_output_is_reassembled(self):
         collected = []
         payload = "héllo"
@@ -326,11 +403,113 @@ class TerminalPaneTests(unittest.TestCase):
             self.assertTrue(pump(self.app, lambda: process._finished))
             pane.close()
 
+    def test_history_navigation_after_exit_and_anchor_during_output(self):
+        pane = TerminalPane()
+        pane.screen = VtScreen(3, 20, scrollback=5)
+        pane._on_output("".join(f"L{index}\r\n" for index in range(6)))
+        QTest.keyClick(pane, Qt.Key.Key_PageUp, Qt.KeyboardModifier.ShiftModifier)
+        self.assertEqual(pane.scroll_offset, 2)
+        before = pane.screen.viewport(pane.scroll_offset)[0]
+        pane._on_output("next\r\n")
+        self.assertEqual(pane.scroll_offset, 3)
+        self.assertEqual(pane.screen.viewport(pane.scroll_offset)[0], before)
+        QTest.keyClick(pane, Qt.Key.Key_PageDown, Qt.KeyboardModifier.ShiftModifier)
+        self.assertEqual(pane.scroll_offset, 1)
+        pane._on_output("\x1b[?1049h")
+        self.assertEqual(pane.scroll_offset, 0)
+        pane.scroll(5)
+        self.assertEqual(pane.scroll_offset, 0)
+        pane.close()
+
+    def test_selection_copy_and_shortcuts_preserve_ctrl_c(self):
+        pane = TerminalPane()
+        pane.screen = VtScreen(3, 20)
+        pane._on_output("first line\r\nsecond line")
+        start = QPoint(0, pane.cell_height // 2)
+        end = QPoint(6 * pane.cell_width, pane.cell_height + pane.cell_height // 2)
+        QTest.mousePress(pane, Qt.MouseButton.LeftButton, pos=start)
+        QTest.mouseMove(pane, end)
+        QTest.mouseRelease(pane, Qt.MouseButton.LeftButton, pos=end)
+        self.assertEqual(pane.selected_text(), "first line\nsecond")
+        QTest.keyClick(pane, Qt.Key.Key_C,
+                       Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)
+        self.assertEqual(self.app.clipboard().text(), "first line\nsecond")
+        process = Mock(running=True)
+        pane.process = process
+        QTest.keyClick(pane, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
+        process.write.assert_called_once_with(b"\x03")
+        pane.close()
+
+    def test_bracketed_paste_and_clipboard_newline_normalization(self):
+        pane = TerminalPane()
+        process = Mock(running=True)
+        pane.process = process
+        pane.paste("one\r\ntwo\n")
+        process.write.assert_called_with(b"one\rtwo\r")
+        pane.screen.feed("\x1b[?2004h")
+        self.app.clipboard().setText("héllo\nworld\x1b[201~")
+        QTest.keyClick(pane, Qt.Key.Key_V,
+                       Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)
+        process.write.assert_called_with(b"\x1b[200~h\xc3\xa9llo\rworld[201~\x1b[201~")
+        pane.close()
+
 
 class TerminalWindowTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
+
+    def test_external_handoff_waits_for_reaping_and_only_launches_once(self):
+        handoffs = []
+        window = TerminalWindow(["/bin/sh", "-c", "printf READY; sleep 30"],
+                                "session", external=lambda: handoffs.append(
+                                    (window.process._finished, window.process.master)))
+        window.show()
+        self.assertTrue(pump(self.app, lambda: "READY" in window.pane.screen.plain()))
+        window._open_external()
+        window._open_external()
+        self.assertFalse(handoffs)
+        self.assertTrue(pump(self.app, lambda: bool(handoffs)))
+        self.assertEqual(handoffs, [(True, None)])
+        self.assertFalse(window.isVisible())
+        self.assertFalse(window.pane._blink.isActive())
+        window._open_external()
+        self.assertEqual(len(handoffs), 1)
+
+    def test_close_or_escape_cancels_pending_external_handoff(self):
+        for escape in (False, True):
+            with self.subTest(escape=escape):
+                external = Mock()
+                window = TerminalWindow(["/bin/sh", "-c", "printf READY; sleep 30"],
+                                        "session", external=external)
+                window.show()
+                self.assertTrue(pump(self.app, lambda: "READY" in window.pane.screen.plain()))
+                window._open_external()
+                if escape:
+                    window.reject()
+                    window.reject()
+                else:
+                    window.close()
+                    window.close()
+                self.assertTrue(pump(self.app, lambda: window.process._finished))
+                external.assert_not_called()
+                self.assertFalse(window.isVisible())
+
+    def test_external_handoff_after_exit_and_failure_remains_visible(self):
+        external = Mock(side_effect=RuntimeError("terminal unavailable"))
+        window = TerminalWindow(["/bin/sh", "-c", "printf READY"], "session", external=external)
+        window.show()
+        self.assertTrue(pump(self.app, lambda: window.process._finished))
+        with patch("chrootables.terminal.QMessageBox.warning") as warning:
+            window._open_external()
+        external.assert_called_once_with()
+        warning.assert_called_once()
+        self.assertTrue(window.isVisible())
+        self.assertFalse(window._closing)
+        external.side_effect = None
+        window._open_external()
+        self.assertEqual(external.call_count, 2)
+        self.assertFalse(window.isVisible())
 
     def test_close_terminates_children_after_session_leader_exits(self):
         script = "import subprocess; subprocess.Popen(['/bin/sleep', '30']); print('READY', flush=True)"

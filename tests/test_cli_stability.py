@@ -263,6 +263,71 @@ archive_has_profile "$(archive_path bookworm amd64)" minimal || echo missing
             result = self.bash('validate_cli "$@"', *arguments)
             self.assertEqual(result.returncode == 0, valid, arguments)
 
+    def test_doctor_json_is_read_only_and_reports_missing_commands(self):
+        before = sorted(path.relative_to(self.store) for path in self.store.rglob("*"))
+        result = self.bash('''
+REQUIRED_COMMANDS=(bash chrootables_nonexistent_command)
+doctor json
+''')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["schema_version"], 1)
+        self.assertFalse(report["ready"])
+        checks = {item["id"]: item for item in report["checks"]}
+        self.assertEqual(checks["command:chrootables_nonexistent_command"]["status"], "error")
+        self.assertIn("--setup", checks["command:chrootables_nonexistent_command"]["remedy"])
+        self.assertTrue(report["storage"]["available"])
+        self.assertGreater(report["storage"]["total_bytes"], 0)
+        self.assertIn("Mount permissions are not tested", report["output"])
+        self.assertEqual(report["errors"], sum(c["status"] == "error" for c in checks.values()))
+        self.assertEqual(sorted(path.relative_to(self.store) for path in self.store.rglob("*")), before)
+
+    def test_doctor_warns_on_low_space_and_checks_store_permissions(self):
+        result = self.bash('''
+REQUIRED_COMMANDS=(bash)
+df() { printf ' Size Avail\\n 10737418240 1048576\\n'; }
+stat() { printf '0 777\\n'; }
+doctor json
+''')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        report = json.loads(result.stdout)
+        checks = {item["id"]: item for item in report["checks"]}
+        self.assertEqual(checks["store-permissions"]["status"], "error")
+        self.assertEqual(checks["store-capacity"]["status"], "warning")
+        self.assertEqual(report["storage"]["free_bytes"], 1048576)
+        self.assertEqual(report["storage"]["total_bytes"], 10737418240)
+
+    def test_doctor_handles_missing_store_and_escapes_unusual_paths(self):
+        unusual = self.store / 'future "store"\nfolder'
+        result = self.bash('''
+STORE_DIR=$1
+REQUIRED_COMMANDS=(bash)
+doctor json
+''', unusual)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["store"], str(unusual))
+        self.assertTrue(report["storage"]["available"])
+        self.assertFalse(unusual.exists())
+        self.assertIn("first write operation", report["output"])
+
+    def test_doctor_rejects_store_subdirectory_symlinks(self):
+        (self.store / "exports").rmdir()
+        (self.store / "exports").symlink_to(self.store / "images", target_is_directory=True)
+        result = self.bash('REQUIRED_COMMANDS=(bash)\ndoctor json')
+        report = json.loads(result.stdout)
+        checks = {item["id"]: item for item in report["checks"]}
+        self.assertEqual(checks["store:exports"]["status"], "error")
+
+    def test_doctor_json_argument_validation_and_version(self):
+        for arguments, valid in ((["--doctor"], True), (["--doctor", "--json"], True),
+                                 (["--doctor", "--json", "extra"], False),
+                                 (["--doctor", "--other"], False)):
+            result = self.bash('validate_cli "$@"', *arguments)
+            self.assertEqual(result.returncode == 0, valid, arguments)
+        from chrootables import __version__
+        result = subprocess.run([str(MANAGER), "--version"], capture_output=True, text=True, check=True)
+        self.assertEqual(result.stdout.strip(), __version__)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -305,8 +305,43 @@ class Store:
         return result.stdout
 
     def doctor(self):
-        result = subprocess.run([str(MANAGER), "--doctor"], env=self.environment(), capture_output=True, text=True, timeout=15)
-        return {"ready": result.returncode == 0, "output": result.stdout + result.stderr}
+        result = subprocess.run([str(MANAGER), "--doctor", "--json"], env=self.environment(), capture_output=True, text=True, timeout=15)
+        try:
+            report = json.loads(result.stdout)
+        except (ValueError, TypeError) as error:
+            raise RuntimeError(result.stderr.strip() or "Host health returned an invalid report.") from error
+        if (not isinstance(report, dict) or type(report.get("schema_version")) is not int
+                or report["schema_version"] != 1
+                or type(report.get("ready")) is not bool
+                or not all(isinstance(report.get(key), str)
+                           for key in ("output", "host", "architecture", "version", "store"))
+                or not all(type(report.get(key)) is int and report[key] >= 0
+                           for key in ("errors", "warnings"))
+                or not isinstance(report.get("checks"), list)
+                or result.returncode not in (0, 1)
+                or report["ready"] != (result.returncode == 0)):
+            raise RuntimeError("Host health returned an inconsistent report.")
+        statuses = {"ok", "info", "warning", "error"}
+        seen = set()
+        for check in report["checks"]:
+            if (not isinstance(check, dict)
+                    or not all(isinstance(check.get(key), str)
+                               for key in ("id", "status", "message", "remedy"))
+                    or check["status"] not in statuses or not check["id"]
+                    or check["id"] in seen):
+                raise RuntimeError("Host health returned an invalid check.")
+            seen.add(check["id"])
+        if (report["errors"] != sum(check["status"] == "error" for check in report["checks"])
+                or report["warnings"] != sum(check["status"] == "warning" for check in report["checks"])
+                or report["ready"] != (report["errors"] == 0)):
+            raise RuntimeError("Host health returned inconsistent issue counts.")
+        storage = report.get("storage")
+        if (not isinstance(storage, dict) or type(storage.get("available")) is not bool
+                or not all(type(storage.get(key)) is int and storage[key] >= 0
+                           for key in ("free_bytes", "total_bytes"))
+                or storage["free_bytes"] > storage["total_bytes"]):
+            raise RuntimeError("Host health returned invalid storage capacity.")
+        return report
 
     def operate(self, action, params, output):
         args, extra = build_command(action, params)

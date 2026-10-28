@@ -11,7 +11,7 @@ point. The Qt desktop and the Bash terminal interface use the same image store.
 On Ubuntu 26.04, install the locally built package with:
 
 ```bash
-sudo apt install ./dist/chrootables_3.1.0-1_all.deb
+sudo apt install ./dist/chrootables_3.2.0-1_all.deb
 chrootables-desktop
 ```
 
@@ -27,11 +27,28 @@ Build the package without root or pip dependencies:
 /usr/bin/python3 scripts/build-deb.py
 ```
 
+The build writes the `.deb` and a `.deb.sha256` checksum to `dist/`. Verify it:
+
+```bash
+(cd dist && sha256sum -c chrootables_3.2.0-1_all.deb.sha256)
+```
+
+Builds are reproducible across directories and umasks. `SOURCE_DATE_EPOCH`
+controls timestamps (default: 2026-10-27 00:00 UTC). Use `--revision 2` for a
+new Debian revision, or `--output /path/to/artifacts` for another destination.
+An identical rebuild is accepted; replacing an existing package with changed
+contents requires `--force`. CI publishes the package and checksum as artifacts.
+Installed help is available through `man chrootables-desktop` and
+`man chrootable-manager`.
+
 The build requires `dpkg-deb` (from `dpkg`). The package contains portable Python
 and Bash code (`Architecture: all`); the verified host architecture is amd64.
 It requires distro PySide6 6.8 or newer, so older Ubuntu/Debian releases may not
 provide suitable dependencies. Remove it with `sudo apt remove chrootables`;
 workspace images in `/var/lib/chrootable-manager` remain intact.
+
+The repository currently has no upstream license file. The builder does not
+invent one; choose and add a license before publishing packages for redistribution.
 
 ### From a checkout
 
@@ -68,6 +85,10 @@ For a clearly labeled, read-only tour with sample data:
 ## Desktop features
 
 - Search and filter workspaces by profile, release, lifecycle, favorites, or usage.
+- Sort by favorites, name, recent use, creation time, capacity, or allocated disk
+  space. Filters and sort order are remembered separately for each store.
+- Save searchable personal notes for each workspace. Notes and session preferences
+  belong to your desktop user and store; they are not included in image exports.
 - Create Debian 13 (Trixie) or Debian 12 (Bookworm) images from minimal, C/C++,
   Python, networking, Rust, Go, and web (Node.js) profiles.
 - Open a shell in the embedded terminal pane, or hand the session to Konsole,
@@ -81,8 +102,16 @@ For a clearly labeled, read-only tour with sample data:
 - Clone, expand, change lifecycle, repair ext4 filesystems, and export `.tar.gz`
   archives to a chosen location. Existing destination files are never overwritten.
 - Watch operation output, inspect history and logs, and check host prerequisites.
+- Scroll through 2,000 lines of terminal history with the wheel or
+  `Shift+PageUp`/`Shift+PageDown`. Select text with the mouse, copy with
+  `Ctrl+Shift+C`, and paste with `Ctrl+Shift+V`. Shells that request bracketed
+  paste receive it; large pastes do not block the desktop.
 - Use `Ctrl+N` to create, `Ctrl+F` to search, `Ctrl+Enter` to open a terminal, and
   `F5` to refresh. Workspace status refreshes every six seconds.
+
+Window size and pane widths are restored on launch. Network isolation and device
+restriction choices are remembered per workspace and store. The read-only tour
+does not save these settings.
 
 The desktop currently manages Debian images. It does not implement an OCI app
 store or graphical application exports. The embedded terminal pane implements a
@@ -105,6 +134,15 @@ uses `dnf`; Debian/Ubuntu uses `apt-get`; Arch uses `pacman` and openSUSE uses
 `zypper` (both best-effort — package names occasionally differ, and `CHROOTABLE_AUTO_INSTALL=0`
 lets you install them yourself). Setup includes debootstrap, Debian archive
 signing keys, ext4 tools, namespace tools, and the terminal UI dependencies.
+
+Host health also inspects store ownership, free disk space, kernel filesystem
+support and namespace availability. Each issue includes a suggested fix. Missing
+commands or signing keys enable the dependency installer; store configuration
+issues require the indicated store fix. Kernel module and loop-device checks are
+warnings because a read-only check cannot prove mount access. For automation,
+`chrootable-manager --doctor --json` returns a versioned report with individual
+checks, remedies, blocking/warning counts and storage byte counts. It exits 1
+when blocking checks fail, and never installs packages or creates the store.
 
 The desktop window runs as your user. **Unlock workspace store** opens a polkit
 administrator prompt and starts a separate, headless helper connected only to the
@@ -233,6 +271,16 @@ No web server, Node build, or downloaded frontend dependencies are required.
 
 ```bash
 python3 scripts/check.py
+```
+
+Tests require QtTest as well as the runtime Qt modules. Debian/Ubuntu users
+with split distro bindings can install `python3-pyside6.qttest`. For isolated
+testing with the pinned dependencies and the distribution interpreter:
+
+```bash
+/usr/bin/python3 -m venv .venv-test
+.venv-test/bin/python -m pip install --require-hashes -r requirements.txt
+.venv-test/bin/python scripts/check.py --build-deb
 ```
 
 Use Python 3.10–3.14 with the pinned `requirements.txt` dependencies; those

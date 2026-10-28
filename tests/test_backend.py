@@ -144,6 +144,50 @@ class StoreTests(unittest.TestCase):
         Path(str(target) + ".meta").write_text("lifecycle=ephemeral\nsuite=trixie\narchitecture=amd64\nprofile=python\ncreated_at=2026-10-16T10:00:00\nlast_used_at=never\n")
         return target
 
+    def test_doctor_preserves_structured_report_and_readiness(self):
+        for ready in (True, False):
+            report = {"schema_version": 1, "ready": ready, "output": "Host health",
+                      "host": "Linux", "architecture": "x86_64", "version": "3.2.0",
+                      "store": str(self.path), "errors": 0 if ready else 1, "warnings": 0,
+                      "checks": [{"id": "archive-keys", "status": "ok" if ready else "error",
+                                  "message": "Archive keys", "remedy": "Run --setup"}],
+                      "storage": {"available": True, "free_bytes": 1024, "total_bytes": 2048}}
+            result = subprocess.CompletedProcess([], 0 if ready else 1, json.dumps(report), "")
+            with patch("chrootables.backend.subprocess.run", return_value=result) as run:
+                self.assertEqual(self.store.doctor(), report)
+            self.assertEqual(run.call_args.args[0][-2:], ["--doctor", "--json"])
+
+    def test_doctor_rejects_invalid_or_inconsistent_cli_reports(self):
+        reports = [(2, "", "doctor invocation failed"), (0, "not json", ""),
+                   (0, json.dumps({"schema_version": 1, "ready": False,
+                                   "output": "invalid", "checks": []}), "")]
+        for code, output, error in reports:
+            with self.subTest(code=code, output=output):
+                result = subprocess.CompletedProcess([], code, output, error)
+                with patch("chrootables.backend.subprocess.run", return_value=result):
+                    with self.assertRaises(RuntimeError):
+                        self.store.doctor()
+
+    def test_doctor_rejects_bad_checks_counts_and_storage_fields(self):
+        report = {"schema_version": 1, "ready": True, "output": "Host health", "errors": 0,
+                  "warnings": 0, "host": "Linux", "architecture": "x86_64", "version": "3.2.0",
+                  "store": str(self.path), "checks": [],
+                  "storage": {"available": True, "free_bytes": 1024, "total_bytes": 2048}}
+        valid_check = {"id": "a", "status": "ok", "message": "Ready", "remedy": ""}
+        invalid = [{"checks": [None]}, {"checks": [{}]}, {"checks": ["text"]},
+                   {"checks": [{**valid_check, "status": "unknown"}]},
+                   {"checks": [{**valid_check, "remedy": []}]},
+                   {"checks": [valid_check, valid_check]},
+                   {"warnings": 1}, {"schema_version": True}, {"errors": False},
+                   {"storage": {"available": 1, "free_bytes": 0, "total_bytes": 0}},
+                   {"storage": {"available": True, "free_bytes": 3000, "total_bytes": 2000}}]
+        for change in invalid:
+            with self.subTest(change=change):
+                result = subprocess.CompletedProcess([], 0, json.dumps({**report, **change}), "")
+                with patch("chrootables.backend.subprocess.run", return_value=result):
+                    with self.assertRaises(RuntimeError):
+                        self.store.doctor()
+
     def test_real_cli_inventory_and_snapshot_metadata(self):
         image = self.image()
         folder = self.path / "snapshots/deleted-lab"

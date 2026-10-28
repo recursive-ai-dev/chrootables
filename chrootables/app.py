@@ -260,6 +260,36 @@ class WorkspaceRow(QWidget):
         self.mode_label.setText("Disposable" if ephemeral else "Persistent")
 
 
+class NotesDialog(QDialog):
+    def __init__(self, target, text, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Notes · {target}")
+        self.resize(540, 360)
+        layout = QVBoxLayout(self)
+        layout.addWidget(label("Personal notes, saved on this host for this workspace store.", "muted", True))
+        self.editor = QPlainTextEdit(text)
+        self.editor.setAccessibleName("Workspace notes")
+        self.editor.setPlaceholderText("Commands, project details, things to try…")
+        layout.addWidget(self.editor, 1)
+        self.limit_label = label("", "muted")
+        layout.addWidget(self.limit_label)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        layout.addWidget(buttons)
+        self.save_button = buttons.button(QDialogButtonBox.StandardButton.Save)
+        self.editor.textChanged.connect(self.validate)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        self.validate()
+
+    def validate(self):
+        length = len(self.editor.toPlainText())
+        self.limit_label.setText(f"{length:,} / 4,000 characters")
+        self.save_button.setEnabled(length <= 4000)
+
+    def value(self):
+        return self.editor.toPlainText().strip()
+
+
 class Window(QMainWindow):
     def __init__(self, store=DEFAULT_STORE, demo=False):
         super().__init__()
@@ -276,12 +306,14 @@ class Window(QMainWindow):
         self.network_choices = {}
         self.restricted_choices = {}
         self.shared_folder_choices = {}
+        self.notes_cache = {}
         self.session_settings_prefix = "sessions/" + sha256(str(self.store.resolve()).encode()).hexdigest()
         self.busy = False
         self.refreshing = False
         self.pending_action = None
         self.last_task = ""
         self.health_ready = False
+        self.missing_dependencies = False
         self.store_locked = False
         self.current_view = 0
         self._detail_state = None
@@ -292,6 +324,19 @@ class Window(QMainWindow):
         self.client.disconnected.connect(self.disconnected)
         self.client.output.connect(lambda identifier, text: self.append_output(text))
         self.build_ui()
+        if not demo:
+            geometry = self.settings.value("window/geometry")
+            if geometry is not None:
+                try:
+                    self.restoreGeometry(geometry)
+                except (TypeError, ValueError):
+                    pass
+            sizes = self.settings.value("window/splitter", [], type=list)
+            if len(sizes) == 2:
+                try:
+                    self.splitter.setSizes([max(1, int(value)) for value in sizes])
+                except (ValueError, TypeError):
+                    pass
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._poll_timer)
         self.timer.start(6000)
@@ -420,7 +465,7 @@ class Window(QMainWindow):
         layout.addWidget(metrics)
         tools, row = box(horizontal=True)
         self.search = QLineEdit()
-        self.search.setPlaceholderText("Search workspaces, profiles or releases…")
+        self.search.setPlaceholderText("Search workspaces, profiles, releases or notes…")
         self.search.setAccessibleName("Search workspaces")
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self.render_library)
@@ -428,9 +473,24 @@ class Window(QMainWindow):
         self.filter = QComboBox()
         self.filter.setAccessibleName("Filter workspaces")
         self.filter.addItems(["All workspaces", "Persistent", "Disposable", "Favorites", "In use"])
-        self.filter.currentIndexChanged.connect(self.render_library)
         row.addWidget(self.filter)
+        self.sort = QComboBox()
+        self.sort.setAccessibleName("Sort workspaces")
+        for text, key in [("Favorites first", "favorites"), ("Name", "name"),
+                          ("Recently used", "recent"), ("Newest first", "created"),
+                          ("Largest capacity", "capacity"), ("Most disk space", "allocated")]:
+            self.sort.addItem(text, key)
+        if not self.demo:
+            saved_filter = self.settings.value(self.session_settings_prefix + "/filter", "All workspaces", type=str)
+            self.filter.setCurrentIndex(max(0, self.filter.findText(saved_filter)))
+            saved_sort = self.settings.value(self.session_settings_prefix + "/sort", "favorites", type=str)
+            self.sort.setCurrentIndex(max(0, self.sort.findData(saved_sort)))
+        self.filter.currentIndexChanged.connect(self.library_preferences_changed)
+        self.sort.currentIndexChanged.connect(self.library_preferences_changed)
+        row.addWidget(self.sort)
         layout.addWidget(tools)
+        self.library_count = label("", "muted")
+        layout.addWidget(self.library_count)
         self.library_stack = QStackedWidget()
         layout.addWidget(self.library_stack, 1)
         self.splitter = QSplitter()
@@ -517,10 +577,13 @@ class Window(QMainWindow):
         header, row = box(horizontal=True)
         row.addWidget(label("Ready before you press Create", "section"), 1)
         row.addWidget(button("Run checks", self.check_health))
+        row.addWidget(button("Copy report", lambda: QApplication.clipboard().setText(self.health_output.toPlainText()), "quiet"))
         self.setup_button = button("Install missing dependencies", self.setup, "primary")
         row.addWidget(self.setup_button)
         layout.addWidget(header)
         layout.addWidget(label("Checks host commands, filesystem support and Linux namespaces. Mount permissions are tested when a workspace starts.", "muted", True))
+        self.health_summary = label("Run checks to inspect this host and workspace store.", "muted", True)
+        layout.addWidget(self.health_summary)
         self.health_output = QPlainTextEdit()
         self.health_output.setReadOnly(True)
         layout.addWidget(self.health_output, 1)
@@ -667,11 +730,11 @@ class Window(QMainWindow):
         layout.addWidget(self.terminal_button)
         self.offline = QCheckBox("Isolate network for this session")
         self.offline.setToolTip("Only loopback is available; internet and host networking are disconnected.")
-        self.offline.toggled.connect(lambda checked: self.network_choices.__setitem__(self.selected, checked) if self.selected else None)
+        self.offline.toggled.connect(lambda checked: self.save_session_choice("isolated", checked))
         layout.addWidget(self.offline)
         self.restricted = QCheckBox("Restrict devices for this session")
         self.restricted.setToolTip("The session gets a minimal /dev without host device nodes. Fewer tools will work; this is still not a security sandbox.")
-        self.restricted.toggled.connect(lambda checked: self.restricted_choices.__setitem__(self.selected, checked) if self.selected else None)
+        self.restricted.toggled.connect(lambda checked: self.save_session_choice("restricted", checked))
         layout.addWidget(self.restricted)
         layout.addWidget(label("SHARED FOLDER · /shared", "eyebrow"))
         self.share_path = QLineEdit()
@@ -711,6 +774,13 @@ class Window(QMainWindow):
             field_layout.addWidget(val_label)
             grid.addWidget(field, r, c, 1, span)
         layout.addWidget(metadata)
+        notes_header, notes_row = box(horizontal=True, spacing=8)
+        notes_row.addWidget(label("PERSONAL NOTES", "eyebrow"), 1)
+        self.notes_button = button("Edit notes…", self.edit_notes, "quiet")
+        notes_row.addWidget(self.notes_button)
+        layout.addWidget(notes_header)
+        self.notes_preview = label("", "muted", True)
+        layout.addWidget(self.notes_preview)
         layout.addStretch()
         actions, row = box(horizontal=True, spacing=8)
         self.save_snapshot_button = button("Save snapshot", self.snapshot)
@@ -745,7 +815,7 @@ class Window(QMainWindow):
         mode = self.filter.currentIndex()
         images = self.data["images"]
         if query:
-            images = [x for x in images if query in f"{x.get('name', '')} {x.get('profile', '')} {x.get('suite', '')}".casefold()]
+            images = [x for x in images if query in f"{x.get('name', '')} {x.get('profile', '')} {x.get('suite', '')} {self.workspace_notes(x['name'])}".casefold()]
         else:
             images = list(images)
         if mode == 1:
@@ -756,7 +826,17 @@ class Window(QMainWindow):
             images = [x for x in images if x["name"] in self.favorites]
         elif mode == 4:
             images = [x for x in images if x["status"] == "busy"]
-        images.sort(key=lambda x: (x["name"] not in self.favorites, x["name"].casefold()))
+        images.sort(key=lambda x: (x["name"].casefold(), x["name"]))
+        order = self.sort.currentData()
+        if order == "favorites":
+            images.sort(key=lambda x: x["name"] not in self.favorites)
+        elif order in ("recent", "created"):
+            field = "last_used_at" if order == "recent" else "created_at"
+            images.sort(key=lambda x: x.get(field, "") if x.get(field) not in ("never", "unknown") else "", reverse=True)
+        elif order in ("capacity", "allocated"):
+            field = "size_mib" if order == "capacity" else "allocated_bytes"
+            images.sort(key=lambda x: x.get(field, 0), reverse=True)
+        self.library_count.setText(f"{len(images)} of {len(self.data['images'])} workspaces")
         selected = self.selected
         self.workspaces.setUpdatesEnabled(False)
         self.workspaces.blockSignals(True)
@@ -814,15 +894,16 @@ class Window(QMainWindow):
         scroll_position = self.details.verticalScrollBar().value() if same_selection else 0
         self.selected = data["name"]
         fav = self.selected in self.favorites
-        isolated = self.network_choices.get(self.selected, False)
-        restricted = self.restricted_choices.get(self.selected, False)
+        isolated = self.session_choice(self.selected, "isolated")
+        restricted = self.session_choice(self.selected, "restricted")
+        notes = self.workspace_notes(self.selected)
         share, read_only = self.shared_folder_choice(self.selected)
         can_configure = not self.demo and not self.busy and data["status"] != "busy"
         state = (
             self.selected, data.get("status"), data.get("lifecycle"), data.get("suite"),
             data.get("profile"), data.get("size_mib"), data.get("allocated_bytes"),
             data.get("last_used_at"), data.get("snapshots"), data.get("path"),
-            fav, can_configure, isolated, share, read_only,
+            fav, can_configure, isolated, restricted, share, read_only, notes, self.demo,
         )
         if state != self._detail_state:
             self._detail_state = state
@@ -841,6 +922,10 @@ class Window(QMainWindow):
             self.restricted.setChecked(restricted)
             self.restricted.blockSignals(False)
             self.share_path.setText(share)
+            self.offline.setEnabled(can_configure)
+            self.restricted.setEnabled(can_configure)
+            self.notes_button.setEnabled(not self.demo)
+            self.notes_preview.setText(notes[:240] + ("…" if len(notes) > 240 else "") if notes else "Add project details or commands to remember.")
             self.share_path.setToolTip(share or "Choose a host folder to make it available at /shared.")
             self.share_choose.setEnabled(can_configure)
             self.share_clear.setEnabled(can_configure and bool(share))
@@ -865,6 +950,49 @@ class Window(QMainWindow):
     def selected_data(self):
         return next((x for x in self.data["images"] if x["name"] == self.selected), None)
 
+    def library_preferences_changed(self):
+        if not self.demo:
+            self.settings.setValue(self.session_settings_prefix + "/filter", self.filter.currentText())
+            self.settings.setValue(self.session_settings_prefix + "/sort", self.sort.currentData())
+        self.render_library()
+
+    def workspace_notes(self, target):
+        if target not in self.notes_cache:
+            self.notes_cache[target] = "" if self.demo else self.settings.value(self.session_settings_prefix + "/" + target + "/notes", "", type=str)[:4000]
+        return self.notes_cache[target]
+
+    def save_notes(self, target, text):
+        if self.demo:
+            return
+        name(target)
+        if len(text) > 4000:
+            raise ValueError("Notes must be at most 4,000 characters.")
+        self.notes_cache[target] = text
+        self.settings.setValue(self.session_settings_prefix + "/" + target + "/notes", text)
+        self.render_library()
+
+    def edit_notes(self):
+        target = self.selected
+        if not target or self.demo:
+            return
+        dialog = NotesDialog(target, self.workspace_notes(target), self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.save_notes(target, dialog.value())
+
+    def session_choice(self, target, option):
+        choices = self.network_choices if option == "isolated" else self.restricted_choices
+        if target not in choices:
+            choices[target] = False if self.demo else self.settings.value(self.session_settings_prefix + "/" + target + "/" + option, False, type=bool)
+        return choices[target]
+
+    def save_session_choice(self, option, checked):
+        if not self.selected:
+            return
+        choices = self.network_choices if option == "isolated" else self.restricted_choices
+        choices[self.selected] = checked
+        if not self.demo:
+            self.settings.setValue(self.session_settings_prefix + "/" + self.selected + "/" + option, checked)
+
     def shared_folder_choice(self, target):
         if target not in self.shared_folder_choices:
             key = self.session_settings_prefix + "/" + target
@@ -882,7 +1010,8 @@ class Window(QMainWindow):
                 self.settings.setValue(key + "/folder", path)
                 self.settings.setValue(key + "/read_only", read_only)
             else:
-                self.settings.remove(key)
+                self.settings.remove(key + "/folder")
+                self.settings.remove(key + "/read_only")
 
     def choose_shared_folder(self):
         target = self.selected
@@ -1045,7 +1174,7 @@ class Window(QMainWindow):
         self.new_button.setEnabled(not self.busy)
         self.empty_create.setEnabled(not self.busy)
         self.unlock_button.setEnabled(not self.busy and not self.demo)
-        self.setup_button.setEnabled(not self.busy and not self.demo and not self.health_ready)
+        self.setup_button.setEnabled(not self.busy and not self.demo and self.missing_dependencies)
         has_snapshot = self.chosen_snapshot() is not None
         self.restore_button.setEnabled(has_snapshot and not self.busy and not self.demo)
         self.drop_snapshot_button.setEnabled(has_snapshot and not self.busy and not self.demo)
@@ -1095,14 +1224,23 @@ class Window(QMainWindow):
         def done(ok, data):
             if ok:
                 self.health_ready = data["ready"]
+                checks = data.get("checks")
+                self.missing_dependencies = (any(check["status"] == "error" and
+                    (check["id"].startswith("command:") or check["id"] == "archive-keys")
+                    for check in checks) if checks is not None else not self.health_ready)
+                if "errors" in data and "warnings" in data:
+                    self.health_summary.setText(f"{data['errors']} blocking issues · {data['warnings']} warnings · Mount permissions are checked when a session starts.")
+                else:
+                    self.health_summary.setText("Host checks passed." if self.health_ready else "Review the host checks below.")
                 self.health_output.setPlainText(data["output"])
                 if not self.health_ready:
-                    self.show_notice("A few host dependencies are missing. Open Host health to install them before creating a workspace.")
+                    self.show_notice("Host health found blocking issues. Review the checks and suggested fixes before creating a workspace.")
                 elif self.client.writable:
                     self.notice.hide()
                 self.update_controls()
             else:
                 self.health_output.setPlainText(str(data))
+                self.health_summary.setText("Host checks could not be completed. Run checks to try again.")
         self.client.request("doctor", {}, done)
 
     def setup(self):
@@ -1170,6 +1308,10 @@ class Window(QMainWindow):
             event.ignore()
             return
         self.timer.stop()
+        if not self.demo:
+            self.settings.setValue("window/geometry", self.saveGeometry())
+            self.settings.setValue("window/splitter", self.splitter.sizes())
+            self.settings.sync()
         self.client.stop()
         event.accept()
 

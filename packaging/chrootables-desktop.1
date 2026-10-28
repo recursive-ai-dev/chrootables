@@ -1,0 +1,43 @@
+.TH CHROOTABLES-DESKTOP 1 "2026-10-27" "Chrootables" "User Commands"
+.SH NAME
+chrootables-desktop \- native workbench for local Debian image workspaces
+.SH SYNOPSIS
+.B chrootables-desktop
+.RI [ --store " directory" ]
+.RB [ --demo ]
+.RI [ --screenshot " file" ]
+.RB [ --version ]
+.SH DESCRIPTION
+Chrootables creates Debian filesystem images, opens interactive terminals,
+and manages clones, snapshots, disposable sessions, exports, and recovery.
+Launch the desktop as your normal user. Store changes request administrator
+access through a separate polkit helper. Terminal sessions authenticate with sudo.
+.SH OPTIONS
+.TP
+.BI --store " directory"
+Use an absolute workspace store other than the host root directory.
+The default is /var/lib/chrootable-manager.
+.TP
+.B --demo
+Explore a read-only tour with sample workspaces.
+.TP
+.BI --screenshot " file"
+Capture the window and exit; useful with --demo for verification.
+.TP
+.B --version
+Print the application version and exit.
+.TP
+.B --help
+Print command-line usage.
+.SH FILES
+.TP
+.I /var/lib/chrootable-manager
+Default store containing images, snapshots, exports, archives, logs and history.
+Store mutations require a root-owned directory that other users cannot write.
+.SH NOTES
+Workspaces run as host root and are intended for trusted development.
+They are not security sandboxes for hostile code.
+Disposable sessions discard image writes; writable shared host folders persist.
+Removing the package leaves workspace data intact.
+.SH SEE ALSO
+.BR chrootable-manager (1)

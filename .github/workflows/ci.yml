@@ -33,6 +33,18 @@ jobs:
       - name: Verify and build package (Debian)
         if: startsWith(matrix.container, 'debian')
         run: python3 scripts/check.py --require-desktop-integration --build-deb
+      - name: Build installable Debian artifact
+        if: startsWith(matrix.container, 'debian')
+        run: python3 scripts/build-deb.py
+      - name: Upload Debian package and checksum
+        if: startsWith(matrix.container, 'debian')
+        uses: actions/upload-artifact@v4
+        with:
+          name: chrootables-debian
+          path: |
+            dist/*.deb
+            dist/*.deb.sha256
+          if-no-files-found: error
 
   integration:
     name: integration (root, opt-in)

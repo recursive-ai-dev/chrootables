@@ -1,6 +1,28 @@
 # Changelog
 
-## Unreleased
+## v3.2.0 — 2026-10-27
+
+- Search personal workspace notes alongside names, profiles and releases.
+  Notes are saved per user, workspace and store; editing during a background
+  refresh keeps the original target. The tour never saves notes.
+- Sort by favorites, name, recent use, creation time, capacity or allocated
+  space. Remember filter/sort choices per store, window geometry, splitter
+  position, and per-workspace network/device settings. Clearing a shared
+  folder preserves the other workspace preferences.
+- Add 2,000 lines of terminal scrollback, mouse selection, Ctrl+Shift+C/V,
+  wheel and Shift+PageUp/PageDown navigation, and bracketed paste. Queue PTY
+  input without blocking the desktop when a guest stops reading.
+- Wait for the embedded session to release its PTY before opening an external
+  terminal, avoiding a race with the workspace lock. Handoff failures remain
+  visible and retryable; closing the session cancels a pending handoff.
+- Expand read-only host diagnostics with structured `--doctor --json` output,
+  actionable remedies, store ownership/access checks and capacity reporting.
+  Distinguish blocking errors from kernel/device warnings; only offer package
+  installation when dependency checks fail.
+- Build reproducible versioned Debian archives with normalized ownership,
+  modes and timestamps, payload checksums, compressed manuals/documentation,
+  atomic output and SHA256 sidecars. Add revision/overwrite controls and CI
+  package artifacts; synchronize desktop and CLI release versions.
 
 - Harden embedded terminal escape parsing against unsupported and oversized
   sequences, and keep RGB values within the renderer's range. Fix saved cursor

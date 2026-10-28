@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 
 APP_NAME="Chrootable Manager"
-APP_VERSION=3.0.0
+APP_VERSION=3.2.0
 SCRIPT_PATH=${BASH_SOURCE[0]}
 STORE_DIR=${CHROOTABLE_HOME:-/var/lib/chrootable-manager}
 DEBIAN_SUITE=${CHROOTABLE_DEBIAN_SUITE:-stable}
@@ -1067,40 +1067,135 @@ show_logs() {
     printf 'Log: %s\n\n' "$latest"
     tail -n 200 "$latest"
 }
-doctor() {
-    local command missing=0 fs namespace
+# Bash dynamic scope keeps the collected checks local to each doctor invocation.
+doctor_check() {
+    health_ids+=("$1"); health_statuses+=("$2")
+    health_messages+=("$3"); health_remedies+=("${4:-}")
+    case $2 in
+        error) health_errors=$((health_errors + 1)) ;;
+        warning) health_warnings=$((health_warnings + 1)) ;;
+    esac
+}
+doctor_report() {
+    local i status
     printf 'CHROOTABLE / Host health\n\n'
-    printf 'Host: %s / %s\nStore: %s\n\n' "$(uname -s)" "$(uname -m)" "$STORE_DIR"
+    printf 'Host: %s / %s\nVersion: %s\nStore: %s\n\n' "$health_host" "$health_arch" "$APP_VERSION" "$STORE_DIR"
+    for i in "${!health_ids[@]}"; do
+        case ${health_statuses[$i]} in
+            ok) status=OK ;; error) status=MISSING ;; warning) status=WARN ;; *) status=INFO ;;
+        esac
+        printf '[%s] %s\n' "$status" "${health_messages[$i]}"
+        [[ -z ${health_remedies[$i]} ]] || printf '       %s\n' "${health_remedies[$i]}"
+    done
+    printf '\n%s blocking issue(s), %s warning(s).\n' "$health_errors" "$health_warnings"
+    printf 'Mount permissions are not tested by this read-only check.\n'
+}
+doctor() {
+    local command fs namespace owner permissions probe disk header line i comma= report
+    local health_host health_arch health_errors=0 health_warnings=0
+    local free_bytes=0 total_bytes=0 storage_available=false
+    local -a health_ids=() health_statuses=() health_messages=() health_remedies=()
+    health_host=$(uname -s); health_arch=$(uname -m)
     for command in "${REQUIRED_COMMANDS[@]}"; do
-        if ! command -v "$command" >/dev/null 2>&1; then
-            printf '[MISSING] %-14s install %s\n' "$command" "$(package_for_command "$command")"
-            missing=$((missing + 1))
+        if command -v "$command" >/dev/null 2>&1; then
+            doctor_check "command:$command" ok "Host command: $command"
+        else
+            doctor_check "command:$command" error "Missing host command: $command" "Install $(package_for_command "$command"), or run sudo $0 --setup."
         fi
     done
-    (( missing != 0 )) || printf '[OK] Host commands are available.\n'
     if [[ -r /usr/share/keyrings/debian-archive-keyring.gpg ]]; then
-        printf '[OK] Debian archive signing keys are available.\n'
+        doctor_check archive-keys ok 'Debian archive signing keys are available.'
     else
-        printf '[MISSING] Debian archive signing keys; run --setup.\n'
-        missing=$((missing + 1))
+        doctor_check archive-keys error 'Debian archive signing keys are unavailable.' "Run sudo $0 --setup."
     fi
     for fs in ext4 overlay; do
-        if awk -v fs="$fs" '$NF==fs {found=1} END {exit !found}' /proc/filesystems; then printf '[OK] Kernel filesystem: %s\n' "$fs"
-        else printf '[INFO] %s is not loaded; it may be available as a kernel module.\n' "$fs"; fi
+        if command -v awk >/dev/null && awk -v fs="$fs" '$NF==fs {found=1} END {exit !found}' /proc/filesystems; then
+            doctor_check "filesystem:$fs" ok "Kernel filesystem: $fs"
+        else
+            doctor_check "filesystem:$fs" warning "$fs is not loaded; it may be available as a kernel module." "Check that your kernel provides $fs support."
+        fi
     done
     for namespace in mnt uts ipc pid net; do
-        if [[ -e /proc/self/ns/$namespace ]]; then printf '[OK] Namespace: %s\n' "$namespace"
-        else printf '[MISSING] Namespace: %s\n' "$namespace"; missing=$((missing + 1)); fi
+        if [[ -e /proc/self/ns/$namespace ]]; then
+            doctor_check "namespace:$namespace" ok "Namespace: $namespace"
+        else
+            doctor_check "namespace:$namespace" error "Missing namespace: $namespace" 'Use a Linux host with mount, UTS, IPC, PID and network namespace support.'
+        fi
     done
-    if [[ -e /dev/loop-control ]]; then printf '[OK] Loop device control exists.\n'
-    else printf '[INFO] /dev/loop-control is unavailable; image mounts may be blocked.\n'; fi
-    if [[ -d $STORE_DIR ]]; then
-        if [[ -r $STORE_DIR && -x $STORE_DIR ]]; then printf '[OK] Store is readable.\n'; df -Ph "$STORE_DIR"
-        else printf '[INFO] Store needs root access.\n'; fi
-    else printf '[INFO] Store will be created on the first write operation.\n'; fi
-    printf '\nMount permissions are not tested by this read-only check.\n'
-    printf 'Install missing tools: sudo %s --setup\n' "$0"
-    (( missing == 0 ))
+    if [[ -e /dev/loop-control ]]; then
+        doctor_check loop-control ok 'Loop device control exists.'
+    else
+        doctor_check loop-control warning '/dev/loop-control is unavailable; image mounts may be blocked.' 'Check the loop kernel module and host/container device access.'
+    fi
+    if [[ $STORE_DIR != /* || $STORE_DIR == / ]]; then
+        doctor_check store-path error 'The store must be an absolute directory other than /.' 'Set CHROOTABLE_HOME to a dedicated directory.'
+    elif [[ -L $STORE_DIR ]]; then
+        doctor_check store-path error 'The workspace store is a symbolic link.' 'Choose the real store directory instead of a symlink.'
+    elif [[ -e $STORE_DIR && ! -d $STORE_DIR ]]; then
+        doctor_check store-path error 'The workspace store exists but is not a directory.' 'Choose a dedicated directory for the workspace store.'
+    elif [[ -d $STORE_DIR ]]; then
+        if read -r owner permissions < <(stat -c '%u %a' -- "$STORE_DIR" 2>/dev/null); then
+            if [[ $owner != 0 ]] || (( (8#$permissions & 0022) != 0 )); then
+                doctor_check store-permissions error 'The store must be owned by root and not writable by group or others.' 'Choose a protected root-owned store before performing administrator operations.'
+            else
+                doctor_check store-permissions ok 'Store ownership and permissions are suitable for administrator operations.'
+            fi
+        else
+            doctor_check store-permissions info 'Store ownership could not be inspected without administrator access.'
+        fi
+        if [[ -r $STORE_DIR && -x $STORE_DIR ]]; then
+            doctor_check store-access ok 'Store is readable.'
+        else
+            doctor_check store-access info 'Store needs administrator access.' 'Unlock the store in the desktop to view and modify workspaces.'
+        fi
+        for probe in images logs exports snapshots; do
+            if [[ -L $STORE_DIR/$probe ]]; then
+                doctor_check "store:$probe" error "Store subdirectory is a symlink: $probe" 'Choose a store with real subdirectories before performing administrator operations.'
+            fi
+        done
+    else
+        doctor_check store-access info 'Store will be created on the first write operation.'
+    fi
+    # Inspect the nearest existing parent without creating the store. GNU df's
+    # byte output does not depend on locale or the caller's block-size settings.
+    probe=$STORE_DIR
+    if [[ $probe == /* ]]; then
+        while [[ ! -e $probe && $probe != / ]]; do probe=${probe%/*}; [[ -n $probe ]] || probe=/; done
+        if disk=$(LC_ALL=C df -B1 --output=size,avail -- "$probe" 2>/dev/null); then
+            { IFS= read -r header; read -r total_bytes free_bytes; } <<<"$disk" || true
+            if [[ $total_bytes =~ ^[0-9]+$ && $free_bytes =~ ^[0-9]+$ ]]; then
+                storage_available=true
+                if (( free_bytes < 2147483648 )); then
+                    doctor_check store-capacity warning "Less than 2 GiB is available on the store filesystem ($free_bytes bytes)." 'Free space or choose a larger store; creation reserves the requested image capacity.'
+                else
+                    doctor_check store-capacity ok "Store filesystem has $(human_bytes "$free_bytes") available."
+                fi
+            else
+                free_bytes=0; total_bytes=0
+            fi
+        fi
+    fi
+    if [[ $storage_available == false ]]; then
+        doctor_check store-capacity warning 'Available store capacity could not be determined.' 'Unlock the store and recheck host health before creating an image.'
+    fi
+    if [[ ${1:-} == json ]]; then
+        report=$(doctor_report)
+        printf '{"schema_version":1,"ready":%s,"errors":%s,"warnings":%s,"version":' "$([[ $health_errors == 0 ]] && printf true || printf false)" "$health_errors" "$health_warnings"
+        json_string "$APP_VERSION"; printf ',"host":'; json_string "$health_host"
+        printf ',"architecture":'; json_string "$health_arch"; printf ',"store":'; json_string "$STORE_DIR"
+        printf ',"storage":{"available":%s,"free_bytes":%s,"total_bytes":%s},"checks":[' "$storage_available" "$free_bytes" "$total_bytes"
+        for i in "${!health_ids[@]}"; do
+            printf '%s{"id":' "$comma"; json_string "${health_ids[$i]}"
+            printf ',"status":'; json_string "${health_statuses[$i]}"
+            printf ',"message":'; json_string "${health_messages[$i]}"
+            printf ',"remedy":'; json_string "${health_remedies[$i]}"; printf '}'
+            comma=,
+        done
+        printf '],"output":'; json_string "$report"; printf '}\n'
+    else
+        doctor_report
+    fi
+    (( health_errors == 0 ))
 }
 
 ui_init() {
@@ -1320,7 +1415,7 @@ Explore (no root required when the store is readable)
   --snapshots NAME                  List recovery points, even after deletion
   --activity                       Recent operation history
   --logs NAME                      Last completed operation log (200 lines)
-  --doctor                         Read-only host readiness checks
+  --doctor [--json]                Read-only host readiness and storage checks
   --demo [--dashboard]              Explore sample workspaces without root
   --help | --version
 
@@ -1407,7 +1502,8 @@ validate_session_arguments() {
 }
 validate_cli() {
     case ${1:-} in
-        --help|-h|--version|--dashboard|--profiles|--activity|--doctor|--setup) [[ $# == 1 ]] ;;
+        --help|-h|--version|--dashboard|--profiles|--activity|--setup) [[ $# == 1 ]] ;;
+        --doctor) [[ $# == 1 || ( $# == 2 && $2 == --json ) ]] ;;
         --list) [[ $# == 1 || ( $# == 2 && $2 == --json ) ]] ;;
         --demo) [[ $# == 1 || ( $# == 2 && $2 == --dashboard ) ]] ;;
         --inspect) [[ $# == 2 || ( $# == 3 && $3 == --json ) ]] && valid_name "$2" ;;
@@ -1427,7 +1523,7 @@ run_cli() {
     local image operation=$1 lifecycle
     case $operation in
         --help|-h) usage ;; --version) printf '%s\n' "$APP_VERSION" ;;
-        --profiles) list_profiles ;; --doctor) doctor ;; --demo) run_demo "${2:-}" ;;
+        --profiles) list_profiles ;; --doctor) doctor "${2:+json}" ;; --demo) run_demo "${2:-}" ;;
         --dashboard) dashboard ;; --list) list_images "${2:+json}" ;;
         --activity) activity ;; --logs) show_logs "$2" ;; --snapshots) list_snapshots "$2" ;;
         --setup) info "All host dependencies are available." ;;

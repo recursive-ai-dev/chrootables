@@ -1,60 +1,57 @@
 # Chrootables Roadmap
 
-Status as of 2026-10-19. v3.0.0 desktop is released: Qt desktop and Bash CLI share
-one image store, Debian 12/13 images with profiles, snapshots and recovery
-points, disposable OverlayFS sessions, shared host folders, polkit-gated
-privileged helper. Five audit passes are complete (stabilization, backend
-performance, frontend performance, dependency security, resource efficiency)
-with regression tests. 69 unit tests, plus an opt-in root integration suite.
+Status as of 2026-10-27. v3.2.0 adds searchable workspace notes, saved library
+and session preferences, terminal scrollback/clipboard support, structured host
+diagnostics, and reproducible Debian packages. Qt desktop and Bash CLI share one
+image store. Debian 12/13 profiles, snapshots, disposable sessions, shared folders,
+restricted devices, and offline bootstrap archives are implemented. Historical
+audit reports remain under `docs/`; root integration is an opt-in test suite.
 
-## Phase 0 — Land the current work (now)
+## Release checks
 
-- Commit the uncommitted stabilization/audit changes; the five audit reports at
-  the repo root are untracked.
 - Keep the audit findings as regression baselines: any change must keep the
   measured latency budgets (24-workspace inventory <= 80 ms, per-render
   main-thread work <= 2 ms on background polls).
-- Tag the next release (v3.1.0) once the working tree is clean and tests pass.
+- Run `scripts/check.py --require-desktop-integration --build-deb`, the package
+  installation simulation, and the opt-in root integration suite before publishing.
+- Choose an upstream license and add its metadata before public redistribution.
+- Commit and tag releases only when requested by the maintainer.
 
 ## Phase 1 — Release engineering
 
-- CI: GitHub Actions running `python3 -m unittest discover -s tests`,
-  `bash -n chrootable-manager`, and the offscreen `--demo --screenshot` run on
-  Fedora and Debian containers, with the root integration suite as an
-  opt-in manual job.
-- Packaging: publish to COPR (Fedora) and a PPA or OBS (Debian/Ubuntu) so the
-  app installs without a checkout; keep `scripts/install-desktop.py` as the
-  source-checkout path.
+- Implemented: GitHub Actions checks on Fedora and Debian, an opt-in root
+  integration job, and downloadable `.deb`/SHA256 artifacts.
+- Next: signed package repositories (COPR, PPA or OBS), source packages and
+  automated installation/upgrade/removal verification in disposable systems.
+  Keep `scripts/install-desktop.py` as the source-checkout path.
 - Release hygiene: audit reports live under `docs/` as historical baselines;
   maintain the CHANGELOG for each release.
 - Support matrix: document tested host distros and Python/PySide6 versions.
 
 ## Phase 2 — Reach
 
-- Host distros beyond dnf/apt: Arch, openSUSE in `package_for_command` /
-  `check_prerequisites`, with per-distro test coverage.
+- Implemented: best-effort Arch/openSUSE dependency mappings and Rust, Go,
+  and Node.js development profiles.
 - ARM64 images (aarch64 debootstrap is already suite-driven; verify loop
   mount, OverlayFS, and terminal paths on arm64 hosts).
-- Profiles: Rust, Go, and a web-dev profile, following the existing profile
-  pattern in `chrootable-manager` and `chrootables/backend.py`.
+- Next: additional host coverage beyond the Debian/Fedora CI matrix.
 
 ## Phase 3 — Product features (currently stated non-goals)
 
 Evaluate before building; these are the README's explicit "does not implement"
 items, so each needs a decision, not just code:
 
-- Embedded terminal widget (QTerminal/libvte via PySide6) to remove the
-  Konsole/GNOME Terminal/xterm dependency — highest user-visible value of the
-  three.
+- Implemented: embedded PTY terminal with a compact VT/ANSI subset. Improve
+  Unicode cell widths and full-screen terminal fidelity as a separate track.
 - Ubuntu and derivatives as additional suites alongside Debian.
-- OCI app store / graphical application export — largest scope; only after
-  the embedded terminal and packaging land.
+- OCI app store / graphical application export — requires a separate product
+  decision and execution model.
 
 ## Phase 4 — Security model (long term)
 
 - The trust model is explicit: trusted development, host root, full `/dev`.
   Any hardening track must not blur that promise silently. Candidates:
-  - Optional restricted `/dev` mode (no direct disk/device access) per session.
+  - Implemented: optional restricted `/dev` mode per session.
   - Rootless operation via user namespaces and fuse-overlayfs as a separate,
   clearly labeled mode — not a swap of the existing model.
 

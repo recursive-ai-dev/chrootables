@@ -1,0 +1,136 @@
+.TH CHROOTABLE-MANAGER 1 "2026-10-27" "Chrootables" "User Commands"
+.SH NAME
+chrootable-manager \- create and maintain local Debian image workspaces
+.SH SYNOPSIS
+.B chrootable-manager
+.RI [ command " arguments..." ]
+.SH DESCRIPTION
+The Bash interface shares the desktop's image store. With no command, it opens
+an interactive dashboard. Run mutations and workspace sessions as root.
+Read-only commands work without root when the store is readable.
+.SH READ-ONLY COMMANDS
+.TP
+.B --dashboard
+Show workspace and storage usage.
+.TP
+.B --list [--json]
+List images as TSV or JSON.
+.TP
+.B --inspect NAME [--json]
+Show image details.
+.TP
+.B --snapshots NAME
+List recovery points, including those of a deleted image.
+.TP
+.B --profiles
+List the minimal, build, python, network, rust, go and web profiles.
+.TP
+.B --doctor [--json]
+Check host readiness and store capacity without installing packages.
+JSON output includes individual checks, errors, warnings and storage byte counts.
+.TP
+.B --activity
+Show recent operation history.
+.TP
+.B --logs NAME
+Show the most recent completed operation log.
+.TP
+.B --demo [--dashboard]
+Show sample workspaces.
+.TP
+.B --help | --version
+Show detailed usage or the version.
+.SH CREATE AND USE
+.TP
+.B --create NAME SIZE_MIB persistent|ephemeral [PROFILE]
+Create an image, reserving its entire capacity. Sizes range from 512 MiB to 1 TiB.
+.TP
+.B --archive-sync SUITE [PROFILE...]
+Download signed bootstrap and profile packages for offline creation.
+.TP
+.B --enter NAME [SESSION_OPTIONS]
+Open a root shell using the image's default lifecycle.
+.TP
+.B --enter-isolated NAME [SESSION_OPTIONS]
+Open a shell without host network access.
+.TP
+.B --exec NAME [SESSION_OPTIONS] -- COMMAND [ARG...]
+Run a command.
+.TP
+.B --try NAME [SESSION_OPTIONS] [-- COMMAND [ARG...]]
+Use a disposable OverlayFS session regardless of the image lifecycle.
+.TP
+.B --clone NAME NEW_NAME
+Make an independent image copy, using reflinks when available.
+.TP
+.B --mode NAME persistent|ephemeral
+Change the default lifecycle.
+.TP
+.B --resize NAME SIZE_MIB
+Expand an image; shrinking is unsupported.
+.TP
+.B --export NAME
+Create a compressed filesystem archive and print its path.
+.SH SESSION OPTIONS
+.TP
+.B --isolated
+Isolate networking for --exec or --try.
+.TP
+.B --share /absolute/host/folder
+Mount an existing host folder at /shared for the session. The host root cannot be shared.
+.TP
+.B --read-only
+Make the shared folder read-only for ordinary filesystem writes.
+.TP
+.B --restricted-dev
+Expose a minimal /dev instead of the host's device nodes.
+.SH RECOVERY AND MAINTENANCE
+.TP
+.B --snapshot NAME LABEL
+Save an offline recovery point.
+.TP
+.B --restore NAME LABEL --yes
+Save current state as a recovery point, then restore a snapshot.
+.TP
+.B --drop-snapshot NAME LABEL --yes
+Permanently remove one snapshot.
+.TP
+.B --repair NAME --yes
+Force an ext4 filesystem check and repair.
+.TP
+.B --delete NAME --yes
+Delete the image, retaining snapshots and exports.
+.TP
+.B --setup
+Install missing host prerequisites through the host package manager.
+.SH ENVIRONMENT
+.TP
+.B CHROOTABLE_HOME
+Store path; defaults to /var/lib/chrootable-manager.
+.TP
+.B CHROOTABLE_DEBIAN_SUITE
+Debian suite used for creation; defaults to stable.
+.TP
+.B CHROOTABLE_DEBIAN_MIRROR
+Debian mirror; defaults to https://deb.debian.org/debian.
+.TP
+.B CHROOTABLE_AUTO_INSTALL
+Set to 0 to prevent automatic prerequisite installation.
+.TP
+.B CHROOTABLE_ARCHIVE
+Set to 0 to bypass the offline archive.
+.SH EXAMPLES
+.nf
+sudo chrootable-manager --create compiler 4096 persistent build
+sudo chrootable-manager --snapshot compiler clean
+sudo chrootable-manager --try compiler -- gcc --version
+sudo chrootable-manager --restore compiler clean --yes
+.fi
+.SH NOTES
+Workspaces run as host root and are intended for trusted development, not
+hostile code. Guest root can alter mounts. Disposable sessions do not undo
+writes to shared host folders. Busy images cannot be maintained.
+.SH SEE ALSO
+.BR chrootables-desktop (1),
+.BR debootstrap (8),
+.BR chroot (8)

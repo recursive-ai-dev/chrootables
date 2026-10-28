@@ -7,6 +7,7 @@ tooling: shell prompts, apt/dpkg progress, compilers and editors.
 from __future__ import annotations
 
 import codecs
+from collections import deque
 import fcntl
 import os
 import signal
@@ -16,10 +17,11 @@ import termios
 
 from PySide6.QtCore import QObject, QSocketNotifier, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter
-from PySide6.QtWidgets import QDialog, QHBoxLayout, QMessageBox, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QDialog, QHBoxLayout, QMessageBox, QPushButton, QVBoxLayout, QWidget
 
 DEFAULT_ROWS = 24
 DEFAULT_COLUMNS = 80
+DEFAULT_SCROLLBACK = 2000
 
 BOLD = 1 << 0
 ITALIC = 1 << 1
@@ -85,7 +87,7 @@ class VtScreen:
     consumed and ignored so broken output degrades to plain text.
     """
 
-    def __init__(self, rows=DEFAULT_ROWS, columns=DEFAULT_COLUMNS):
+    def __init__(self, rows=DEFAULT_ROWS, columns=DEFAULT_COLUMNS, scrollback=DEFAULT_SCROLLBACK):
         self.rows = rows
         self.columns = columns
         self.lines = [self._blank_line() for _ in range(rows)]
@@ -100,6 +102,9 @@ class VtScreen:
         self.style = DEFAULT_STYLE
         self._state = _GROUND
         self._params = ""
+        self.history = deque(maxlen=max(0, scrollback))
+        self.history_count = 0
+        self.bracketed_paste = False
 
     def _blank_line(self):
         return [(" ", DEFAULT_STYLE)] * self.columns
@@ -112,6 +117,9 @@ class VtScreen:
 
     def _scroll_up(self, count=1):
         for _ in range(min(count, self._bottom - self._top + 1)):
+            if not self._alt_active and self._top == 0 and self._bottom == self.rows - 1:
+                self.history.append(self.lines[0])
+                self.history_count += 1
             del self.lines[self._top]
             self.lines.insert(self._bottom, self._blank_line())
 
@@ -196,7 +204,9 @@ class VtScreen:
             self.row = count() - 1
         elif final == "J":
             mode = self._param(0, 0) if self._param_count() else 0
-            if mode == 0:
+            if mode == 3:
+                self.history.clear()
+            elif mode == 0:
                 self._erase(self.row, self.column, self.columns)
                 for line in range(self.row + 1, self.rows):
                     self._erase(line, 0, self.columns)
@@ -316,6 +326,8 @@ class VtScreen:
                 continue
             if value == 25:
                 self.cursor_visible = enable
+            elif value == 2004:
+                self.bracketed_paste = enable
             elif value in (1049, 1047, 47):
                 self._switch_screen(enable, save_cursor=(value == 1049))
 
@@ -337,11 +349,16 @@ class VtScreen:
         self._clamp_cursor()
 
     def _reset(self):
-        self.rows, self.columns = self.rows, self.columns
         self.lines = [self._blank_line() for _ in range(self.rows)]
         self.row = self.column = 0
         self._top, self._bottom = 0, self.rows - 1
         self.style = DEFAULT_STYLE
+        self.history.clear()
+        self._primary = None
+        self._alt_active = False
+        self.bracketed_paste = False
+        self.cursor_visible = True
+        self._saved_cursor = (0, 0)
 
     # -- public interface ---------------------------------------------------
 
@@ -438,6 +455,16 @@ class VtScreen:
         """Visible text, one line per row, trailing spaces trimmed."""
         return "\n".join("".join(cell[0] for cell in line).rstrip() for line in self.lines)
 
+    def viewport(self, offset=0):
+        """Return the visible grid, optionally looking back through primary history."""
+        if not offset or self._alt_active:
+            return self.lines
+        offset = max(0, min(offset, len(self.history)))
+        lines = list(self.history) + self.lines
+        start = len(self.history) - offset
+        return [(line[:self.columns] + self._blank_line())[:self.columns]
+                for line in lines[start:start + self.rows]]
+
 
 def key_to_bytes(key, text, ctrl=False, alt=False):
     """Translate a Qt key event into the bytes sent to the session."""
@@ -475,6 +502,7 @@ class PtyProcess(QObject):
         self.master, slave = os.openpty()
         try:
             self._set_window_size(slave, rows, columns)
+            os.set_blocking(self.master, False)
             environment = dict(os.environ)
             environment.setdefault("TERM", "xterm-256color")
             if env:
@@ -491,6 +519,10 @@ class PtyProcess(QObject):
         self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self._notifier = QSocketNotifier(self.master, QSocketNotifier.Type.Read, self)
         self._notifier.activated.connect(self._readable)
+        self._pending_input = bytearray()
+        self._write_notifier = QSocketNotifier(self.master, QSocketNotifier.Type.Write, self)
+        self._write_notifier.setEnabled(False)
+        self._write_notifier.activated.connect(self._flush_input)
         self._finished = False
         self._reaper = QTimer(self)
         self._reaper.setInterval(25)
@@ -505,10 +537,14 @@ class PtyProcess(QObject):
             return
         try:
             data = os.read(self.master, 65536)
+        except (BlockingIOError, InterruptedError):
+            return
         except OSError:
             data = b""
         if not data:
             self._notifier.setEnabled(False)
+            self._write_notifier.setEnabled(False)
+            self._pending_input.clear()
             descriptor, self.master = self.master, None
             os.close(descriptor)
             remaining = self._decoder.decode(b"", final=True)
@@ -531,10 +567,21 @@ class PtyProcess(QObject):
             return
         if isinstance(payload, str):
             payload = payload.encode("utf-8")
+        self._pending_input.extend(payload)
+        self._flush_input()
+
+    def _flush_input(self):
+        """Drain queued input without blocking the UI on a busy or stopped guest."""
+        if self.master is None:
+            return
         try:
-            os.write(self.master, payload)
-        except OSError:
+            written = os.write(self.master, self._pending_input[:65536]) if self._pending_input else 0
+            del self._pending_input[:written]
+        except (BlockingIOError, InterruptedError):
             pass
+        except OSError:
+            self._pending_input.clear()
+        self._write_notifier.setEnabled(bool(self._pending_input))
 
     def resize(self, rows, columns):
         if self.master is None:
@@ -565,7 +612,14 @@ class TerminalPane(QWidget):
         super().__init__(parent)
         self.screen = VtScreen()
         self.process = None
+        self.scroll_offset = 0
+        self._selection_start = None
+        self._selection_end = None
+        self._selecting = False
         self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.setCursor(Qt.CursorShape.IBeamCursor)
+        self.setToolTip("Select text to copy with Ctrl+Shift+C. Paste with Ctrl+Shift+V. "
+                        "Scroll with the mouse wheel or Shift+PageUp / PageDown.")
         font = QFont("Monospace")
         font.setStyleHint(QFont.StyleHint.Monospace)
         font.setPointSize(10)
@@ -584,11 +638,21 @@ class TerminalPane(QWidget):
         process.finished.connect(self._on_finished)
 
     def _on_output(self, text):
+        previous_count = self.screen.history_count
+        previous_alt = self.screen._alt_active
         self.screen.feed(text)
+        if self.screen._alt_active or previous_alt != self.screen._alt_active:
+            self.scroll_offset = 0
+        elif self.scroll_offset:
+            # Keep the same historical output in view as more lines arrive.
+            self.scroll_offset = min(len(self.screen.history), self.scroll_offset +
+                                     self.screen.history_count - previous_count)
+        self.clear_selection()
         self.update()
 
     def _on_finished(self, code):
-        self.screen.feed(f"\n[session exited with code {code}]")
+        self._on_output(f"\r\n[session exited with code {code}]")
+        self._blink.stop()
         self._cursor_shown = False
         self.update()
 
@@ -605,6 +669,7 @@ class TerminalPane(QWidget):
     def resizeEvent(self, event):
         rows, columns = self._cells()
         self.screen.resize(rows, columns)
+        self.clear_selection()
         if self.process is not None:
             self.process.resize(rows, columns)
         super().resizeEvent(event)
@@ -623,7 +688,7 @@ class TerminalPane(QWidget):
         foreground = QColor("#e6e6e2")
         painter.fillRect(self.rect(), background)
         painter.setFont(self.font)
-        for row, line in enumerate(self.screen.lines):
+        for row, line in enumerate(self.screen.viewport(self.scroll_offset)):
             y = row * self.cell_height
             run_start = 0
             previous = line[0][1]
@@ -645,27 +710,123 @@ class TerminalPane(QWidget):
                                      y + self._metrics.ascent(), text)
                     run_start = column
                     previous = style
-        if self._cursor_shown and self.process is not None and self.process.running:
+        if self._selection_start is not None and self._selection_end is not None:
+            start, end = sorted((self._selection_start, self._selection_end))
+            for row in range(start[0], end[0] + 1):
+                left = start[1] if row == start[0] else 0
+                right = end[1] if row == end[0] else self.screen.columns
+                painter.fillRect(left * self.cell_width, row * self.cell_height,
+                                 (right - left) * self.cell_width, self.cell_height,
+                                 QColor(100, 160, 220, 100))
+        if (not self.scroll_offset and self._cursor_shown and self.process is not None
+                and self.process.running):
             painter.fillRect(self.screen.column * self.cell_width,
                              self.screen.row * self.cell_height,
                              self.cell_width, self.cell_height, foreground)
 
     def keyPressEvent(self, event):
+        modifiers = event.modifiers()
+        shift = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
+        ctrl = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
+        if ctrl and shift and event.key() == Qt.Key.Key_C:
+            text = self.selected_text()
+            if text:
+                QApplication.clipboard().setText(text)
+            event.accept()
+            return
+        if ctrl and shift and event.key() == Qt.Key.Key_V:
+            self.paste(QApplication.clipboard().text())
+            event.accept()
+            return
+        if shift and event.key() in (Qt.Key.Key_PageUp, Qt.Key.Key_PageDown):
+            self.scroll((self.screen.rows - 1) *
+                        (1 if event.key() == Qt.Key.Key_PageUp else -1))
+            event.accept()
+            return
         if self.process is None or not self.process.running:
             super().keyPressEvent(event)
             return
-        modifiers = event.modifiers()
         payload = key_to_bytes(
             event.key(), event.text(),
             bool(modifiers & Qt.KeyboardModifier.ControlModifier),
             bool(modifiers & Qt.KeyboardModifier.AltModifier),
         )
         if payload:
+            self.scroll_offset = 0
+            self.clear_selection()
             self.process.write(payload)
+            self.update()
+
+    def scroll(self, lines):
+        if not self.screen._alt_active:
+            self.scroll_offset = max(0, min(len(self.screen.history), self.scroll_offset + lines))
+            self.clear_selection()
+            self.update()
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        lines = int(delta / 120 * 3) if delta else int(event.pixelDelta().y() / self.cell_height)
+        self.scroll(lines)
+        event.accept()
+
+    def clear_selection(self):
+        self._selection_start = self._selection_end = None
+        self._selecting = False
+
+    def _cell_at(self, position):
+        return (max(0, min(self.screen.rows - 1, int(position.y()) // self.cell_height)),
+                max(0, min(self.screen.columns, int(position.x()) // self.cell_width)))
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.setFocus()
+            self._selection_start = self._selection_end = self._cell_at(event.position())
+            self._selecting = True
+            self.update()
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._selecting:
+            self._selection_end = self._cell_at(event.position())
+            self.update()
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._selecting:
+            self._selection_end = self._cell_at(event.position())
+            self._selecting = False
+            self.update()
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+    def selected_text(self):
+        if self._selection_start is None or self._selection_end is None:
+            return ""
+        start, end = sorted((self._selection_start, self._selection_end))
+        lines = self.screen.viewport(self.scroll_offset)
+        selected = []
+        for row in range(start[0], end[0] + 1):
+            left = start[1] if row == start[0] else 0
+            right = end[1] if row == end[0] else self.screen.columns
+            selected.append("".join(cell[0] for cell in lines[row][left:right]).rstrip())
+        return "\n".join(selected)
 
     def paste(self, text):
         if self.process is not None and self.process.running and text:
-            self.process.write(text.encode("utf-8"))
+            # Keep embedded escapes from terminating the bracketed block early.
+            text = text.replace("\x1b", "").replace("\r\n", "\n").replace("\r", "\n")
+            payload = text.replace("\n", "\r").encode("utf-8")
+            if self.screen.bracketed_paste:
+                payload = b"\x1b[200~" + payload + b"\x1b[201~"
+            self.scroll_offset = 0
+            self.clear_selection()
+            self.process.write(payload)
+            self.update()
 
 
 class TerminalWindow(QDialog):
@@ -677,6 +838,7 @@ class TerminalWindow(QDialog):
         self.resize(760, 480)
         self._external = external
         self._closing = False
+        self._external_pending = False
         layout = QVBoxLayout(self)
         self.pane = TerminalPane()
         self.process = PtyProcess(command, parent=self)
@@ -695,9 +857,21 @@ class TerminalWindow(QDialog):
         layout.addLayout(buttons)
 
     def _open_external(self):
+        if self._closing or self._external is None:
+            return
+        self._external_pending = True
+        if self._begin_close():
+            self._complete_handoff()
+
+    def _complete_handoff(self):
+        # The image lock belongs to the embedded process. Wait until it has
+        # exited and the PTY has closed before launching its replacement.
+        self._external_pending = False
+        self._closing = True
         try:
             self._external()
         except (RuntimeError, ValueError) as error:
+            self._closing = False
             QMessageBox.warning(self, "Chrootables", str(error))
             return
         self.close()
@@ -705,6 +879,7 @@ class TerminalWindow(QDialog):
     def closeEvent(self, event):
         # Closing the window ends the session, matching the CLI's rule that
         # closing the terminal releases the image lock.
+        self._external_pending = False
         if self._begin_close():
             super().closeEvent(event)
         else:
@@ -721,9 +896,13 @@ class TerminalWindow(QDialog):
 
     def reject(self):
         # Escape calls reject directly, bypassing closeEvent.
+        self._external_pending = False
         if self._begin_close():
             super().reject()
 
     def _session_finished(self, code):
         if self._closing:
-            self.close()
+            if self._external_pending:
+                self._complete_handoff()
+            else:
+                self.close()
