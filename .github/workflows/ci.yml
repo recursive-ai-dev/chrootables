@@ -24,13 +24,28 @@ jobs:
     steps:
       - name: Install dependencies (Fedora)
         if: startsWith(matrix.container, 'fedora')
-        run: dnf install -y --setopt=install_weak_deps=False git python3-pyside6 python3-gobject-base desktop-file-utils rpm-build
+        run: dnf install -y --setopt=install_weak_deps=False git python3-pyside6 python3-gobject-base desktop-file-utils rpm-build dpkg
       - name: Install dependencies (Debian)
         if: startsWith(matrix.container, 'debian')
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git ca-certificates python3-pyside6.qtcore python3-pyside6.qtgui python3-pyside6.qtwidgets python3-pyside6.qttest python3-gi gir1.2-glib-2.0 desktop-file-utils dpkg
       - uses: actions/checkout@v4
+      - name: "TEMP: cancel diagnostics"
+        continue-on-error: true
+        run: |
+          grep -E 'Sig(Blk|Ign|Cgt)' /proc/self/status
+          python3 -c "import signal; print('python SIGTERM', signal.getsignal(signal.SIGTERM))"
+          bash --version | head -1
+          python3 -m unittest discover -s tests -p test_backend.py -k test_cancel_stops > /tmp/cancel.out 2>&1 &
+          sleep 6
+          for d in /proc/[0-9]*; do
+            printf '%s ppid/pgrp/sid=%s ' "${d#/proc/}" "$(cut -d' ' -f4-6 "$d/stat" 2>/dev/null)"
+            grep -E 'SigIgn|SigBlk|SigCgt' "$d/status" 2>/dev/null | tr -s '\t ' ' ' | tr '\n' ' '
+            tr '\0' ' ' < "$d/cmdline" 2>/dev/null | cut -c1-140
+          done
+          wait || true
+          tail -25 /tmp/cancel.out
       - name: Verify (Fedora)
         if: startsWith(matrix.container, 'fedora')
         run: python3 scripts/check.py --require-desktop-integration
