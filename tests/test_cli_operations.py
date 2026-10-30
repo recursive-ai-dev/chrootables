@@ -432,9 +432,11 @@ printf '%s\\n' "$required"
     @unittest.skipUnless(shutil.which("mkfs.ext4") or Path("/usr/sbin/mkfs.ext4").exists(), "mke2fs is required")
     def test_required_capacity_holds_the_payload_on_a_real_filesystem(self):
         path = os.pathsep.join([os.environ.get("PATH", ""), "/usr/sbin", "/sbin"])
-        for payload_mib in (0, 1, 100, 400, 480, 1024, 4096, 16384, 70000, 200000):
-            with self.subTest(payload_mib=payload_mib):
-                payload = payload_mib * 1048576
+        payloads = [size * 1048576 for size in (0, 1, 100, 400, 480, 1024, 4096, 16384, 70000, 200000)]
+        payloads += [(threshold * 1048576 - 1) * 93 // 100 - journal * 1048576
+                     for threshold, journal in ((1024, 16), (2048, 32))]
+        for payload in payloads:
+            with self.subTest(payload=payload):
                 result = self.bash('required_capacity_mib "$1" 1000', payload)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 capacity = int(result.stdout)
@@ -443,7 +445,9 @@ printf '%s\\n' "$required"
                 with image.open("wb") as handle:
                     handle.truncate(capacity * 1048576)
                 env = {**os.environ, "PATH": path}
-                subprocess.run(["mkfs.ext4", "-q", "-F", str(image)], check=True, env=env, capture_output=True)
+                subprocess.run(["mkfs.ext4", "-q", "-F", "-b", "4096", "-I", "256",
+                                "-i", "16384", "-m", "5", str(image)],
+                               check=True, env=env, capture_output=True)
                 dump = subprocess.run(["dumpe2fs", "-h", str(image)], check=True, env=env,
                                       capture_output=True, text=True).stdout
                 field = lambda label: int(re.search(rf"^{label}:\s+(\d+)", dump, re.M).group(1))
@@ -454,7 +458,71 @@ printf '%s\\n' "$required"
 
     def test_required_capacity_honors_the_inode_bound(self):
         result = self.bash('required_capacity_mib 0 1000000')
-        self.assertEqual(int(result.stdout), 15625)
+        self.assertEqual(int(result.stdout), 15626)
+
+    @unittest.skipUnless(shutil.which("mkfs.ext4") or Path("/usr/sbin/mkfs.ext4").exists(), "mke2fs is required")
+    def test_required_capacity_leaves_room_for_initial_filesystem_inodes(self):
+        env = {**os.environ, "PATH": os.pathsep.join([os.environ.get("PATH", ""), "/usr/sbin", "/sbin"])}
+        image = Path(self.temporary.name) / "inode-capacity.img"
+        for entries in (32752, 32768, 65536, 1000000):
+            with self.subTest(entries=entries):
+                result = self.bash('required_capacity_mib 0 "$1"', entries)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                capacity = int(result.stdout)
+                with image.open("wb") as handle:
+                    handle.truncate(capacity * 1048576)
+                subprocess.run(["mkfs.ext4", "-q", "-F", "-b", "4096", "-I", "256",
+                                "-i", "16384", "-m", "5", str(image)],
+                               check=True, env=env, capture_output=True)
+                dump = subprocess.run(["dumpe2fs", "-h", str(image)], check=True, env=env,
+                                      capture_output=True, text=True).stdout
+                free_inodes = int(re.search(r"^Free inodes:\s+(\d+)", dump, re.M).group(1))
+                self.assertGreaterEqual(free_inodes, entries, f"capacity {capacity} MiB")
+                image.unlink()
+
+    def test_required_capacity_accounts_for_journal_growth_after_mib_rounding(self):
+        # Choose payloads whose estimate with the smaller journal falls in the
+        # final MiB below each threshold; MiB rounding enters the larger tier.
+        for threshold, small_journal, large_journal in (
+                (1024, 16, 32), (2048, 32, 64), (16384, 64, 128),
+                (32768, 128, 256), (65536, 256, 512), (131072, 512, 1024)):
+            with self.subTest(threshold_mib=threshold):
+                payload = (threshold * 1048576 - 1) * 93 // 100 - small_journal * 1048576
+                result = self.bash('required_capacity_mib "$1" 0', payload)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                capacity = int(result.stdout) * 1048576
+                self.assertGreaterEqual(capacity * 93, (payload + large_journal * 1048576) * 100)
+
+    def test_required_capacity_rejects_overflow_and_unsupported_payloads(self):
+        for payload, entries in (("100000000000000000", "1"), ("9223372036854775807", "1"),
+                                 ("1", "9223372036854775807"), ("1099511627777", "1"),
+                                 ("1099511627776", "1"), ("0", "67108849"),
+                                 ("-1", "1"), ("08", "1"), ("0", "1+1")):
+            with self.subTest(payload=payload, entries=entries):
+                result = self.bash('required_capacity_mib "$1" "$2"', payload, entries)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertIn("capacity limit", result.stderr)
+                self.assertEqual(result.stdout, "")
+        result = self.bash('required_capacity_mib 0 67108848')
+        self.assertEqual((result.returncode, result.stdout), (0, "1048576"), result.stderr)
+
+    def test_archive_capacity_bounds_each_entry_and_cumulative_payload(self):
+        # Stub only listing output so pathological logical sizes require neither
+        # huge files nor hours of compression; gzip validity is covered separately.
+        script = '''
+gzip() { :; }
+tar() { printf '%s\\n' "$@" >/dev/null; printf '%s\\n' "$LISTING"; }
+LISTING=$1
+validate_tar_archive ignored.tar.gz
+'''
+        for listing in ("-rw-r--r-- 0/0 100000000000000000 2026-01-01 00:00 large",
+                        "-rw-r--r-- 0/0 1099511627777 2026-01-01 00:00 large",
+                        "-rw-r--r-- 0/0 600000000000 2026-01-01 00:00 first\n"
+                        "-rw-r--r-- 0/0 600000000000 2026-01-01 00:00 second"):
+            with self.subTest(listing=listing):
+                result = self.bash(script, listing)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertIn("capacity limit", result.stderr)
 
     def test_import_details_are_read_through_guest_links_only(self):
         root = self.store / "guest"
@@ -564,7 +632,12 @@ WORKER_ROOT=/nonexistent WORKER_LOWER=/nonexistent WORKER_OVERLAY=/nonexistent W
 
     def test_expansion_and_publication_finish_despite_termination_signals(self):
         result = self.bash("""
-fsck_preflight() { :; }
+fsck_preflight() {
+    kill -HUP "$BASHPID"
+    kill -INT "$BASHPID"
+    kill -TERM "$BASHPID"
+    bash -c 'kill -HUP "$$"; kill -INT "$$"; kill -TERM "$$"; printf survived' >"$STORE_DIR/fsck-done"
+}
 truncate() { :; }
 resize2fs() { kill -TERM "$BASHPID"; command sleep 0.2; printf survived >"$STORE_DIR/resize-done"; }
 image_size_mib() { printf 600; }
@@ -573,6 +646,7 @@ assert_offline() { :; }
 resize_image "$IMAGE_DIR/lab.img" 1024
 """)
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.store / "fsck-done").read_text(), "survived")
         self.assertEqual((self.store / "resize-done").read_text(), "survived")
         self.assertIn("size_mib=1024", self.image.with_suffix(".img.meta").read_text())
         result = self.bash("""
@@ -630,6 +704,35 @@ printf 'continued\\n'
         self.assertFalse(partial.exists())
         self.assertEqual(self.image.read_bytes(), b"original image")
         self.assertEqual(self.bash('lock_image "$IMAGE_DIR/lab.img" descriptor').returncode, 0)
+
+    def test_discard_preserves_blocking_record_when_publication_files_disappear(self):
+        self.interrupt_publication()
+        pending = self.store / "images/.lab.ABC123.partial"
+        pending.unlink()
+        before = (self.store / "operations" / f"{OPERATION_ID}.state").read_bytes()
+        result = self.bash('discard_operation "$1"', OPERATION_ID)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--recover-operation", result.stderr)
+        self.assertEqual((self.store / "operations" / f"{OPERATION_ID}.state").read_bytes(), before)
+        self.assertNotEqual(self.bash('lock_image "$IMAGE_DIR/lab.img" descriptor').returncode, 0)
+        self.assertEqual(self.image.read_bytes(), b"original image")
+        self.assertIn("origin=replacement", self.image.with_suffix(".img.meta").read_text())
+
+    def test_discard_rejects_unsafe_publication_destinations_without_modifying_evidence(self):
+        pending = self.store / "images/.lab.ABC123.partial"
+        pending.write_bytes(b"staged")
+        Path(str(pending) + ".meta").write_text("origin=staged\n")
+        for destination in ("images/../../outside.img", "/tmp/outside.img", "snapshots/../outside.img", ""):
+            with self.subTest(destination=destination):
+                record = self.write_record(stage="publish-prepared", action="restore",
+                                           pending="images/.lab.ABC123.partial", destination=destination)
+                before = record.read_bytes()
+                result = self.bash('discard_operation "$1"', OPERATION_ID)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Unsafe publication paths", result.stderr)
+                self.assertEqual(record.read_bytes(), before)
+                self.assertEqual(pending.read_bytes(), b"staged")
+                self.assertEqual(Path(str(pending) + ".meta").read_text(), "origin=staged\n")
 
     def test_discard_refuses_unsafe_paths_live_and_finished_operations(self):
         outside = self.store / "precious"

@@ -13,10 +13,35 @@ def valid_result(action, data):
                 and all(isinstance(value.get(key), str) for key in strings)
                 and all(type(value.get(key)) is int and value[key] >= 0 for key in integers))
 
+    def optional_fields(value, strings=(), integers=(), booleans=()):
+        return (isinstance(value, dict)
+                and all(key not in value or isinstance(value[key], str) for key in strings)
+                and all(key not in value or type(value[key]) is int and value[key] >= 0
+                        for key in integers)
+                and all(key not in value or type(value[key]) is bool for key in booleans))
+
     if action == "logs":
         return isinstance(data, str)
     if action == "doctor":
-        return fields(data, ("output",)) and type(data.get("ready")) is bool
+        if (not fields(data, ("output",)) or type(data.get("ready")) is not bool
+                or not optional_fields(data, integers=("errors", "warnings"))):
+            return False
+        if "checks" in data:
+            checks = data["checks"]
+            if (not isinstance(checks, list)
+                    or not all(fields(check, ("id", "status")) and check["id"]
+                               and check["status"] in ("ok", "info", "warning", "error")
+                               and optional_fields(check, strings=("message", "remedy"))
+                               for check in checks)):
+                return False
+            if len({check["id"] for check in checks}) != len(checks):
+                return False
+            for key, status in (("errors", "error"), ("warnings", "warning")):
+                if key in data and data[key] != sum(check["status"] == status for check in checks):
+                    return False
+            if data["ready"] != all(check["status"] != "error" for check in checks):
+                return False
+        return "errors" not in data or data["ready"] == (data["errors"] == 0)
     if action == "cancel":
         return isinstance(data, dict) and type(data.get("cancelled")) is bool and isinstance(data.get("stage", ""), str)
     if action == "inventory":
@@ -30,6 +55,8 @@ def valid_result(action, data):
                     or not all(fields(item, ("id", "action", "name", "status", "stage", "log"))
                                and type(item.get("active")) is bool
                                and type(item.get("recoverable")) is bool
+                               and optional_fields(item, integers=("reclaimable_bytes",),
+                                                   booleans=("discardable", "invalid"))
                                for item in data["operations"])):
                 return False
         if "exports" in data:
@@ -56,7 +83,9 @@ def valid_result(action, data):
                    for key, schema in schemas.items())
                 and all("allocated_bytes" not in item or
                         type(item["allocated_bytes"]) is int and item["allocated_bytes"] >= 0
-                        for item in data["snapshots"]))
+                        for item in data["snapshots"])
+                and all(optional_fields(item, booleans=("orphan",)) for item in data["snapshots"])
+                and all(optional_fields(item, strings=("path",)) for item in data["images"]))
     return fields(data, integers=("exit_code",))
 
 

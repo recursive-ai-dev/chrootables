@@ -46,6 +46,25 @@ class DesktopInstallerTests(unittest.TestCase):
                        capture_output=True, text=True, check=True)
         self.entry = data / "applications/io.github.chrootables.Desktop.desktop"
 
+    def test_empty_relative_and_absolute_xdg_data_home(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            for index, configured in enumerate((None, "", "relative-data", str(base / "absolute-data"))):
+                with self.subTest(configured=configured):
+                    user_home = base / str(index)
+                    user_home.mkdir()
+                    environment = {**os.environ, "HOME": str(user_home)}
+                    environment.pop("XDG_DATA_HOME", None)
+                    if configured is not None:
+                        environment["XDG_DATA_HOME"] = configured
+                    subprocess.run([sys.executable, str(self.root / "scripts/install-desktop.py")],
+                                   env=environment, cwd=user_home, capture_output=True, check=True)
+                    expected = Path(configured) if configured and Path(configured).is_absolute() else user_home / ".local/share"
+                    self.assertTrue((expected / "applications/io.github.chrootables.Desktop.desktop").is_file())
+                    self.assertTrue((expected / "icons/hicolor/scalable/apps/io.github.chrootables.Desktop.svg").is_file())
+                    self.assertFalse((user_home / "applications").exists())
+                    self.assertFalse((user_home / "relative-data").exists())
+
     @unittest.skipUnless(shutil.which("desktop-file-validate"), "desktop-file-validate is unavailable")
     def test_special_checkout_path_produces_valid_desktop_entry(self):
         result = subprocess.run(["desktop-file-validate", str(self.entry)],

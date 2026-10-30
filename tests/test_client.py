@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication
-from chrootables.client import Client
+from chrootables.client import Client, valid_result
 
 
 class ClientTests(unittest.TestCase):
@@ -90,6 +90,51 @@ class ClientTests(unittest.TestCase):
         for callback in callbacks:
             callback.assert_called_once_with(False, "helper exited")
         disconnected.assert_called_once_with("helper exited")
+
+    def test_doctor_nested_data_and_counts_are_checked_before_callback(self):
+        invalid = [
+            {"checks": None}, {"checks": [{}]},
+            {"checks": [{"id": "command:tar", "status": []}]},
+            {"checks": [{"id": "command:tar", "status": "unknown"}]},
+            {"checks": [{"id": "command:tar", "status": "error"}]},
+            {"checks": [{"id": "command:tar", "status": "ok", "remedy": []}]},
+            {"checks": [{"id": "same", "status": "ok"}] * 2},
+            {"errors": False}, {"warnings": -1}, {"errors": "0"},
+            {"checks": [], "warnings": 1}, {"errors": 1},
+        ]
+        for extra in invalid:
+            with self.subTest(extra=extra):
+                callback = Mock()
+                identifier = self.client.request("doctor", {}, callback)
+                self.read({"event": "result", "id": identifier, "ok": True,
+                           "data": {"ready": True, "output": "Host health", **extra}})
+                callback.assert_called_once()
+                self.assertFalse(callback.call_args.args[0])
+                self.assertIn("Invalid doctor response", str(callback.call_args.args[1]))
+        self.assertTrue(valid_result("doctor", {"ready": False, "output": "Missing tar", "errors": 1,
+            "warnings": 0, "checks": [{"id": "command:tar", "status": "error"}]}))
+        self.assertTrue(valid_result("doctor", {"ready": True, "output": "Ready"}))
+
+    def test_inventory_optional_fields_match_desktop_consumers(self):
+        base = json.loads((Path(__file__).resolve().parents[1] / "assets/demo.json").read_text())
+        base["exports"], base["archives"] = [], []
+        fixture = json.dumps(base)
+        operation = {"id": "a" * 32, "action": "clone", "name": "lab", "status": "interrupted",
+                     "stage": "copy", "log": "/tmp/log", "active": False, "recoverable": False}
+        for key, value in (("discardable", "yes"), ("invalid", "yes"), ("reclaimable_bytes", []),
+                           ("reclaimable_bytes", True), ("reclaimable_bytes", -1)):
+            with self.subTest(key=key, value=value):
+                inventory = json.loads(fixture)
+                inventory["operations"] = [{**operation, key: value}]
+                self.assertFalse(valid_result("inventory", inventory))
+        inventory = json.loads(fixture)
+        inventory["operations"] = [{**operation, "discardable": True, "reclaimable_bytes": 1024}]
+        self.assertTrue(valid_result("inventory", inventory))
+        inventory["snapshots"][0]["orphan"] = "false"
+        self.assertFalse(valid_result("inventory", inventory))
+        inventory = json.loads(fixture)
+        inventory["images"][0]["path"] = []
+        self.assertFalse(valid_result("inventory", inventory))
 
     def test_reconnection_from_callback_ignores_remaining_old_messages(self):
         received = []

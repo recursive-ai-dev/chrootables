@@ -13,6 +13,8 @@ import threading
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from chrootables.backend import Store, MUTATIONS, OperationCancelled
 
+MAX_PENDING_REQUESTS = 16
+
 
 def serve(store, input_stream=sys.stdin, output_stream=sys.stdout, *, writable=False):
     output_lock = threading.Lock()
@@ -64,6 +66,7 @@ def serve(store, input_stream=sys.stdin, output_stream=sys.stdout, *, writable=F
             send({"id": identifier, "event": "result", "ok": False, "error": str(error), "code": code})
 
     send({"event": "ready", "writable": writable})
+    pending = threading.BoundedSemaphore(MAX_PENDING_REQUESTS)
     with ThreadPoolExecutor(max_workers=4) as pool:
         while True:
             line = input_stream.readline(65537)
@@ -74,9 +77,26 @@ def serve(store, input_stream=sys.stdin, output_stream=sys.stdout, *, writable=F
                 break
             try:
                 request = json.loads(line)
-                if not isinstance(request, dict) or not isinstance(request.get("id"), int):
+                if (not isinstance(request, dict) or type(request.get("id")) is not int
+                        or not 0 < request["id"] <= 2147483647
+                        or not isinstance(request.get("action"), str)
+                        or not isinstance(request.get("params", {}), dict)):
                     raise ValueError("Invalid request.")
-                pool.submit(handle, request)
+                # Cancellation only inspects/signals the active process. Handle
+                # it on the reader thread so queued disk reads cannot delay it.
+                if request["action"] == "cancel":
+                    handle(request)
+                elif not pending.acquire(blocking=False):
+                    send({"id": request["id"], "event": "result", "ok": False,
+                          "error": "The workspace helper is busy. Wait for pending requests and try again.",
+                          "code": "overloaded"})
+                else:
+                    try:
+                        future = pool.submit(handle, request)
+                    except BaseException:
+                        pending.release()
+                        raise
+                    future.add_done_callback(lambda _: pending.release())
             except (ValueError, TypeError) as error:
                 send({"event": "error", "error": str(error)})
 

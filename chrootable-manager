@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 
 APP_NAME="Chrootable Manager"
-APP_VERSION=1.2.0
+APP_VERSION=1.2.1
 SCRIPT_PATH=${BASH_SOURCE[0]}
 STORE_DIR=${CHROOTABLE_HOME:-/var/lib/chrootable-manager}
 DEBIAN_SUITE=${CHROOTABLE_DEBIAN_SUITE:-stable}
@@ -254,25 +254,37 @@ check_prerequisites() {
         fi
     fi
 }
+# A protected parent does not make an existing writable child safe. Use the same
+# rules for mutations and read-only diagnostics; missing directories are allowed
+# because init_store creates the required ones only after all checks pass.
+store_directory_check() {
+    local directory=$1 expected_owner=$2 owner permissions
+    [[ ! -L $directory ]] || { printf 'Store directories must not be symlinks: %s' "$directory"; return 1; }
+    [[ -e $directory ]] || return 0
+    [[ -d $directory ]] || { printf 'Store path must be a directory: %s' "$directory"; return 1; }
+    if ! read -r owner permissions < <(stat -c '%u %a' -- "$directory" 2>/dev/null); then
+        printf 'Cannot inspect store directory ownership and permissions: %s' "$directory"; return 1
+    fi
+    [[ $owner =~ ^[0-9]+$ && $permissions =~ ^[0-7]{1,4}$ ]] || {
+        printf 'Invalid ownership or permission information for store directory: %s' "$directory"; return 1;
+    }
+    [[ $owner == "$expected_owner" ]] && (( (8#$permissions & 0022) == 0 )) || {
+        printf 'Store directory must be owned by UID %s and not writable by group/others: %s' "$expected_owner" "$directory"; return 1;
+    }
+}
 init_store() {
+    local directory issue
     [[ $STORE_DIR == /* && $STORE_DIR != / ]] || { fail "CHROOTABLE_HOME must be an absolute directory other than /."; return 1; }
+    [[ ! -L $STORE_DIR ]] || { fail "The store must not be a symlink: $STORE_DIR"; return 1; }
     STORE_DIR=$(readlink -m -- "$STORE_DIR") || return
     [[ $STORE_DIR != / ]] || { fail "The store cannot be /."; return 1; }
     configure_paths
-    if [[ -e $STORE_DIR ]]; then
-        local owner permissions
-        read -r owner permissions < <(stat -c '%u %a' -- "$STORE_DIR") || return
-        [[ $owner == "$EUID" ]] && (( (8#$permissions & 0022) == 0 )) || {
-            fail "The store must be owned by the current user and not writable by group/others: $STORE_DIR"; return 1;
-        }
-    fi
-    local directory
-    for directory in "$IMAGE_DIR" "$LOG_DIR" "$EXPORT_DIR" "$SNAPSHOT_DIR" "$OPERATIONS_DIR"; do
-        [[ ! -L $directory ]] || { fail "Store subdirectories must not be symlinks: $directory"; return 1; }
+    for directory in "$STORE_DIR" "$IMAGE_DIR" "$LOG_DIR" "$EXPORT_DIR" "$SNAPSHOT_DIR" "$OPERATIONS_DIR" "$ARCHIVE_DIR"; do
+        issue=$(store_directory_check "$directory" "$EUID") || { fail "$issue"; return 1; }
     done
-    [[ -d $STORE_DIR ]] || install -d -m 0700 "$STORE_DIR" || return
-    [[ -d $IMAGE_DIR && -d $LOG_DIR && -d $EXPORT_DIR && -d $SNAPSHOT_DIR && -d $OPERATIONS_DIR ]] ||
-        install -d -m 0700 "$IMAGE_DIR" "$LOG_DIR" "$EXPORT_DIR" "$SNAPSHOT_DIR" "$OPERATIONS_DIR"
+    for directory in "$STORE_DIR" "$IMAGE_DIR" "$LOG_DIR" "$EXPORT_DIR" "$SNAPSHOT_DIR" "$OPERATIONS_DIR"; do
+        [[ -d $directory ]] || install -d -m 0700 "$directory" || return
+    done
 }
 check_readable_store() {
     [[ ! -e $STORE_DIR || ( -r $STORE_DIR && -x $STORE_DIR ) ]] || { fail "Store is not readable. Run with sudo to view $STORE_DIR"; return 1; }
@@ -591,6 +603,11 @@ discard_operation() (
         staged_path_valid "$pending" || { fail "Unsafe staged path in operation record. Nothing was changed."; return 1; }
         [[ ! -L $STORE_DIR/$pending && ! -L $STORE_DIR/$pending.meta ]] || { fail "Refusing a symlinked staged path. Nothing was changed."; return 1; }
     fi
+    if [[ -n $destination || ${state[stage]} == publish-* ]]; then
+        publication_paths_valid "$pending" "$destination" || {
+            fail "Unsafe publication paths in operation record. Nothing was changed."; return 1;
+        }
+    fi
     if [[ ${state[action]} != archive ]]; then
         if [[ $destination == images/* ]]; then lock_name=${destination#images/}; lock_name=${lock_name%.img}
         elif [[ $destination == snapshots/* ]]; then lock_name=${destination#snapshots/}; lock_name=${lock_name%%/*}
@@ -600,9 +617,10 @@ discard_operation() (
     fi
     # Metadata may already be published. Only roll back while both staged files
     # still exist; otherwise the image and metadata would be left mismatched.
-    if [[ ${state[stage]} == publish-* && -n $pending && -f $STORE_DIR/$pending ]]; then
-        [[ ${state[stage]} == publish-prepared && -f $STORE_DIR/$pending.meta ]] || {
-            fail "This publication already replaced metadata. Finish it instead: $0 --recover-operation $identifier --yes"
+    if [[ ${state[stage]} == publish-* ]]; then
+        [[ ${state[stage]} == publish-prepared && -n $pending &&
+           -f $STORE_DIR/$pending && -f $STORE_DIR/$pending.meta ]] || {
+            fail "This publication may already have replaced metadata. Retain its record and finish it instead: $0 --recover-operation $identifier --yes"
             return 1
         }
     fi
@@ -908,10 +926,12 @@ resize_image() (
     valid_size_mib "$requested" && (( requested > current )) || { fail "Choose a size larger than $current MiB (maximum 1048576)."; return 1; }
     preflight_free_space "$(((requested - current) * 1048576))" || return
     begin_operation resize "$(basename "$image" .img)" || return
+    # e2fsck -p can repair live data too. Protect before announcing its stage,
+    # so a cancellation based on an older desktop event cannot interrupt it.
+    protect_from_signals
     operation_stage checking-filesystem || return
     fsck_preflight "$image" "$OP_LOG" || return
     operation_stage expanding || return
-    protect_from_signals
     truncate -s "${requested}M" "$image" >>"$OP_LOG" 2>&1 || return
     resize2fs "$image" >>"$OP_LOG" 2>&1 || return
     metadata_set "$image" size_mib "$requested" || return
@@ -963,8 +983,11 @@ canonicalize_archive_file() {
 # 256-byte inodes per 16 KiB take 1.5625%, and bitmaps and descriptors stay under
 # 0.5%. The journal J(C) is a step function of C and never shrinks as C grows, so
 # iterating C = (payload + J(C)) / 0.93 upward reaches a fixed point. Inodes add
-# the bound C >= entries * 16 KiB. The result is at least the 512 MiB minimum image
-# size, which also keeps mke2fs off its denser "small" profile, used below 512 MiB.
+# the bound C >= (entries + 16) * 16 KiB: inode numbers 1-10 are reserved,
+# lost+found and orphan metadata consume more, and 16 leaves a small margin.
+# Import explicitly sets block/inode sizes, density and reserved space to match
+# this calculation. Round each candidate to MiB before reevaluating J(C), because
+# rounding itself can cross a journal-size threshold. The minimum is 512 MiB.
 # tests/test_cli_operations.py checks all of this against a real mke2fs.
 journal_bytes_for() {
     local blocks=$(($1 / 4096))
@@ -979,14 +1002,26 @@ journal_bytes_for() {
 }
 required_capacity_mib() {
     local payload=$1 entries=$2 capacity=536870912 next journal
+    # The supported capacity is at most 1 TiB. Enforce that bound before any
+    # arithmetic: Bash integers wrap, including multiplication by 100 below.
+    # At 16 KiB per inode the largest image has 2^26 inodes, including 16 reserved
+    # here for the filesystem's initial structures rather than archive entries.
+    [[ $payload =~ ^(0|[1-9][0-9]{0,12})$ && $entries =~ ^(0|[1-9][0-9]{0,7})$ ]] &&
+        (( payload <= 1099511627776 && entries <= 67108848 )) || {
+        fail "Archive contents exceed the supported 1048576 MiB capacity limit."; return 1;
+    }
     while :; do
         journal=$(journal_bytes_for "$capacity")
         next=$(( (payload + journal) * 100 / 93 + 1 ))
-        (( next > entries * 16384 )) || next=$((entries * 16384))
+        (( next > (entries + 16) * 16384 )) || next=$(((entries + 16) * 16384))
+        next=$(((next + 1048575) / 1048576 * 1048576))
+        (( next <= 1099511627776 )) || {
+            fail "Archive contents exceed the supported 1048576 MiB capacity limit."; return 1;
+        }
         (( next > capacity )) || break
         capacity=$next
     done
-    printf '%s' "$(( (capacity + 1048575) / 1048576 ))"
+    printf '%s' "$((capacity / 1048576))"
 }
 # debootstrap creates exactly these nodes; anything else could reach a host device
 # because sessions mount images without nodev.
@@ -995,7 +1030,7 @@ allowed_character_device() {
 }
 unsafe_archive_path() { [[ $1 == /* || $1 == ../* || $1 == */../* || $1 == */.. || $1 == .. ]]; }
 validate_tar_archive() {
-    local archive=$1 perms owner bytes day clock entry target type payload=0 entries=0 status=
+    local archive=$1 perms owner bytes day clock entry target type payload=0 entries=0 status= entry_bytes
     gzip -t -- "$archive" 2>/dev/null || { fail "Archive is not a valid gzip-compressed file: $archive"; return 1; }
     # GNU tar quotes control characters in names, so each entry is one line and
     # --numeric-owner keeps the owner a single field. --absolute-names shows names
@@ -1014,15 +1049,22 @@ validate_tar_archive() {
             fail "Unsafe path in archive: $entry"
             return 1
         fi
+        entry_bytes=0
         case $type in
-            -) [[ $bytes =~ ^[0-9]+$ ]] || { fail "Could not read the size of archive entry: $entry"; return 1; }
-               payload=$((payload + (bytes + 4095) / 4096 * 4096)) ;;
-            d) payload=$((payload + 4096)) ;;
+            -) [[ $bytes =~ ^(0|[1-9][0-9]{0,12})$ ]] && (( bytes <= 1099511627776 )) || {
+                   fail "Archive entry size is invalid or exceeds the supported 1048576 MiB capacity limit: $entry"; return 1;
+               }
+               entry_bytes=$(((bytes + 4095) / 4096 * 4096)) ;;
+            d) entry_bytes=4096 ;;
             l|h|p) ;;
             c) allowed_character_device "$bytes" || { fail "Archive contains an unsupported device node: $entry"; return 1; } ;;
             b) fail "Archive contains a block device node: $entry"; return 1 ;;
             *) fail "Archive contains an unsupported entry type '$type': $entry"; return 1 ;;
         esac
+        (( entry_bytes <= 1099511627776 - payload && entries < 67108848 )) || {
+            fail "Archive contents exceed the supported 1048576 MiB capacity limit."; return 1;
+        }
+        payload=$((payload + entry_bytes))
         entries=$((entries + 1))
     done < <(LC_ALL=C tar --numeric-owner --absolute-names -tvzf "$archive" 2>/dev/null; printf 'status %s\n' "$?")
     [[ $status == 0 ]] || { fail "Could not read tar archive entries: $archive"; return 1; }
@@ -1060,7 +1102,7 @@ import_image() (
     info "Importing $name from ${archive##*/} / $profile / $size MiB. Log: $OP_LOG"
     allocate_image "$PENDING" "$size" || return
     operation_stage formatting || return
-    mkfs.ext4 -F -L "${name:0:16}" "$PENDING" >>"$OP_LOG" 2>&1 || return
+    mkfs.ext4 -F -b 4096 -I 256 -i 16384 -m 5 -L "${name:0:16}" "$PENDING" >>"$OP_LOG" 2>&1 || return
     operation_stage importing || return
     run_worker import "$PENDING" "$WORK" "$name" "$archive" >>"$OP_LOG" 2>&1 || return
     # The archive's own release and architecture are recorded when it names them.
@@ -1833,7 +1875,7 @@ doctor_report() {
     printf 'Mount permissions are not tested by this read-only check.\n'
 }
 doctor() {
-    local command fs namespace owner permissions probe disk header line i comma= report record remedy
+    local command fs namespace owner permissions probe disk header line i comma= report record remedy issue
     local -A operation=()
     local health_host health_arch health_errors=0 health_warnings=0
     local free_bytes=0 total_bytes=0 storage_available=false
@@ -1891,9 +1933,9 @@ doctor() {
         else
             doctor_check store-access info 'Store needs administrator access.' 'Unlock the store in the desktop to view and modify workspaces.'
         fi
-        for probe in images logs exports snapshots operations; do
-            if [[ -L $STORE_DIR/$probe ]]; then
-                doctor_check "store:$probe" error "Store subdirectory is a symlink: $probe" 'Choose a store with real subdirectories before performing administrator operations.'
+        for probe in images logs exports snapshots operations archive; do
+            if ! issue=$(store_directory_check "$STORE_DIR/$probe" 0); then
+                doctor_check "store:$probe" error "$issue" 'Use a real root-owned directory without group/other write access before performing administrator operations.'
             fi
         done
         if [[ -d $OPERATIONS_DIR && ! -L $OPERATIONS_DIR && -r $OPERATIONS_DIR && -x $OPERATIONS_DIR ]]; then

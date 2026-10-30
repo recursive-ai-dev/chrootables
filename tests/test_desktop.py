@@ -162,6 +162,51 @@ class DesktopTests(unittest.TestCase):
         self.assertGreater(window.width(), 0)
         self.assertEqual(window.text_scale.currentData(), 100)
 
+    def test_favorites_are_scoped_to_store_and_preserve_empty_choices(self):
+        first_store = Path(self.directory.name) / "first"
+        second_store = Path(self.directory.name) / "second"
+        with patch("chrootables.app.QSettings", return_value=self.settings), \
+                patch("chrootables.app.QTimer.singleShot"):
+            first, second = Window(first_store), Window(second_store)
+            self.addCleanup(first.close)
+            self.addCleanup(second.close)
+            first.selected = "same-name"
+            first.favorite()
+            second.selected = "other-name"
+            second.favorite()
+            reopened = Window(first_store)
+            self.addCleanup(reopened.close)
+            self.assertEqual(reopened.favorites, {"same-name"})
+            self.assertEqual(second.favorites, {"other-name"})
+            reopened.selected = "same-name"
+            reopened.favorite()
+            empty = Window(first_store)
+            self.addCleanup(empty.close)
+            self.assertEqual(empty.favorites, set())
+            self.assertEqual(self.settings.value(second.session_settings_prefix + "/favorites"), ["other-name"])
+
+    def test_legacy_favorites_migrate_only_to_default_store_and_demo_is_isolated(self):
+        self.settings.setValue("favorites", ["python-playground", ["invalid"]])
+        with patch("chrootables.app.QSettings", return_value=self.settings), \
+                patch("chrootables.app.QTimer.singleShot"):
+            default = Window()
+            custom = Window(Path(self.directory.name) / "custom")
+            demo = Window(demo=True)
+            for window in (default, custom, demo):
+                self.addCleanup(window.close)
+            self.assertEqual(default.favorites, {"python-playground"})
+            self.assertEqual(custom.favorites, set())
+            self.assertEqual(demo.favorites, set())
+            self.assertEqual(self.settings.value(default.session_settings_prefix + "/favorites"), ["python-playground"])
+            default.selected = "python-playground"
+            default.favorite()
+            reopened = Window()
+            self.addCleanup(reopened.close)
+            self.assertEqual(reopened.favorites, set())
+            with patch.object(self.settings, "setValue") as write:
+                demo.favorite()
+            write.assert_not_called()
+
     def test_health_distinguishes_store_configuration_from_dependencies(self):
         self.enable_shared_folder_controls()
         self.window.client.is_ready = True
@@ -711,6 +756,24 @@ class DesktopTests(unittest.TestCase):
         values = dialog.parameters()
         self.assertEqual(values["export"], Path(unreadable).name)
         self.assertNotIn("archive", values)
+
+    def test_damaged_operation_record_explains_set_aside_without_deleting_staged_files(self):
+        self.window.data["operations"] = [{
+            "id": "c" * 32, "action": "unknown", "name": "store", "status": "invalid",
+            "stage": "invalid-record", "log": "", "active": False, "recoverable": False,
+            "discardable": True, "reclaimable_bytes": 0, "invalid": True,
+        }]
+        self.window.demo = False
+        self.window.render_recovery()
+        self.assertIn("Damaged operation record", self.window.interrupted_label.text())
+        self.assertIn("Staged files remain", self.window.interrupted_label.text())
+        self.assertFalse(self.window.recover_operation_button.isVisible())
+        self.assertTrue(self.window.discard_operation_button.isEnabled())
+        with patch.object(self.window, "confirm", return_value=True) as confirm, \
+                patch.object(self.window, "perform") as perform:
+            self.window.discard_interrupted_operation()
+        self.assertIn("staged files remain", confirm.call_args.args[1])
+        perform.assert_called_once_with("discard-operation", {"id": "c" * 32, "confirmed": True})
 
     def test_interrupted_work_is_visible_and_can_be_discarded(self):
         operations = [

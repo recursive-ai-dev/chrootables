@@ -6,7 +6,8 @@ import shutil
 import sys
 
 root = Path(__file__).resolve().parent.parent
-data = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
+configured_data = os.environ.get("XDG_DATA_HOME", "")
+data = Path(configured_data) if configured_data and Path(configured_data).is_absolute() else Path.home() / ".local/share"
 applications = data / "applications"
 icons = data / "icons/hicolor/scalable/apps"
 applications.mkdir(parents=True, exist_ok=True)

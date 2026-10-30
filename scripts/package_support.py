@@ -183,10 +183,16 @@ def publish_artifact(staged, destination, *, force=False, executable=False):
                        else path.read_bytes() == content.encode("ascii"))
             if not matches and not force:
                 raise ValueError(f"{path} already exists with different contents; use --force to replace it.")
+        # A successful rename alone does not make the package contents durable.
+        # Flush both staged files before exposing either final name.
+        for path in (staged, staged_checksum):
+            with path.open("rb") as stream:
+                os.fsync(stream.fileno())
         if force or not destination.exists():
             os.replace(staged, destination)
         if force or not checksum.exists():
             os.replace(staged_checksum, checksum)
+        os.fsync(descriptor)
     finally:
         os.close(descriptor)
     return destination

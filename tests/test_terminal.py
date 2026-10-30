@@ -43,6 +43,36 @@ class VtScreenTests(unittest.TestCase):
         screen.feed("x" * 12)
         self.assertEqual((screen.row, screen.column), (1, 7))
 
+    def test_pending_wrap_survives_formatting_queries_and_every_chunk_boundary(self):
+        for sequence in ("\x1b[31m", "\x1b[0m", "\x1b[6n", "\x1b[5n", "\x1b[c",
+                         "\x1b[?25l", "\x1b[?1h", "\x1b[4h", "\x1b(0\x1b(B"):
+            text = "abc" + sequence + "d"
+            for split in range(len(text) + 1):
+                with self.subTest(sequence=sequence, split=split):
+                    screen = VtScreen(3, 3)
+                    screen.feed(text[:split])
+                    screen.feed(text[split:])
+                    self.assertEqual(screen.plain().splitlines()[:2], ["abc", "d"])
+                    self.assertEqual((screen.row, screen.column), (1, 1))
+
+    def test_right_margin_control_movement_cancels_pending_wrap(self):
+        for sequence, expected in (("\r", ["Xbc", ""]), ("\b", ["aXc", ""]),
+                                   ("\x1b[D", ["aXc", ""]), ("\n", ["abc", "  X"]),
+                                   ("\x1b[K", ["abX", ""])):
+            with self.subTest(sequence=sequence):
+                screen = VtScreen(3, 3)
+                screen.feed("abc" + sequence + "X")
+                self.assertEqual(screen.plain().splitlines()[:2], expected)
+
+    def test_repeat_and_saved_cursor_preserve_right_margin_wrap(self):
+        screen = VtScreen(3, 3)
+        screen.feed("a\x1b[2bX")
+        self.assertEqual(screen.plain().splitlines()[:2], ["aaa", "X"])
+        for save, restore in (("\x1b7", "\x1b8"), ("\x1b[s", "\x1b[u")):
+            screen = VtScreen(3, 3)
+            screen.feed("abc" + save + "\r" + restore + "X")
+            self.assertEqual(screen.plain().splitlines()[:2], ["abc", "X"])
+
     def test_unicode_combining_and_wide_characters_keep_cell_positions(self):
         screen = VtScreen(3, 6)
         screen.feed("Ae")
@@ -204,6 +234,23 @@ class VtScreenTests(unittest.TestCase):
         screen.feed("\x1b[1;1H\x1b[2M")
         self.assertEqual(screen.plain().splitlines()[:3], ["2", "3", ""])
 
+    def test_insert_delete_lines_obey_both_scroll_margins(self):
+        for operation in ("L", "M"):
+            for row in (1, 5):
+                with self.subTest(operation=operation, row=row):
+                    screen = VtScreen(5, 8)
+                    screen.feed("one\r\ntwo\r\nthree\r\nfour\r\nfive")
+                    original = screen.plain()
+                    screen.feed(f"\x1b[2;4r\x1b[{row};1H\x1b[99{operation}")
+                    self.assertEqual(screen.plain(), original)
+            for count in (1, 99):
+                with self.subTest(operation=operation, count=count):
+                    screen = VtScreen(5, 8)
+                    screen.feed("one\r\ntwo\r\nthree\r\nfour\r\nfive")
+                    screen.feed(f"\x1b[2;4r\x1b[3;1H\x1b[{count}{operation}")
+                    expected = (["", "three"] if operation == "L" else ["four", ""]) if count == 1 else ["", ""]
+                    self.assertEqual(screen.plain().splitlines(), ["one", "two", *expected, "five"])
+
     def test_osc_titles_and_unknown_sequences_are_ignored(self):
         screen = VtScreen(2, 40)
         screen.feed("\x1b]0;window title\x07after\x1b[9999999ztail")
@@ -283,6 +330,15 @@ class VtScreenTests(unittest.TestCase):
         self.assertFalse(screen.lines[0][1][1].flags & UNDERLINE)
         screen.feed("\x1b[0;38:2:1:2:3mC")
         self.assertEqual(screen.lines[0][2][1].fg, (1, 2, 3))
+
+    def test_mixed_color_parameters_do_not_interrupt_following_output(self):
+        for color in ("38;5;1:2", "48;5;1:2", "38;2;1:2;2;3",
+                      "48;2;1;2:3;4", "38;2;1;2;3:4", "38;2:1;4"):
+            with self.subTest(color=color):
+                screen = VtScreen(2, 20)
+                screen.feed("before\x1b[" + color + "mX\x1b[32mY")
+                self.assertEqual(screen.plain().splitlines()[0], "beforeXY")
+                self.assertEqual(screen.lines[0][7][1].fg, 2)
 
     def test_dec_special_graphics_draws_boxes_and_shift_selects_g1(self):
         screen = VtScreen(3, 20)

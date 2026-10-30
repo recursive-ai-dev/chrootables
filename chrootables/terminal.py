@@ -141,7 +141,7 @@ class VtScreen:
         self.row = 0
         self.column = 0
         self.cursor_visible = True
-        self._saved_cursor = (0, 0, DEFAULT_STYLE, ("B", "B"), 0)
+        self._saved_cursor = (0, 0, DEFAULT_STYLE, ("B", "B"), 0, columns)
         self._alt_active = False
         self._primary = None
         self._top = 0
@@ -166,9 +166,11 @@ class VtScreen:
 
     # -- grid operations ---------------------------------------------------
 
-    def _clamp_cursor(self):
+    def _clamp_cursor(self, preserve_wrap=False):
         self.row = max(0, min(self.rows - 1, self.row))
-        self.column = max(0, min(self.columns - 1, self.column))
+        # column == columns records a pending wrap after writing the rightmost
+        # cell. Formatting and reports must retain it until the next character.
+        self.column = max(0, min(self.columns if preserve_wrap else self.columns - 1, self.column))
 
     def _scroll_up(self, count=1):
         for _ in range(min(count, self._bottom - self._top + 1)):
@@ -184,12 +186,14 @@ class VtScreen:
             self.lines.insert(self._top, self._blank_line())
 
     def _line_feed(self):
+        self.column = min(self.column, self.columns - 1)
         if self.row == self._bottom:
             self._scroll_up()
         elif self.row < self.rows - 1:
             self.row += 1
 
     def _reverse_line_feed(self):
+        self.column = min(self.column, self.columns - 1)
         if self.row == self._top:
             self._scroll_down()
         elif self.row > 0:
@@ -274,6 +278,11 @@ class VtScreen:
         allowed = "0123456789;:" if final == "m" else "0123456789;"
         if any(character not in allowed for character in params):
             return
+        if final in ("L", "M") and not self._top <= self.row <= self._bottom:
+            return
+        preserve_wrap = final in ("m", "n", "c", "h", "l", "s", "u", "b")
+        if not preserve_wrap:
+            self._clamp_cursor()
         count = lambda index=0: max(1, self._param(index))
         if final == "A":
             self.row -= count()
@@ -356,8 +365,7 @@ class VtScreen:
             if mode == 5:
                 self.responses.append("\x1b[0n")
             elif mode == 6:
-                self._clamp_cursor()
-                self.responses.append(f"\x1b[{self.row + 1};{self.column + 1}R")
+                self.responses.append(f"\x1b[{self.row + 1};{min(self.column + 1, self.columns)}R")
         elif final == "c":  # DA: VT220 with ANSI color
             if self._param(0, 0) == 0:
                 self.responses.append("\x1b[?62;22c")
@@ -365,7 +373,7 @@ class VtScreen:
             self._apply_sgr()
         elif final in ("h", "l"):
             self._apply_mode(final == "h")
-        self._clamp_cursor()
+        self._clamp_cursor(preserve_wrap=preserve_wrap)
 
     def _apply_sgr(self):
         chunks = [chunk for chunk in self._params.split(";")] if self._params else ["0"]
@@ -437,9 +445,15 @@ class VtScreen:
     def _extended_color(self, params, index):
         mode = params[index] if index < len(params) else 5
         if mode == 5 and index + 1 < len(params):
-            return params[index + 1] % 256, index + 1
+            value = params[index + 1]
+            return (value % 256 if isinstance(value, int) else None), index + 1
         if mode == 2 and index + 3 < len(params):
-            return tuple(min(255, value) for value in params[index + 1:index + 4]), index + 3
+            values = params[index + 1:index + 4]
+            # Colon-form parameters are parsed as lists. A malformed mixed form
+            # must be consumed as one color, never used in integer arithmetic.
+            color = tuple(min(255, value) for value in values) if all(
+                isinstance(value, int) for value in values) else None
+            return color, index + 3
         return None, index
 
     @staticmethod
@@ -454,12 +468,12 @@ class VtScreen:
         return None
 
     def _save_cursor(self):
-        self._saved_cursor = (self.row, self.column, self.style, tuple(self._charsets), self._shift)
+        self._saved_cursor = (self.row, self.column, self.style, tuple(self._charsets), self._shift, self.columns)
 
     def _restore_cursor(self):
-        self.row, self.column, self.style, charsets, self._shift = self._saved_cursor
+        self.row, self.column, self.style, charsets, self._shift, columns = self._saved_cursor
         self._charsets = list(charsets)
-        self._clamp_cursor()
+        self._clamp_cursor(preserve_wrap=self.column == columns == self.columns)
 
     def _apply_mode(self, enable):
         private = self._params.startswith("?")
@@ -507,7 +521,7 @@ class VtScreen:
         self._alt_active = False
         self.bracketed_paste = False
         self.cursor_visible = True
-        self._saved_cursor = (0, 0, DEFAULT_STYLE, ("B", "B"), 0)
+        self._saved_cursor = (0, 0, DEFAULT_STYLE, ("B", "B"), 0, self.columns)
         self._last_char = ""
         self.application_cursor = False
         self._autowrap = True
@@ -534,7 +548,7 @@ class VtScreen:
                 elif character == "\t":
                     self.column = min(self.columns - 1, (self.column // 8 + 1) * 8)
                 elif character == "\b":
-                    self.column = max(0, self.column - 1)
+                    self.column = max(0, min(self.column, self.columns - 1) - 1)
                 elif character >= " ":
                     self._put(character)
                 # BEL, NUL and other C0 controls are ignored.
@@ -600,8 +614,6 @@ class VtScreen:
                 self._state = _GROUND
                 if self._charset_target in (0, 1):
                     self._charsets[self._charset_target] = "0" if character == "0" else "B"
-        if self._state in (_CSI,):
-            self._clamp_cursor()
 
     def resize(self, rows, columns):
         rows = max(2, rows)

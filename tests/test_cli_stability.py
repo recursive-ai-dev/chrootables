@@ -1,6 +1,7 @@
 """Exercise CLI failure paths using temporary images and no privileged operations."""
 import fcntl
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -333,6 +334,70 @@ doctor json
         report = json.loads(result.stdout)
         checks = {item["id"]: item for item in report["checks"]}
         self.assertEqual(checks["store:exports"]["status"], "error")
+
+    def test_store_init_and_doctor_reject_unsafe_managed_directories(self):
+        outside = self.store.parent / (self.store.name + "-outside")
+        outside.mkdir()
+        self.addCleanup(outside.rmdir)
+        for name in ("images", "logs", "exports", "snapshots", "operations", "archive"):
+            directory = self.store / name
+            directory.mkdir(exist_ok=True)
+            with self.subTest(directory=name, problem="permissions"):
+                original_mode = directory.stat().st_mode & 0o7777
+                directory.chmod(0o777)
+                try:
+                    result = self.bash('init_store')
+                    self.assertNotEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("not writable by group/others", result.stderr)
+                    self.assertEqual(directory.stat().st_mode & 0o7777, 0o777)
+                    report = json.loads(self.bash('REQUIRED_COMMANDS=(bash)\ndoctor json').stdout)
+                    checks = {check["id"]: check for check in report["checks"]}
+                    self.assertEqual(checks["store:" + name]["status"], "error")
+                finally:
+                    directory.chmod(original_mode)
+            saved = self.store / ("saved-" + name)
+            directory.rename(saved)
+            try:
+                for kind in ("symlink", "file", "fifo"):
+                    with self.subTest(directory=name, problem=kind):
+                        if kind == "symlink":
+                            directory.symlink_to(outside, target_is_directory=True)
+                        elif kind == "file":
+                            directory.write_text("preserve me")
+                        else:
+                            os.mkfifo(directory)
+                        try:
+                            result = self.bash('init_store')
+                            self.assertNotEqual(result.returncode, 0, result.stderr)
+                            report = json.loads(self.bash('REQUIRED_COMMANDS=(bash)\ndoctor json').stdout)
+                            checks = {check["id"]: check for check in report["checks"]}
+                            self.assertEqual(checks["store:" + name]["status"], "error")
+                            if kind == "file":
+                                self.assertEqual(directory.read_text(), "preserve me")
+                        finally:
+                            directory.unlink()
+            finally:
+                saved.rename(directory)
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_store_init_rejects_foreign_directory_owner_before_creating_paths(self):
+        result = self.bash('''
+stat() {
+    if [[ ${@: -1} == "$IMAGE_DIR" ]]; then printf '%s 755\\n' "$((EUID + 1))";
+    else command stat "$@"; fi
+}
+init_store
+''')
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("must be owned", result.stderr)
+        self.assertFalse((self.store / "operations").exists())
+
+    def test_store_init_preserves_safe_existing_directory_permissions(self):
+        (self.store / "images").chmod(0o750)
+        result = self.bash('init_store')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.store / "images").stat().st_mode & 0o777, 0o750)
+        self.assertEqual((self.store / "operations").stat().st_mode & 0o777, 0o700)
 
     def test_doctor_json_argument_validation_and_version(self):
         for arguments, valid in ((["--doctor"], True), (["--doctor", "--json"], True),

@@ -461,14 +461,23 @@ class Window(QMainWindow):
         self.store = Path(store)
         self.demo = demo
         self.settings = QSettings("Chrootables", "Desktop")
-        self.favorites = set(self.settings.value("favorites", [], type=list))
+        self.session_settings_prefix = "sessions/" + sha256(str(self.store.resolve()).encode()).hexdigest()
+        favorites_key = self.session_settings_prefix + "/favorites"
+        if (not demo and not self.settings.contains(favorites_key)
+                and self.store.resolve() == DEFAULT_STORE.resolve() and self.settings.contains("favorites")):
+            # The former global preference has no store identity. Preserve it
+            # for the default store once, without leaking it to custom stores.
+            legacy = self.settings.value("favorites", [], type=list)
+            self.settings.setValue(favorites_key, [value for value in legacy if isinstance(value, str)])
+        self.favorites = set(value for value in
+                             ([] if demo else self.settings.value(favorites_key, [], type=list))
+                             if isinstance(value, str))
         self.data = {"images": [], "snapshots": [], "activity": [], "free_bytes": 0}
         self.selected = None
         self.network_choices = {}
         self.restricted_choices = {}
         self.shared_folder_choices = {}
         self.notes_cache = {}
-        self.session_settings_prefix = "sessions/" + sha256(str(self.store.resolve()).encode()).hexdigest()
         self.busy = False
         self.refreshing = False
         self.pending_action = None
@@ -977,7 +986,10 @@ class Window(QMainWindow):
         if interrupted:
             first = interrupted[0]
             more = f" ({len(interrupted) - 1} more after this.)" if len(interrupted) > 1 else ""
-            if first.get("recoverable"):
+            if first.get("invalid"):
+                text = (f"Damaged operation record {first['id'][:12]}…. "
+                        "Discard it to set the record aside. Staged files remain available for inspection.")
+            elif first.get("recoverable"):
                 text = (f"Interrupted {first['action']} publication for {first['name']} ({first['stage']}). "
                         "Recover it to finalize the staged image and metadata, or discard it.")
             else:
@@ -1384,7 +1396,7 @@ class Window(QMainWindow):
         elif self.selected:
             self.favorites.add(self.selected)
         if not self.demo:
-            self.settings.setValue("favorites", sorted(self.favorites))
+            self.settings.setValue(self.session_settings_prefix + "/favorites", sorted(self.favorites))
         self.render_library()
 
     def focus_search(self):
@@ -1521,10 +1533,17 @@ class Window(QMainWindow):
     def discard_interrupted_operation(self, op_id=None):
         interrupted = self.interrupted_operations()
         target = next((op for op in interrupted if op["id"] == op_id), interrupted[0] if interrupted else None)
-        if target and self.confirm("Discard interrupted operation",
-                                   f"Abandon the interrupted {target['action']} for {target['name']} (operation {target['id'][:12]}…) "
-                                   "and permanently remove its staged files?\n\n"
-                                   "If it already replaced workspace metadata, Chrootables will ask you to recover it instead."):
+        if not target:
+            return
+        if target.get("invalid"):
+            description = (f"Set aside damaged operation record {target['id'][:12]}…?\n\n"
+                           "Its staged files remain available for inspection because the damaged record "
+                           "cannot safely identify them for removal.")
+        else:
+            description = (f"Abandon the interrupted {target['action']} for {target['name']} (operation {target['id'][:12]}…) "
+                           "and permanently remove its staged files?\n\n"
+                           "If it already replaced workspace metadata, Chrootables will ask you to recover it instead.")
+        if self.confirm("Discard interrupted operation", description):
             self.perform("discard-operation", {"id": target["id"], "confirmed": True})
 
     def recover_interrupted_operation(self, op_id=None):

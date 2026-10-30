@@ -1,6 +1,10 @@
 # Chrootables Roadmap
 
-Status as of 2026-10-30. v1.2.0 adds validated workspace archive import
+Status as of 2026-10-30. v1.2.1 hardens interrupted publication, resize signal
+protection, store permissions and import-capacity arithmetic; improves helper
+backpressure, log streaming and terminal correctness; and isolates store favorites.
+The completed 1.2.1 audit is tracked in `TODO.md`. v1.2.0 added validated workspace
+archive import
 (`--import`), desktop interrupted-publication recovery, safe operation
 cancellation, log/export retention management and journal compaction, desktop
 offline archive syncing, sub-GiB (`512 MiB+`) desktop creation, full 7-profile
@@ -25,7 +29,7 @@ execution model. Historical audit reports remain under `docs/`.
 - Implemented: GitHub Actions checks on Fedora and Debian; isolated package
   installation/upgrade/removal checks; DEB/RPM/AppImage builds and SHA256
   artifacts; explicitly pinned AppImage tools/runtime; root minimal/Python
-  integration on release branches and manual runs.
+  integration on version tags, release branches and manual runs.
 - Next: signed package repositories (COPR, PPA or OBS), source packages,
   signed release provenance, and a separately evaluated self-contained AppImage.
   Keep `scripts/install-desktop.py` as the source-checkout path.

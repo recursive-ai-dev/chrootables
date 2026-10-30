@@ -139,6 +139,44 @@ class SharedPackagingTests(unittest.TestCase):
             self.assertEqual(outside.read_bytes(), b"other file")
             self.assertTrue(destination.is_symlink())
 
+    def test_publication_flushes_contents_before_rename_and_directory_after(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "stage").mkdir()
+            staged = root / "stage/application.rpm"
+            staged.write_bytes(b"package")
+            events = []
+            original_sync, original_replace = os.fsync, os.replace
+
+            def sync(descriptor):
+                events.append("sync")
+                original_sync(descriptor)
+
+            def replace(source, target):
+                events.append("rename")
+                original_replace(source, target)
+
+            with patch.object(support.os, "fsync", side_effect=sync), \
+                    patch.object(support.os, "replace", side_effect=replace):
+                support.publish_artifact(staged, root / staged.name)
+            self.assertEqual(events, ["sync", "sync", "rename", "rename", "sync"])
+
+    def test_flush_failure_keeps_existing_outputs_untouched(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "stage").mkdir()
+            staged = root / "stage/application.rpm"
+            staged.write_bytes(b"new package")
+            destination = root / staged.name
+            destination.write_bytes(b"old package")
+            checksum = destination.with_suffix(".rpm.sha256")
+            checksum.write_bytes(b"old checksum")
+            with patch.object(support.os, "fsync", side_effect=OSError("disk failure")):
+                with self.assertRaisesRegex(OSError, "disk failure"):
+                    support.publish_artifact(staged, destination, force=True)
+            self.assertEqual(destination.read_bytes(), b"old package")
+            self.assertEqual(checksum.read_bytes(), b"old checksum")
+
     def test_missing_build_tools_fail_without_installing_or_creating_outputs(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "absent"

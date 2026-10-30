@@ -13,7 +13,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock, patch
 
-from chrootables.backend import OperationCancelled, Store, build_command, name, read_regular, shared_folder, session_command, terminal_command, deliver_export, MANAGER, PROFILES
+from chrootables.backend import OperationCancelled, Store, build_command, name, read_regular, shared_folder, session_command, terminal_command, deliver_export, MANAGER, PROFILES, _OperationLogTail
 from chrootables.broker import serve
 
 
@@ -238,6 +238,57 @@ class StoreTests(unittest.TestCase):
         with self.assertRaises(OSError):
             read_regular(link)
 
+    def test_explicit_log_offsets_do_not_jump_to_the_tail(self):
+        log = self.path / "burst.log"
+        log.write_text("prefix" + "x" * 300000)
+        self.assertEqual(read_regular(log, 6, offset=0), "prefix")
+        self.assertEqual(read_regular(log, 4), "xxxx")
+
+    def operation_record(self, identifier="a" * 32, **changes):
+        directory = self.path / "operations"
+        directory.mkdir(exist_ok=True)
+        state = {"format": "1", "id": identifier, "pid": "2147483647", "process_start": "1",
+                 "status": "running", "stage": "publish-prepared", "action": "clone", "name": "lab"}
+        state.update(changes)
+        path = directory / (identifier + ".state")
+        path.write_text("".join(f"{key}={value}\n" for key, value in state.items()))
+        return path
+
+    def test_invalid_operation_records_remain_visible_for_discard(self):
+        path = self.operation_record()
+        original = path.read_text()
+        damaged = ["damaged record\n", original + "name=other\n", original + "unexpected=value\n",
+                   original.replace("format=1", "format=2"), original.replace("pid=2147483647", "pid=0"),
+                   original.replace("stage=publish-prepared", "stage=" + "x" * 49),
+                   original.replace("name=lab", "name=../lab"), original.replace("process_start=1", "process_start=no"),
+                   original.replace("id=" + "a" * 32, "id=" + "b" * 32), "x" * (256 * 1024 + 1)]
+        for content in damaged:
+            with self.subTest(content=content[:100]):
+                path.write_text(content)
+                records = self.store._scan_operations()
+                self.assertEqual(len(records), 1)
+                self.assertEqual(records[0]["id"], "a" * 32)
+                self.assertTrue(records[0]["invalid"])
+                self.assertTrue(records[0]["discardable"])
+                self.assertFalse(records[0]["recoverable"])
+                self.assertEqual(records[0]["reclaimable_bytes"], 0)
+        path.write_text(original)
+        repaired = self.store._scan_operations()[0]
+        self.assertNotIn("invalid", repaired)
+        self.assertTrue(repaired["recoverable"])
+
+    def test_operation_recovery_eligibility_matches_cli_listing(self):
+        for index, status in enumerate(("running", "completed", "failed", "interrupted", "recovered")):
+            self.operation_record(f"{index:032x}", status=status)
+        command = 'source "$1"; OPERATIONS_DIR="$2/operations"; LOG_DIR="$2/logs"; list_operations json'
+        result = subprocess.run(["bash", "-c", command, "operation-list-test", str(MANAGER), str(self.path)],
+                                check=True, capture_output=True, text=True)
+        expected = json.loads(result.stdout)
+        actual = self.store._scan_operations()
+        for backend_record, cli_record in zip(actual, expected, strict=True):
+            for field in ("id", "status", "active", "recoverable", "discardable"):
+                self.assertEqual(backend_record[field], cli_record[field], (field, cli_record))
+
     def test_inventory_cache_reuses_unchanged_state_and_tracks_locks_and_mutations(self):
         import fcntl
         import chrootables.backend as backend_mod
@@ -328,6 +379,99 @@ assert store.inventory()['images'][0]['status'] == 'ready'
         output = [json.loads(line) for line in messages.getvalue().splitlines()]
         self.assertTrue(output[-1]["ok"])
         self.assertEqual(output[-1]["data"]["images"][0]["name"], "lab")
+
+    def test_broker_cancellation_bypasses_saturated_workers(self):
+        store = Mock()
+        all_started, cancelled = threading.Event(), threading.Event()
+        started = 0
+        lock = threading.Lock()
+
+        def doctor():
+            nonlocal started
+            with lock:
+                started += 1
+                if started == 4:
+                    all_started.set()
+            if not cancelled.wait(3):
+                raise RuntimeError("Cancellation was blocked behind disk reads")
+            return {"ready": True}
+
+        def cancel():
+            cancelled.set()
+            return {"cancelled": True, "stage": "copying"}
+
+        class Requests(io.StringIO):
+            def readline(self, *args):
+                line = super().readline(*args)
+                if '"cancel"' in line:
+                    if not all_started.wait(3):
+                        raise RuntimeError("Read workers did not start")
+                return line
+
+        store.doctor.side_effect = doctor
+        store.cancel_operation.side_effect = cancel
+        requests = [json.dumps({"id": index + 1, "action": "doctor"}) for index in range(4)]
+        requests.append(json.dumps({"id": 5, "action": "cancel"}))
+        output = io.StringIO()
+        serve(store, Requests("\n".join(requests) + "\n"), output, writable=True)
+        results = [json.loads(line) for line in output.getvalue().splitlines() if '"result"' in line]
+        self.assertEqual(len(results), 5)
+        self.assertTrue(all(item["ok"] for item in results), results)
+        store.cancel_operation.assert_called_once()
+
+    def test_broker_bounds_pending_work_and_reports_overload(self):
+        store = Mock()
+        release, overloaded = threading.Event(), threading.Event()
+        store.doctor.side_effect = lambda: (release.wait(3), {"ready": True})[1]
+
+        class Output(io.StringIO):
+            def write(self, text):
+                result = super().write(text)
+                if '"overloaded"' in text:
+                    overloaded.set()
+                return result
+
+        requests = "".join(json.dumps({"id": index + 1, "action": "doctor"}) + "\n" for index in range(30))
+        output = Output()
+        worker = threading.Thread(target=serve, args=(store, io.StringIO(requests), output))
+        with patch("chrootables.broker.MAX_PENDING_REQUESTS", 4):
+            worker.start()
+            try:
+                self.assertTrue(overloaded.wait(2), "Expected a prompt overload response")
+                self.assertLessEqual(store.doctor.call_count, 4)
+            finally:
+                release.set()
+                worker.join(5)
+        self.assertFalse(worker.is_alive())
+        results = [json.loads(line) for line in output.getvalue().splitlines() if '"result"' in line]
+        self.assertEqual(len(results), 30)
+        self.assertEqual(len({item["id"] for item in results}), 30)
+        self.assertTrue(any(item.get("code") == "overloaded" for item in results))
+
+    def test_broker_rejects_invalid_request_contracts(self):
+        requests = [{"id": value, "action": "doctor"} for value in (True, 0, -1, 2147483648, "1")]
+        requests += [{"id": 1, "action": []}, {"id": 1, "action": "doctor", "params": []}]
+        for request in requests:
+            with self.subTest(request=request):
+                store, output = Mock(), io.StringIO()
+                serve(store, io.StringIO(json.dumps(request) + "\n"), output)
+                self.assertEqual(json.loads(output.getvalue().splitlines()[-1])["event"], "error")
+                store.doctor.assert_not_called()
+
+    def test_privileged_export_uses_invoking_users_supplementary_groups(self):
+        source = self.path / "source.tar.gz"
+        source.write_bytes(b"payload")
+        account = Mock(pw_name="export-user", pw_gid=2100)
+        with patch.dict(os.environ, {"PKEXEC_UID": "2000"}), \
+                patch("chrootables.backend.os.geteuid", return_value=0), \
+                patch("chrootables.backend.pwd.getpwuid", return_value=account), \
+                patch("chrootables.backend.os.getgrouplist", return_value=[2100, 2200, 2300]) as groups, \
+                patch("chrootables.backend.subprocess.run", return_value=Mock(returncode=0)) as run:
+            deliver_export(source, self.path / "destination.tar.gz")
+        groups.assert_called_once_with("export-user", 2100)
+        self.assertEqual(run.call_args.kwargs["user"], 2000)
+        self.assertEqual(run.call_args.kwargs["group"], 2100)
+        self.assertEqual(run.call_args.kwargs["extra_groups"], [2100, 2200, 2300])
 
     @unittest.skipIf(os.getuid() == 0, "Tests the user-side export writer")
     def test_export_delivers_and_refuses_overwrite(self):
@@ -453,6 +597,70 @@ assert store.inventory()['images'][0]['status'] == 'ready'
             code = self.store.operate("clone", {"name": "lab", "target": "copy"}, output.append)
         self.assertEqual(code, 0)
         self.assertEqual("".join(output), "first\nsecond\n")
+
+    def test_completed_operation_drains_large_log_and_decodes_chunk_boundaries(self):
+        identifier = "c" * 32
+        log = self.path / "logs" / (identifier + ".log")
+        expected = "begin\n" + "x" * (256 * 1024 - 7) + "€" + "é" * (1024 * 1024) + "\nend\n"
+        log.write_text(expected, encoding="utf-8")
+        process = Mock(stdout=io.StringIO(), returncode=0)
+        process.poll.return_value = 0
+        output = []
+        with patch("chrootables.backend.subprocess.Popen", return_value=process), \
+                patch("chrootables.backend.uuid.uuid4", return_value=Mock(hex=identifier)):
+            self.assertEqual(self.store.operate("clone", {"name": "lab", "target": "copy"}, output.append), 0)
+        self.assertGreater(len(output), 4)
+        self.assertEqual("".join(output), expected)
+
+    def test_streaming_log_preserves_split_characters_and_flushes_incomplete_tail(self):
+        log = self.path / "logs/stream.log"
+        output = []
+        tail = _OperationLogTail(log, output.append)
+        log.write_bytes(b"first \xe2")
+        tail.read()
+        self.assertEqual("".join(output), "first ")
+        with log.open("ab") as stream:
+            stream.write(b"\x82")
+        tail.read()
+        self.assertEqual("".join(output), "first ")
+        with log.open("ab") as stream:
+            stream.write(b"\xac last\xe2")
+        tail.read(final=True)
+        self.assertEqual("".join(output), "first € last�")
+
+    def test_streaming_log_resets_decoder_on_truncation_or_replacement(self):
+        log = self.path / "logs/stream.log"
+        for replace in (False, True):
+            with self.subTest(replace=replace):
+                log.write_bytes(b"old\xe2")
+                output = []
+                tail = _OperationLogTail(log, output.append)
+                tail.read()
+                if replace:
+                    other = log.with_suffix(".replacement")
+                    other.write_bytes(b"new")
+                    other.replace(log)
+                else:
+                    log.write_bytes(b"n")
+                tail.read(final=True)
+                self.assertEqual("".join(output), "old�" + ("new" if replace else "n"))
+
+    def test_streaming_log_limits_live_poll_and_rejects_special_files_without_leaks(self):
+        log = self.path / "logs/stream.log"
+        expected = "x" * (2 * 1024 * 1024 + 7)
+        log.write_text(expected)
+        output = []
+        tail = _OperationLogTail(log, output.append)
+        tail.read()
+        self.assertEqual(len("".join(output)), 1024 * 1024)
+        tail.read(final=True)
+        self.assertEqual("".join(output), expected)
+        fifo = self.path / "fifo"
+        os.mkfifo(fifo)
+        before = len(os.listdir("/proc/self/fd"))
+        for path in (self.path, fifo):
+            _OperationLogTail(path, output.append).read(final=True)
+        self.assertEqual(len(os.listdir("/proc/self/fd")), before)
 
     def test_operation_tails_only_its_log_and_forwards_matching_phases(self):
         operation_id = "b" * 32
@@ -591,6 +799,7 @@ valid_mirror "https://deb.debian.org/debian" || exit 13
         process.pid = 2147483647
         store._active_process = process
         for action, stage in (("clone", "publish-metadata"), ("clone", "publish-prepared"), ("resize", "expanding"),
+                              ("resize", "checking-filesystem"),
                               ("repair", "repairing-filesystem"), ("delete", "deleting"), ("setup", "starting"),
                               ("restore", "published")):
             with self.subTest(action=action, stage=stage), patch("chrootables.backend.os.killpg") as killpg:

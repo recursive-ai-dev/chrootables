@@ -1,6 +1,8 @@
 """Validated desktop API for the existing image manager. No shell evaluation."""
 from __future__ import annotations
 
+import codecs
+from contextlib import contextmanager
 import fcntl
 from datetime import datetime
 import json
@@ -32,7 +34,7 @@ MUTATIONS = {
 CANCELLABLE_ACTIONS = {"create", "import", "clone", "snapshot", "restore", "resize", "export", "archive-sync"}
 CANCELLABLE_STAGES = {
     "starting", "allocating", "formatting", "bootstrapping", "importing", "exporting",
-    "copying", "copying-snapshot", "copying-restore", "checking-filesystem", "downloading-archive",
+    "copying", "copying-snapshot", "copying-restore", "downloading-archive",
 }
 CANCEL_RESEND_SECONDS = 1.0
 
@@ -202,19 +204,76 @@ def read_regular(path, limit=256 * 1024, offset=None):
     return _read_regular_chunk(path, limit, offset)[0]
 
 
-def _read_regular_chunk(path, limit=256 * 1024, offset=None):
-    """Return bounded text and the byte position actually consumed."""
+@contextmanager
+def _open_regular(path):
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    with os.fdopen(descriptor, "rb") as stream:
-        info = os.fstat(stream.fileno())
+    try:
+        info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode):
             raise ValueError("Expected a regular file.")
-        start = max(0, info.st_size - limit)
-        if offset is not None and 0 <= offset <= info.st_size:
-            start = max(start, offset)
+        stream = os.fdopen(descriptor, "rb")
+        descriptor = None  # The stream now owns the descriptor.
+        with stream:
+            yield stream, info
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _read_regular_chunk(path, limit=256 * 1024, offset=None):
+    """Return bounded text and the byte position actually consumed."""
+    with _open_regular(path) as (stream, info):
+        start = max(0, info.st_size - limit) if offset is None else (
+            offset if 0 <= offset <= info.st_size else 0)
         stream.seek(start)
         data = stream.read(max(0, min(limit, info.st_size - start)))
         return data.decode("utf-8", errors="replace"), stream.tell()
+
+
+class _OperationLogTail:
+    """Stream bounded chunks without losing bytes or splitting UTF-8 characters."""
+
+    def __init__(self, path, output):
+        self.path = path
+        self.output = output
+        self.offset = 0
+        self.identity = None
+        self.decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+
+    def _emit(self, data=b"", *, final=False):
+        text = self.decoder.decode(data, final=final)
+        if text:
+            self.output(text)
+
+    def read(self, *, final=False):
+        try:
+            with _open_regular(self.path) as (stream, info):
+                identity = (info.st_dev, info.st_ino)
+                if self.identity != identity or info.st_size < self.offset:
+                    # An incomplete character belongs to the old file, never to
+                    # its replacement or to bytes written after truncation.
+                    self._emit(final=True)
+                    self.decoder.reset()
+                    self.offset = 0
+                self.identity = identity
+                stream.seek(self.offset)
+                # Limit each live poll so cancellation remains responsive. The
+                # final read drains the entire size observed when it opens the log.
+                remaining = info.st_size - self.offset
+                if not final:
+                    remaining = min(remaining, 4 * 256 * 1024)
+                while remaining:
+                    data = stream.read(min(remaining, 256 * 1024))
+                    if not data:
+                        break
+                    self.offset = stream.tell()
+                    remaining -= len(data)
+                    self._emit(data)
+        except (OSError, ValueError):
+            pass  # A log may not yet exist, or may have been pruned/replaced.
+        finally:
+            if final:
+                self._emit(final=True)
 
 
 def _probe_lock_status(lock_path):
@@ -268,7 +327,9 @@ except BaseException:
     raise
 '''
     try:
-        options = {"user": uid, "group": account.pw_gid, "extra_groups": []} if os.geteuid() == 0 else {}
+        options = ({"user": uid, "group": account.pw_gid,
+                    "extra_groups": os.getgrouplist(account.pw_name, account.pw_gid)}
+                   if os.geteuid() == 0 else {})
         result = subprocess.run(["/usr/bin/python3", "-I", "-S", "-c", script, str(source), str(target)],
                                 pass_fds=(source,), capture_output=True, text=True, **options)
         if result.returncode:
@@ -282,6 +343,35 @@ def metadata(path):
         return dict(line.split("=", 1) for line in read_regular(path).splitlines() if "=" in line)
     except FileNotFoundError:
         return {}
+
+
+def _operation_state(path, identifier):
+    """Read the CLI state schema without accepting duplicate or unknown fields."""
+    allowed = {
+        "format", "id", "pid", "process_start", "status", "stage", "action", "name",
+        "pending", "destination", "image_inode", "image_size", "meta_inode", "meta_size",
+    }
+    text, consumed = _read_regular_chunk(path, 256 * 1024 + 1, offset=0)
+    if consumed > 256 * 1024:
+        raise ValueError("Operation record is too large.")
+    lines = text.split("\n")
+    if lines and not lines[-1]:
+        lines.pop()
+    state = {}
+    for line in lines:
+        field, separator, value = line.partition("=")
+        if not separator or field not in allowed or field in state:
+            raise ValueError("Invalid operation record fields.")
+        state[field] = value
+    if (state.get("format") != "1" or state.get("id") != identifier
+            or not re.fullmatch(r"[1-9][0-9]*", state.get("pid", ""))
+            or not re.fullmatch(r"[0-9]+", state.get("process_start", ""))
+            or state.get("status") not in {"running", "completed", "failed", "interrupted", "recovered"}
+            or not re.fullmatch(r"[a-z][a-z0-9-]{0,47}", state.get("stage", ""))
+            or not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", state.get("action", ""))
+            or not NAME_RE.fullmatch(state.get("name", ""))):
+        raise ValueError("Invalid operation record values.")
+    return state
 
 
 def _process_alive(pid, expected_start):
@@ -457,35 +547,50 @@ class Store:
             return []
         if not stat.S_ISDIR(info.st_mode):
             raise ValueError("Store directories must not be symlinks.")
-        sig = (info.st_ino, info.st_mtime_ns)
-        if sig == self._operations_sig and not self._operations_has_running:
-            return self._operations_cache
-        records = []
-        has_running = False
         with os.scandir(op_dir) as entries:
             state_entries = sorted(
                 (e for e in entries if not e.is_symlink() and e.name.endswith(".state") and e.is_file(follow_symlinks=False)),
                 key=lambda e: e.name,
             )
+        stamps = []
+        for entry in state_entries:
+            try:
+                stamp = entry.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            stamps.append((entry.name, stamp.st_ino, stamp.st_mtime_ns, stamp.st_size))
+        sig = (info.st_ino, info.st_mtime_ns, tuple(stamps))
+        if sig == self._operations_sig and not self._operations_has_running:
+            return self._operations_cache
+        records = []
+        has_running = False
         for entry in state_entries:
             op_id = entry.name[:-6]
             if not OPERATION_ID_RE.fullmatch(op_id):
                 continue
-            state = metadata(Path(entry.path))
-            if state.get("format") != "1" or state.get("id") != op_id:
+            try:
+                state = _operation_state(entry.path, op_id)
+            except FileNotFoundError:
+                continue
+            except ValueError:
+                records.append({
+                    "id": op_id, "action": "unknown", "name": "store", "status": "invalid",
+                    "stage": "invalid-record", "log": str(self.path / "logs" / (op_id + ".log")),
+                    "active": False, "recoverable": False, "discardable": True,
+                    "reclaimable_bytes": 0, "invalid": True,
+                })
                 continue
             action = state.get("action", "")
             ws_name = state.get("name", "")
             status = state.get("status", "")
             stage = state.get("stage", "")
-            if not NAME_RE.fullmatch(ws_name) or status not in ("running", "completed", "failed", "interrupted", "recovered"):
-                continue
             active = _process_alive(state.get("pid", ""), state.get("process_start", ""))
+            has_running = has_running or active
             if status == "running":
                 has_running = True
                 if not active:
                     status = "interrupted"
-            recoverable = (not active and status not in ("completed", "recovered") and stage.startswith("publish-"))
+            recoverable = not active and status == "interrupted" and stage.startswith("publish-")
             discardable = not active and status == "interrupted"
             records.append({
                 "id": op_id,
@@ -754,34 +859,15 @@ class Store:
                 output(line)
         reader = threading.Thread(target=drain, daemon=True)
         reader.start()
-        offsets = {}
-        stats = {}
-        def tail_file(log_path, info):
-            if not stat.S_ISREG(info.st_mode):
-                return
-            sig = (info.st_mtime_ns, info.st_size)
-            if stats.get(log_path) == sig:
-                return
-            prev_offset = offsets.get(log_path, 0)
-            if info.st_size < prev_offset:
-                prev_offset = 0
-            chunk, offsets[log_path] = _read_regular_chunk(log_path, offset=prev_offset)
-            stats[log_path] = sig
-            if chunk:
-                output(chunk)
-        def tail():
-            try:
-                tail_file(str(operation_log), operation_log.lstat())
-            except (FileNotFoundError, OSError):
-                pass
+        log_tail = _OperationLogTail(operation_log, output)
         try:
             while process.poll() is None:
-                tail()
+                log_tail.read()
                 self._repeat_cancel(process)
                 time.sleep(0.2)
             reader.join()
             process.stdout.close()
-            tail()
+            log_tail.read(final=True)
         finally:
             with self._active_lock:
                 self._active_process = None

@@ -9,3 +9,4 @@ dist/*.deb
 dist/*.rpm
 dist/*.AppImage
 dist/*.sha256
+dist/SHA256SUMS

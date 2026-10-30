@@ -1,7 +1,34 @@
 # Changelog
 
-The current release is numbered `1.2.0`. Earlier development release numbers
+The current release is numbered `1.2.1`. Earlier development release numbers
 are retained below as historical records.
+
+## v1.2.1 — 2026-10-30
+
+- Preserve interrupted-publication records when replacement metadata is already
+  live, including when staged image data is missing. Protect the modifying
+  filesystem check throughout expansion from cancellation and CLI signals.
+- Validate root ownership, safe permissions and directory types for every managed
+  store subdirectory, including the offline archive cache. Reject import payload
+  sizes and entry counts that exceed supported capacity before integer arithmetic,
+  accounting for ext4's reserved inodes when estimating import capacity.
+- Display damaged operation records in desktop Recovery, with strict record
+  validation and CLI-consistent recovery eligibility. Validate nested helper
+  responses before the desktop consumes them.
+- Bound outstanding helper requests and process cancellation promptly. Preserve
+  every byte of operation-log bursts and decode UTF-8 across streaming boundaries.
+- Save exports with the invoking user's supplementary groups so shared writable
+  destination folders work without administrator-owned output files.
+- Handle malformed terminal color sequences without crashing, preserve pending
+  right-margin wrapping across formatting and chunk boundaries, and keep line
+  insertion/deletion inside the terminal's scrolling region.
+- Remember favorites separately for each workspace store, migrate default-store
+  favorites and isolate demo preferences. Honor default XDG data paths when the
+  desktop installer receives an empty or relative override.
+- Reject unsafe build-tool cache entries and preserve competing downloads.
+  Synchronize package/checksum contents and publication directories before
+  reporting success. Run privileged integration for version tags as well as
+  release branches and manual builds.
 
 ## v1.2.0 — 2026-10-30
 
