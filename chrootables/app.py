@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QProgressBar, QMenu, QFileDialog, QLayout,
 )
 from . import __version__
-from .backend import DEFAULT_STORE, ROOT, PROFILES, SUITES, name, shared_folder, session_command, terminal_command
+from .backend import DEFAULT_STORE, ROOT, PROFILES, SUITES, archive_file, name, shared_folder, session_command, terminal_command
 from .client import Client
 from .style import STYLE, scaled_style
 from .terminal import TerminalWindow
@@ -131,10 +131,17 @@ class CreateDialog(QDialog):
         self.suite = QComboBox()
         for key, title in SUITES.items():
             self.suite.addItem(title, key)
+        size_row_widget, size_row = box(horizontal=True, spacing=8)
         self.size_input = QSpinBox()
         self.size_input.setRange(1, 1024)
         self.size_input.setValue(2)
         self.size_input.setSuffix(" GiB")
+        self.size_unit = QComboBox()
+        self.size_unit.addItem("GiB", "gib")
+        self.size_unit.addItem("MiB (512–1048576)", "mib")
+        self.size_unit.setAccessibleName("Capacity unit")
+        size_row.addWidget(self.size_input, 1)
+        size_row.addWidget(self.size_unit)
         self.lifecycle = QComboBox()
         self.lifecycle.addItem("Persistent — keep my changes", "persistent")
         self.lifecycle.addItem("Disposable — reset after every session", "ephemeral")
@@ -142,7 +149,7 @@ class CreateDialog(QDialog):
         form.addRow("Starting profile", self.profile)
         form.addRow("", self.profile_description)
         form.addRow("Distribution", self.suite)
-        form.addRow("Image capacity", self.size_input)
+        form.addRow("Image capacity", size_row_widget)
         form.addRow("Session lifecycle", self.lifecycle)
         layout.addLayout(form)
         layout.addWidget(label("Debian packages are verified by debootstrap. Creation checks available capacity and downloads a base system. Sparse image files grow as data is written; free space is not reserved.", "muted", True))
@@ -155,13 +162,34 @@ class CreateDialog(QDialog):
         buttons.accepted.connect(self.validate)
         layout.addWidget(buttons)
         self.profile.currentIndexChanged.connect(self.select_profile)
+        self.size_unit.currentIndexChanged.connect(self.change_size_unit)
         self.name_input.textChanged.connect(lambda: self.error.clear())
         self.name_input.setFocus()
+
+    def change_size_unit(self):
+        current = self.size_input.value()
+        if self.size_unit.currentData() == "mib":
+            self.size_input.setRange(512, 1048576)
+            self.size_input.setSingleStep(512)
+            self.size_input.setSuffix(" MiB")
+            self.size_input.setValue(max(512, min(1048576, current * 1024)))
+        else:
+            self.size_input.setRange(1, 1024)
+            self.size_input.setSingleStep(1)
+            self.size_input.setSuffix(" GiB")
+            self.size_input.setValue(max(1, min(1024, round(current / 1024))))
+
+    def set_size_mib(self, mib):
+        self.size_unit.setCurrentIndex(self.size_unit.findData("mib"))
+        self.size_input.setValue(max(512, min(1048576, int(mib))))
 
     def select_profile(self):
         data = PROFILES[self.profile.currentData()]
         self.profile_description.setText(data[1])
-        self.size_input.setValue(data[2])
+        if self.size_unit.currentData() == "mib":
+            self.size_input.setValue(data[2] * 1024)
+        else:
+            self.size_input.setValue(data[2])
 
     def validate(self):
         try:
@@ -174,14 +202,106 @@ class CreateDialog(QDialog):
         self.accept()
 
     def parameters(self):
-        return {"name": self.name_input.text().strip(), "size_mib": self.size_input.value() * 1024,
+        size_mib = self.size_input.value() if self.size_unit.currentData() == "mib" else self.size_input.value() * 1024
+        return {"name": self.name_input.text().strip(), "size_mib": size_mib,
                 "profile": self.profile.currentData(), "suite": self.suite.currentData(),
                 "lifecycle": self.lifecycle.currentData()}
 
 
-class ValueDialog(QDialog):
-    def __init__(self, title, description, field="Name", value="", minimum=None, parent=None):
+class ImportDialog(QDialog):
+    def __init__(self, existing, initial_archive="", parent=None):
         super().__init__(parent)
+        self.existing = existing
+        self.setWindowTitle("Import workspace archive")
+        self.setMinimumWidth(550)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(28, 28, 28, 28)
+        layout.setSpacing(16)
+        layout.addWidget(label("Rehydrate an exported workspace.", "title"))
+        layout.addWidget(label("Unpack a .tar.gz export into a fresh sparse ext4 workspace image.", "muted", True))
+        form = QFormLayout()
+        form.setSpacing(14)
+        archive_widget, archive_row = box(horizontal=True, spacing=8)
+        self.archive_input = QLineEdit(initial_archive)
+        self.archive_input.setPlaceholderText("/path/to/workspace-export.tar.gz")
+        self.browse_button = button("Browse…", self.browse_archive)
+        archive_row.addWidget(self.archive_input, 1)
+        archive_row.addWidget(self.browse_button)
+        self.name_input = QLineEdit()
+        self.name_input.setPlaceholderText("e.g. restored-lab")
+        if initial_archive:
+            stem = Path(initial_archive).name
+            for suffix in (".tar.gz", ".tgz"):
+                if stem.endswith(suffix):
+                    stem = stem[:-len(suffix)]
+                    break
+            self.name_input.setText(stem[:56] + "-import" if stem else "")
+        self.profile = QComboBox()
+        for key, (title, description, suggested) in PROFILES.items():
+            self.profile.addItem(title, key)
+        self.suite = QComboBox()
+        for key, title in SUITES.items():
+            self.suite.addItem(title, key)
+        self.size_input = QSpinBox()
+        self.size_input.setRange(512, 1048576)
+        self.size_input.setSingleStep(512)
+        self.size_input.setValue(2048)
+        self.size_input.setSuffix(" MiB")
+        self.lifecycle = QComboBox()
+        self.lifecycle.addItem("Persistent — keep my changes", "persistent")
+        self.lifecycle.addItem("Disposable — reset after every session", "ephemeral")
+        form.addRow("Archive (.tar.gz)", archive_widget)
+        form.addRow("Workspace name", self.name_input)
+        form.addRow("Profile metadata", self.profile)
+        form.addRow("Distribution", self.suite)
+        form.addRow("Image capacity", self.size_input)
+        form.addRow("Session lifecycle", self.lifecycle)
+        layout.addLayout(form)
+        self.error = label("", "banner", True)
+        layout.addWidget(self.error)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        self.import_button = buttons.addButton("Import workspace", QDialogButtonBox.ButtonRole.AcceptRole)
+        self.import_button.setObjectName("primary")
+        buttons.rejected.connect(self.reject)
+        buttons.accepted.connect(self.validate)
+        layout.addWidget(buttons)
+        self.profile.currentIndexChanged.connect(lambda: self.size_input.setValue(PROFILES[self.profile.currentData()][2] * 1024))
+        self.name_input.textChanged.connect(lambda: self.error.clear())
+        self.archive_input.textChanged.connect(lambda: self.error.clear())
+
+    def browse_archive(self):
+        chosen, _ = QFileDialog.getOpenFileName(self, "Choose workspace archive", str(Path.home()), "Compressed archive (*.tar.gz *.tgz)")
+        if chosen:
+            self.archive_input.setText(chosen)
+
+    def validate(self):
+        try:
+            archive_file(self.archive_input.text().strip())
+            value = name(self.name_input.text().strip())
+            if value in self.existing:
+                raise ValueError("That workspace name is already in use.")
+        except ValueError as error:
+            self.error.setText(str(error))
+            return
+        self.accept()
+
+    def parameters(self):
+        return {
+            "name": self.name_input.text().strip(),
+            "archive": self.archive_input.text().strip(),
+            "size_mib": self.size_input.value(),
+            "profile": self.profile.currentData(),
+            "suite": self.suite.currentData(),
+            "lifecycle": self.lifecycle.currentData(),
+        }
+
+
+class ValueDialog(QDialog):
+    def __init__(self, title, description, field="Name", value="", minimum=None, parent=None,
+                 forbidden=None, collision_message="That name is already in use."):
+        super().__init__(parent)
+        self.forbidden = set(forbidden or ())
+        self.collision_message = collision_message
         self.setWindowTitle(title)
         self.setMinimumWidth(460)
         layout = QVBoxLayout(self)
@@ -201,15 +321,33 @@ class ValueDialog(QDialog):
         self.error = label("", "banner", True)
         layout.addWidget(self.error)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok)
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setObjectName("primary")
+        self.ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self.ok_button.setObjectName("primary")
         buttons.accepted.connect(self.validate)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        if isinstance(self.input, QLineEdit):
+            self.input.textChanged.connect(self._check_inline)
+            if self.forbidden:
+                self._check_inline()
+
+    def _check_inline(self):
+        if not isinstance(self.input, QLineEdit):
+            return
+        candidate = self.input.text().strip()
+        if self.forbidden and candidate in self.forbidden:
+            self.error.setText(self.collision_message)
+            self.ok_button.setEnabled(False)
+        else:
+            self.error.clear()
+            self.ok_button.setEnabled(True)
 
     def validate(self):
         if isinstance(self.input, QLineEdit):
             try:
-                name(self.input.text().strip())
+                candidate = name(self.input.text().strip())
+                if candidate in self.forbidden:
+                    raise ValueError(self.collision_message)
             except ValueError as error:
                 self.error.setText(str(error))
                 return
@@ -254,7 +392,10 @@ class WorkspaceRow(QWidget):
         if state == self._state:
             return
         self._state = state
-        self.icon_label.setPixmap(glyph({"python": "Py", "build": "C+", "network": "~"}.get(profile, "box"), size=44))
+        self.icon_label.setPixmap(glyph({
+            "python": "Py", "build": "C+", "network": "~",
+            "rust": "Rs", "go": "Go", "web": "JS", "minimal": "Min",
+        }.get(profile, "box"), size=44))
         self.title_label.setText(("★  " if favorite else "") + item["name"])
         self.meta_label.setText(f"Debian {suite}  ·  {PROFILES.get(profile, (profile,))[0]}  ·  {capacity(size_mib)}")
         self.status_label.setText("●  In use" if busy else "●  Ready")
@@ -434,6 +575,10 @@ class Window(QMainWindow):
         self.refresh_button.setToolTip("Refresh · F5")
         self.refresh_button.setAccessibleName("Refresh workspaces")
         row.addWidget(self.refresh_button)
+        self.import_button = button("Import…", self.import_archive)
+        self.import_button.setToolTip("Import a .tar.gz export into a workspace")
+        self.import_button.setAccessibleName("Import workspace archive")
+        row.addWidget(self.import_button)
         self.new_button = button("＋  New workspace", self.create, "primary")
         row.addWidget(self.new_button)
         self.content_layout.addWidget(top)
@@ -459,6 +604,9 @@ class Window(QMainWindow):
         task_top, task_row = box(horizontal=True)
         self.task_title = label("Task output", "section")
         task_row.addWidget(self.task_title, 1)
+        self.cancel_task_button = button("Cancel", self.cancel_operation, "danger")
+        self.cancel_task_button.hide()
+        task_row.addWidget(self.cancel_task_button)
         task_row.addWidget(button("Copy output", lambda: QApplication.clipboard().setText(self.task_output.toPlainText()), "quiet"))
         self.hide_task = button("Hide", self.task_panel.hide, "quiet")
         task_row.addWidget(self.hide_task)
@@ -589,6 +737,26 @@ class Window(QMainWindow):
         layout.addWidget(label("A restore first saves your current image. Recovery points survive workspace deletion.", "muted", True))
         self.storage_summary = label("", "muted", True)
         layout.addWidget(self.storage_summary)
+        self.interrupted_frame, interrupted_row = box(horizontal=True, spacing=8)
+        self.interrupted_label = label("", "banner", True)
+        interrupted_row.addWidget(self.interrupted_label, 1)
+        self.recover_operation_button = button("Recover publication", self.recover_interrupted_operation, "primary")
+        interrupted_row.addWidget(self.recover_operation_button)
+        self.interrupted_frame.hide()
+        layout.addWidget(self.interrupted_frame)
+        self.exports_frame, exports_row = box(horizontal=True, spacing=8)
+        exports_row.addWidget(label("Retained exports:", "muted"))
+        self.exports_combo = QComboBox()
+        self.exports_combo.setAccessibleName("Retained export archives")
+        self.exports_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.exports_combo.setMinimumContentsLength(12)
+        exports_row.addWidget(self.exports_combo, 1)
+        self.reimport_export_button = button("Re-import…", self.import_selected_export)
+        self.delete_export_button = button("Delete export", self.delete_selected_export, "danger")
+        exports_row.addWidget(self.reimport_export_button)
+        exports_row.addWidget(self.delete_export_button)
+        self.exports_frame.hide()
+        layout.addWidget(self.exports_frame)
         self.recovery_search = QLineEdit()
         self.recovery_search.setPlaceholderText("Search recovery points by workspace, label or date…")
         self.recovery_search.setAccessibleName("Search recovery points")
@@ -633,6 +801,8 @@ class Window(QMainWindow):
         layout.addWidget(self.activity_empty)
         row_widget, row = box(horizontal=True)
         row.addStretch()
+        self.prune_logs_button = button("Prune old logs…", self.prune_logs)
+        row.addWidget(self.prune_logs_button)
         row.addWidget(button("View operation log", self.activity_log))
         layout.addWidget(row_widget)
         self.pages.addWidget(page)
@@ -653,6 +823,19 @@ class Window(QMainWindow):
         self.health_output = QPlainTextEdit()
         self.health_output.setReadOnly(True)
         layout.addWidget(self.health_output, 1)
+        archive_bar, archive_row = box(horizontal=True, spacing=8)
+        self.archive_status = label("Offline cache: none synced yet", "muted", True)
+        archive_row.addWidget(self.archive_status, 1)
+        self.archive_suite = QComboBox()
+        self.archive_suite.setAccessibleName("Offline archive release")
+        self.archive_suite.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.archive_suite.setMinimumContentsLength(10)
+        for key, title in SUITES.items():
+            self.archive_suite.addItem(title, key)
+        archive_row.addWidget(self.archive_suite)
+        self.sync_archive_button = button("Sync offline archive", self.sync_archive)
+        archive_row.addWidget(self.sync_archive_button)
+        layout.addWidget(archive_bar)
         layout.addWidget(label("WORKSPACE STORE", "eyebrow"))
         layout.addWidget(label(str(self.store), "muted"))
         layout.addWidget(label("Trust model: workspaces run as root and share host devices. Use them for trusted development and testing; they are not a security boundary for hostile software.", "muted", True))
@@ -765,6 +948,39 @@ class Window(QMainWindow):
                 ". Shared blocks can make actual reclaimed space smaller.")
         else:
             self.storage_summary.setText(f"{len(self.data['snapshots'])} recovery points. Select a point to preview deletion and its allocated storage.")
+        recoverable = [op for op in self.data.get("operations", []) if op.get("recoverable")]
+        if recoverable:
+            first = recoverable[0]
+            self.interrupted_label.setText(
+                f"Interrupted {first['action']} publication for {first['name']} ({first['stage']}). "
+                "Recover it to finalize the staged image and metadata."
+            )
+            self.interrupted_frame.show()
+        else:
+            self.interrupted_frame.hide()
+        exports = self.data.get("exports", [])
+        if exports:
+            current_file = self.exports_combo.currentData()
+            self.exports_combo.blockSignals(True)
+            self.exports_combo.clear()
+            for exp in exports:
+                self.exports_combo.addItem(f"{exp['filename']} ({byte_size(exp['size_bytes'])})", exp)
+            if current_file:
+                for i in range(self.exports_combo.count()):
+                    if (self.exports_combo.itemData(i) or {}).get("filename") == current_file.get("filename"):
+                        self.exports_combo.setCurrentIndex(i)
+                        break
+            self.exports_combo.blockSignals(False)
+            self.exports_frame.show()
+        else:
+            self.exports_combo.clear()
+            self.exports_frame.hide()
+        archives = self.data.get("archives", [])
+        if archives:
+            summary = ", ".join(f"{a['suite']} ({byte_size(a['size_bytes'])})" for a in archives)
+            self.archive_status.setText(f"Offline cache ready: {summary}")
+        else:
+            self.archive_status.setText("Offline cache: none synced yet")
         self.update_controls()
 
     def render_activity(self):
@@ -1160,11 +1376,27 @@ class Window(QMainWindow):
         if dialog.exec():
             self.perform("create", dialog.parameters())
 
+    def import_archive(self, initial_archive=""):
+        if self.busy:
+            return
+        dialog = ImportDialog({x["name"] for x in self.data["images"]}, initial_archive if isinstance(initial_archive, str) else "", self)
+        if dialog.exec():
+            self.perform("import", dialog.parameters())
+
     def snapshot(self):
         target = self.selected
         if not target:
             return
-        dialog = ValueDialog("Save a recovery point", "Capture this workspace before your next experiment. The workspace must be offline.", "Snapshot label", datetime.now().strftime("checkpoint-%Y%m%d-%H%M"), parent=self)
+        existing_labels = {s["label"] for s in self.data["snapshots"] if s["name"] == target}
+        dialog = ValueDialog(
+            "Save a recovery point",
+            "Capture this workspace before your next experiment. The workspace must be offline.",
+            "Snapshot label",
+            datetime.now().strftime("checkpoint-%Y%m%d-%H%M"),
+            parent=self,
+            forbidden=existing_labels,
+            collision_message="That snapshot label already exists for this workspace.",
+        )
         if dialog.exec():
             self.perform("snapshot", {"name": target, "target": dialog.value()})
 
@@ -1172,7 +1404,16 @@ class Window(QMainWindow):
         target = self.selected
         if not target:
             return
-        dialog = ValueDialog("Branch into a new workspace", "An independent copy of the filesystem and profile. The original stays intact.", "New workspace name", target[:58] + "-copy", parent=self)
+        existing_names = {x["name"] for x in self.data["images"]}
+        dialog = ValueDialog(
+            "Branch into a new workspace",
+            "An independent copy of the filesystem and profile. The original stays intact.",
+            "New workspace name",
+            target[:58] + "-copy",
+            parent=self,
+            forbidden=existing_names,
+            collision_message="That workspace name is already in use.",
+        )
         if dialog.exec():
             self.perform("clone", {"name": target, "target": dialog.value()})
 
@@ -1239,6 +1480,52 @@ class Window(QMainWindow):
                         "Only this recovery point is removed. The current workspace and other recovery points remain. This cannot be undone."):
             self.perform("drop-snapshot", {"name": item["name"], "target": item["label"], "confirmed": True})
 
+    def recover_interrupted_operation(self, op_id=None):
+        recoverable = [op for op in self.data.get("operations", []) if op.get("recoverable")]
+        target = next((op for op in recoverable if op["id"] == op_id), recoverable[0] if recoverable else None)
+        if not target:
+            return
+        if self.confirm("Recover interrupted publication",
+                        f"Finish the interrupted {target['action']} publication for {target['name']} (operation {target['id'][:12]}…)?"):
+            self.perform("recover-operation", {"id": target["id"], "confirmed": True})
+
+    def import_selected_export(self):
+        exp = self.exports_combo.currentData()
+        if exp and isinstance(exp, dict) and exp.get("path"):
+            self.import_archive(exp["path"])
+
+    def delete_selected_export(self):
+        exp = self.exports_combo.currentData()
+        if not exp or not isinstance(exp, dict) or not exp.get("filename"):
+            return
+        if self.confirm("Delete export archive",
+                        f"Permanently delete export archive {exp['filename']} ({byte_size(exp.get('size_bytes', 0))})?"):
+            self.perform("delete-export", {"filename": exp["filename"], "confirmed": True})
+
+    def prune_logs(self):
+        if self.confirm("Prune operation logs",
+                        "Remove older completed operation logs while retaining the 20 most recent logs and any active or interrupted operations?"):
+            self.perform("prune-logs", {"keep": 20, "confirmed": True})
+
+    def sync_archive(self):
+        suite = self.archive_suite.currentData() or "trixie"
+        if self.confirm("Sync offline archive",
+                        f"Download and cache the Debian {suite} base system and profile packages for offline workspace creation?"):
+            self.perform("archive-sync", {"suite": suite})
+
+    def cancel_operation(self):
+        if not self.busy or self.demo or not self.client.is_ready:
+            return
+        self.cancel_task_button.setEnabled(False)
+        def done(ok, result):
+            if ok:
+                self.append_output("\nCancellation requested (SIGTERM sent to active operation).\n")
+                self.set_task_phase("Cancelling")
+            else:
+                self.cancel_task_button.setEnabled(self.busy)
+                self.show_error(str(result))
+        self.client.request("cancel", {}, done)
+
     def perform(self, action, params):
         if self.demo:
             self.show_error("This is a read-only tour. Launch Chrootables without --demo to manage real workspaces.")
@@ -1262,10 +1549,13 @@ class Window(QMainWindow):
         self.task_panel.show()
         self.task_reopen.show()
         self.task_progress.show()
+        self.cancel_task_button.setEnabled(True)
+        self.cancel_task_button.show()
         self.update_controls()
         self.render_library()
         def done(ok, result):
             self.busy = False
+            self.cancel_task_button.hide()
             self.set_task_phase("Completed" if ok else "Failed")
             self.update_task_elapsed()
             self.task_started = None
@@ -1275,7 +1565,7 @@ class Window(QMainWindow):
                 self.append_output("\n" + str(result) + "\n")
                 self.task_panel.show()
             self.render_library()
-            if ok and action == "create":
+            if ok and action in ("create", "import"):
                 self.selected = params["name"]
                 self.navigate(0)
             self.update_controls()
@@ -1286,9 +1576,17 @@ class Window(QMainWindow):
 
     def update_controls(self):
         self.new_button.setEnabled(not self.busy)
+        self.import_button.setEnabled(not self.busy and not self.demo)
         self.empty_create.setEnabled(not self.busy)
         self.unlock_button.setEnabled(not self.busy and not self.demo)
         self.setup_button.setEnabled(not self.busy and not self.demo and self.missing_dependencies)
+        self.sync_archive_button.setEnabled(not self.busy and not self.demo)
+        self.prune_logs_button.setEnabled(not self.busy and not self.demo)
+        has_recoverable = any(op.get("recoverable") for op in self.data.get("operations", []))
+        self.recover_operation_button.setEnabled(has_recoverable and not self.busy and not self.demo)
+        has_exports = bool(self.data.get("exports"))
+        self.reimport_export_button.setEnabled(has_exports and not self.busy and not self.demo)
+        self.delete_export_button.setEnabled(has_exports and not self.busy and not self.demo)
         has_snapshot = self.chosen_snapshot() is not None
         self.restore_button.setEnabled(has_snapshot and not self.busy and not self.demo)
         self.drop_snapshot_button.setEnabled(has_snapshot and not self.busy and not self.demo)

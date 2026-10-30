@@ -344,6 +344,36 @@ doctor json
         result = subprocess.run([str(MANAGER), "--version"], capture_output=True, text=True, check=True)
         self.assertEqual(result.stdout.strip(), __version__)
 
+    def test_activity_log_compaction_and_inspect_enrichment(self):
+        activity = self.store / "activity.tsv"
+        activity.write_text("".join(f"2026-10-15T10:00:{i:02d}\tcreate\tlab-{i}\tok\t\n" for i in range(40)))
+        (self.store / "exports/lab-20261015-120000.tar.gz").write_bytes(b"export")
+        op_file = self.store / "operations" / ("d" * 32 + ".state")
+        op_file.write_text("id=" + "d" * 32 + "\naction=clone\nname=lab\ntarget=copy\nstatus=running\nstage=publish-image\npid=999999\n")
+        result = self.bash('''
+CHROOTABLE_ACTIVITY_MAX_BYTES=200 CHROOTABLE_ACTIVITY_KEEP_LINES=10 record_event snapshot lab ok
+image_details "$IMAGE_DIR/lab.img"
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = activity.read_text().splitlines()
+        self.assertEqual(len(lines), 10)
+        self.assertTrue(lines[-1].endswith("\tsnapshot\tlab\tok\t"))
+        self.assertIn("Origin:", result.stdout)
+        self.assertIn("Exports:", result.stdout)
+        self.assertIn("--recover-operation", result.stdout)
+
+    def test_recommended_size_mib_covers_all_seven_profiles(self):
+        result = self.bash('''
+for p in minimal build python network rust go web; do
+    printf '%s=%s\n' "$p" "$(recommended_size_mib "$p")"
+done
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [
+            "minimal=2048", "build=8192", "python=4096", "network=2048",
+            "rust=8192", "go=6144", "web=6144",
+        ])
+
 
 if __name__ == "__main__":
     unittest.main()

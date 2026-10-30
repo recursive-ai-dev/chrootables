@@ -18,7 +18,10 @@ import unicodedata
 
 from PySide6.QtCore import QObject, QSocketNotifier, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter
-from PySide6.QtWidgets import QApplication, QDialog, QHBoxLayout, QMessageBox, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QApplication, QDialog, QHBoxLayout, QLineEdit, QMessageBox, QPushButton,
+    QVBoxLayout, QWidget,
+)
 
 DEFAULT_ROWS = 24
 DEFAULT_COLUMNS = 80
@@ -28,6 +31,8 @@ BOLD = 1 << 0
 ITALIC = 1 << 1
 UNDERLINE = 1 << 2
 REVERSE = 1 << 3
+DIM = 1 << 4
+STRIKE = 1 << 5
 
 # XTerm palette, indices 0-15; None follows the widget theme.
 PALETTE = {
@@ -129,6 +134,7 @@ class VtScreen:
         self.history = deque(maxlen=max(0, scrollback))
         self.history_count = 0
         self.bracketed_paste = False
+        self._last_char = ""
 
     def _blank_line(self):
         return [(" ", DEFAULT_STYLE)] * self.columns
@@ -179,6 +185,7 @@ class VtScreen:
             return
         if width > self.columns:
             character, width = "\ufffd", 1
+        self._last_char = character
         if self.column >= self.columns or self.column + width > self.columns:
             self.column = 0
             self._line_feed()
@@ -293,6 +300,10 @@ class VtScreen:
             self._scroll_down(count())
         elif final == "X":  # ECH
             self._erase(self.row, self.column, min(self.columns, self.column + count()))
+        elif final == "b":  # REP
+            if self._last_char:
+                for _ in range(min(count(), self.columns * self.rows)):
+                    self._put(self._last_char)
         elif final == "r":  # DECSTBM
             top = self._param(0, 1) - 1
             bottom = self._param(1, self.rows) - 1 if self._param_count() > 1 else self.rows - 1
@@ -324,20 +335,28 @@ class VtScreen:
                 fg, bg, flags = None, None, 0
             elif value == 1:
                 flags |= BOLD
+            elif value == 2:
+                flags |= DIM
             elif value == 3:
                 flags |= ITALIC
             elif value == 4:
                 flags |= UNDERLINE
             elif value == 7:
                 flags |= REVERSE
-            elif value in (21, 22):
+            elif value == 9:
+                flags |= STRIKE
+            elif value == 21:
                 flags &= ~BOLD
+            elif value == 22:
+                flags &= ~(BOLD | DIM)
             elif value == 23:
                 flags &= ~ITALIC
             elif value == 24:
                 flags &= ~UNDERLINE
             elif value == 27:
                 flags &= ~REVERSE
+            elif value == 29:
+                flags &= ~STRIKE
             elif 30 <= value <= 37:
                 fg = value - 30
             elif value == 39:
@@ -409,6 +428,7 @@ class VtScreen:
         self.bracketed_paste = False
         self.cursor_visible = True
         self._saved_cursor = (0, 0)
+        self._last_char = ""
 
     # -- public interface ---------------------------------------------------
 
@@ -519,6 +539,12 @@ class VtScreen:
 
 def key_to_bytes(key, text, ctrl=False, alt=False):
     """Translate a Qt key event into the bytes sent to the session."""
+    ctrl_arrows = {
+        QT_KEY_UP: b"\x1b[1;5A", QT_KEY_DOWN: b"\x1b[1;5B",
+        QT_KEY_RIGHT: b"\x1b[1;5C", QT_KEY_LEFT: b"\x1b[1;5D",
+    }
+    if ctrl and key in ctrl_arrows:
+        return (b"\x1b" if alt else b"") + ctrl_arrows[key]
     special = {
         QT_KEY_ENTER: b"\r", QT_KEY_TAB: b"\t", QT_KEY_BACKSPACE: b"\x7f",
         QT_KEY_LEFT: b"\x1b[D", QT_KEY_UP: b"\x1b[A", QT_KEY_RIGHT: b"\x1b[C",
@@ -659,6 +685,8 @@ class PtyProcess(QObject):
 class TerminalPane(QWidget):
     """Renders a VtScreen and forwards keyboard input to a PtyProcess."""
 
+    find_requested = Signal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.screen = VtScreen()
@@ -667,6 +695,7 @@ class TerminalPane(QWidget):
         self._selection_start = None
         self._selection_end = None
         self._selecting = False
+        self._search_cursor = None
         self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self.setCursor(Qt.CursorShape.IBeamCursor)
         self.setToolTip("Select text to copy with Ctrl+Shift+C. Paste with Ctrl+Shift+V. "
@@ -771,6 +800,12 @@ class TerminalPane(QWidget):
                 text_color = self._brush(style.fg, "#e6e6e2")
                 if style.flags & REVERSE:
                     fill, text_color = text_color, fill
+                if style.flags & DIM:
+                    text_color = QColor(
+                        int(text_color.red() * 0.65),
+                        int(text_color.green() * 0.65),
+                        int(text_color.blue() * 0.65),
+                    )
                 painter.fillRect(column * self.cell_width, y, width * self.cell_width,
                                  self.cell_height, fill)
                 if style.flags != last_flags:
@@ -779,6 +814,7 @@ class TerminalPane(QWidget):
                         font.setBold(bool(style.flags & BOLD))
                         font.setItalic(bool(style.flags & ITALIC))
                         font.setUnderline(bool(style.flags & UNDERLINE))
+                        font.setStrikeOut(bool(style.flags & STRIKE))
                         fonts[style.flags] = font
                     painter.setFont(fonts[style.flags])
                     last_flags = style.flags
@@ -811,6 +847,10 @@ class TerminalPane(QWidget):
             return
         if ctrl and shift and event.key() == Qt.Key.Key_V:
             self.paste(QApplication.clipboard().text())
+            event.accept()
+            return
+        if ctrl and shift and event.key() == Qt.Key.Key_F:
+            self.find_requested.emit()
             event.accept()
             return
         if shift and event.key() in (Qt.Key.Key_PageUp, Qt.Key.Key_PageDown):
@@ -907,6 +947,62 @@ class TerminalPane(QWidget):
             self.process.write(payload)
             self.update()
 
+    def clear_scrollback(self):
+        self.screen.history.clear()
+        self.scroll_offset = 0
+        self._search_cursor = None
+        self.clear_selection()
+        self.update()
+
+    def find_text(self, query, forward=True):
+        needle = (query or "").strip().lower()
+        if not needle:
+            self.clear_selection()
+            self.update()
+            return False
+        history = [] if self.screen._alt_active else list(self.screen.history)
+        all_lines = history + self.screen.lines
+        matches = []
+        for abs_row, line in enumerate(all_lines):
+            row_chars = []
+            col_map = []
+            for col, (cell_text, _) in enumerate(line):
+                if cell_text:
+                    for ch in cell_text:
+                        row_chars.append(ch)
+                        col_map.append((col, col + max(1, cell_width(cell_text))))
+            haystack = "".join(row_chars).lower()
+            pos = 0
+            while True:
+                idx = haystack.find(needle, pos)
+                if idx < 0:
+                    break
+                start_col = col_map[idx][0] if idx < len(col_map) else 0
+                end_idx = min(len(col_map) - 1, idx + len(needle) - 1)
+                end_col = col_map[end_idx][1] if end_idx >= 0 and col_map else start_col + len(needle)
+                matches.append((abs_row, start_col, end_col))
+                pos = idx + 1
+        if not matches:
+            self.clear_selection()
+            self.update()
+            return False
+        if self._search_cursor in matches:
+            index = (matches.index(self._search_cursor) + (1 if forward else -1)) % len(matches)
+        else:
+            index = 0 if forward else len(matches) - 1
+        abs_row, start_col, end_col = self._search_cursor = matches[index]
+        if self.screen._alt_active or abs_row >= len(history):
+            self.scroll_offset = 0
+            view_row = abs_row - len(history)
+        else:
+            self.scroll_offset = min(len(history), max(0, len(history) - abs_row))
+            start = len(history) - self.scroll_offset
+            view_row = abs_row - start
+        self._selection_start = (max(0, min(self.screen.rows - 1, view_row)), start_col)
+        self._selection_end = (max(0, min(self.screen.rows - 1, view_row)), end_col)
+        self.update()
+        return True
+
 
 class TerminalWindow(QDialog):
     """A modeless window hosting one embedded session."""
@@ -919,7 +1015,23 @@ class TerminalWindow(QDialog):
         self._closing = False
         self._external_pending = False
         layout = QVBoxLayout(self)
+        self.search_bar = QWidget(self)
+        search_layout = QHBoxLayout(self.search_bar)
+        search_layout.setContentsMargins(0, 0, 0, 0)
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Find in scrollback and screen…")
+        self.search_input.returnPressed.connect(lambda: self.find_match(True))
+        self.find_prev_button = QPushButton("Previous")
+        self.find_prev_button.clicked.connect(lambda: self.find_match(False))
+        self.find_next_button = QPushButton("Next")
+        self.find_next_button.clicked.connect(lambda: self.find_match(True))
+        search_layout.addWidget(self.search_input, 1)
+        search_layout.addWidget(self.find_prev_button)
+        search_layout.addWidget(self.find_next_button)
+        self.search_bar.setVisible(False)
+        layout.addWidget(self.search_bar)
         self.pane = TerminalPane()
+        self.pane.find_requested.connect(self.toggle_search)
         self.process = PtyProcess(command, parent=self)
         self.process.finished.connect(self._session_finished)
         self.pane.attach(self.process)
@@ -929,11 +1041,29 @@ class TerminalWindow(QDialog):
             external_button = QPushButton("Open in external terminal")
             external_button.clicked.connect(self._open_external)
             buttons.addWidget(external_button)
+        self.find_button = QPushButton("Find…")
+        self.find_button.clicked.connect(self.toggle_search)
+        buttons.addWidget(self.find_button)
+        self.clear_scrollback_button = QPushButton("Clear scrollback")
+        self.clear_scrollback_button.clicked.connect(self.pane.clear_scrollback)
+        buttons.addWidget(self.clear_scrollback_button)
         buttons.addStretch(1)
         close_button = QPushButton("Close session")
         close_button.clicked.connect(self.close)
         buttons.addWidget(close_button)
         layout.addLayout(buttons)
+
+    def toggle_search(self):
+        visible = not self.search_bar.isVisible()
+        self.search_bar.setVisible(visible)
+        if visible:
+            self.search_input.setFocus()
+            self.search_input.selectAll()
+        else:
+            self.pane.setFocus()
+
+    def find_match(self, forward=True):
+        return self.pane.find_text(self.search_input.text(), forward=forward)
 
     def _open_external(self):
         if self._closing or self._external is None:

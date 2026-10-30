@@ -4,10 +4,10 @@ A native Linux desktop workbench for Debian image environments. Create a workspa
 open a terminal, experiment in a disposable session, and return to a saved recovery
 point. The Qt desktop and the Bash terminal interface use the same image store.
 
-## Install version 1.1.0
+## Install version 1.2.0
 
 Download packages and SHA256 checksums from the
-[1.1.0 release](https://github.com/recursive-ai-dev/chrootables/releases/tag/v1.1.0).
+[1.2.0 release](https://github.com/recursive-ai-dev/chrootables/releases/tag/v1.2.0).
 The native packages install Python/Qt and workspace prerequisites through your
 host package manager. Launch the desktop as your normal user; workspace changes
 request administrator access when needed.
@@ -15,7 +15,7 @@ request administrator access when needed.
 ### Ubuntu / Debian
 
 ```bash
-sudo apt install ./chrootables_1.1.0-1_all.deb
+sudo apt install ./chrootables_1.2.0-1_all.deb
 chrootables-desktop
 ```
 
@@ -28,7 +28,7 @@ application-menu entry and manual pages.
 ### Fedora
 
 ```bash
-sudo dnf install ./chrootables-1.1.0-1.noarch.rpm
+sudo dnf install ./chrootables-1.2.0-1.noarch.rpm
 chrootables-desktop
 ```
 
@@ -38,8 +38,8 @@ the tested RPM target; compatibility with RHEL derivatives is not yet verified.
 ### AppImage · x86_64
 
 ```bash
-chmod +x Chrootables-1.1.0-1-x86_64.AppImage
-./Chrootables-1.1.0-1-x86_64.AppImage
+chmod +x Chrootables-1.2.0-1-x86_64.AppImage
+./Chrootables-1.2.0-1-x86_64.AppImage
 ```
 
 This is a **host-runtime AppImage**: it requires `/usr/bin/python3` 3.10+ and
@@ -53,7 +53,7 @@ Each artifact has a `.sha256` sidecar. Verify it in the download directory, for
 example:
 
 ```bash
-sha256sum -c chrootables_1.1.0-1_all.deb.sha256
+sha256sum -c chrootables_1.2.0-1_all.deb.sha256
 ```
 
 Removing a native package leaves `/var/lib/chrootable-manager` intact. Installed

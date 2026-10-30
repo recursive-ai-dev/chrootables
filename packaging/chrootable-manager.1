@@ -77,6 +77,9 @@ Expand an image; shrinking is unsupported.
 .TP
 .B --export NAME
 Create a compressed filesystem archive and print its path.
+.TP
+.B --import NAME ARCHIVE.tar.gz [SIZE_MIB] [persistent|ephemeral] [PROFILE]
+Import a validated .tar.gz archive into a new sparse ext4 image.
 .SH SESSION OPTIONS
 .TP
 .B --isolated
@@ -110,6 +113,12 @@ Force an ext4 filesystem check and repair.
 .TP
 .B --delete NAME --yes
 Delete the image, retaining snapshots and exports.
+.TP
+.B --prune-logs [KEEP_COUNT] --yes
+Remove older completed operation logs while retaining the most recent KEEP_COUNT logs (default 20).
+.TP
+.B --delete-export FILENAME --yes
+Delete a retained export archive from the store exports directory.
 .TP
 .B --setup
 Install missing host prerequisites through the host package manager.

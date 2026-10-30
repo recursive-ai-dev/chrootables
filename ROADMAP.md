@@ -1,10 +1,11 @@
 # Chrootables Roadmap
 
-Status as of 2026-10-27. v1.1.0 adds durable operation stages and interrupted
-publication recovery, sparse-capacity checks, isolated task logs, searchable
-recovery/history, storage totals, smaller-display/text-scaling support, improved
-terminal rendering and Unicode cell widths, canonical CLI capabilities, and
-verified DEB/RPM/host-runtime AppImage packaging. The project is Apache-2.0.
+Status as of 2026-10-30. v1.2.0 adds validated workspace archive import
+(`--import`), desktop interrupted-publication recovery, safe operation
+cancellation, log/export retention management and journal compaction, desktop
+offline archive syncing, sub-GiB (`512 MiB+`) desktop creation, full 7-profile
+interactive TUI parity, embedded terminal search (`Ctrl+Shift+F`) and extended
+VT/SGR sequences, and broadened external terminal support. The project is Apache-2.0.
 Qt desktop and Bash CLI continue to share one image store and the trusted-root
 execution model. Historical audit reports remain under `docs/`.
 

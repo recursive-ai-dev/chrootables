@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 
 APP_NAME="Chrootable Manager"
-APP_VERSION=1.1.0
+APP_VERSION=1.2.0
 SCRIPT_PATH=${BASH_SOURCE[0]}
 STORE_DIR=${CHROOTABLE_HOME:-/var/lib/chrootable-manager}
 DEBIAN_SUITE=${CHROOTABLE_DEBIAN_SUITE:-stable}
@@ -31,6 +31,8 @@ valid_size_mib() {
     [[ $1 =~ ^[1-9][0-9]*$ ]] && (( ${#1} <= 7 )) && (( $1 >= 512 && $1 <= 1048576 ))
 }
 valid_operation_id() { [[ $1 =~ ^[a-f0-9]{32}$ ]]; }
+valid_keep_count() { [[ $1 =~ ^[0-9]+$ ]] && (( ${#1} <= 5 && 10#$1 <= 10000 )); }
+valid_export_name() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,199}\.tar\.gz$ ]]; }
 valid_lifecycle() { [[ $1 == persistent || $1 == ephemeral ]]; }
 valid_profile() { [[ $1 == minimal || $1 == build || $1 == python || $1 == network || $1 == rust || $1 == go || $1 == web ]]; }
 valid_profiles() {
@@ -159,6 +161,13 @@ snapshot_count() {
     for file in "$SNAPSHOT_DIR/$1/"*.img; do [[ -f $file && ! -L $file ]] && count=$((count + 1)); done
     printf '%s' "$count"
 }
+export_count() {
+    local file count=0
+    for file in "$EXPORT_DIR/$1-"*.tar.gz "$EXPORT_DIR/$1.tar.gz"; do
+        [[ -f $file && ! -L $file ]] && count=$((count + 1))
+    done
+    printf '%s' "$count"
+}
 
 package_for_command() {
     if command -v dnf >/dev/null 2>&1; then
@@ -266,10 +275,18 @@ check_readable_store() {
 }
 
 record_event() {
-    local descriptor
+    local descriptor bytes temporary max_bytes=${CHROOTABLE_ACTIVITY_MAX_BYTES:-1048576} keep_lines=${CHROOTABLE_ACTIVITY_KEEP_LINES:-500}
     exec {descriptor}>>"$STORE_DIR/.activity.lock" || return
     flock "$descriptor" || return
     printf '%s\t%s\t%s\t%s\t%s\n' "$(timestamp)" "$1" "$2" "$3" "$4" >>"$STORE_DIR/activity.tsv"
+    if [[ -f $STORE_DIR/activity.tsv && ! -L $STORE_DIR/activity.tsv && $max_bytes =~ ^[0-9]+$ && $keep_lines =~ ^[1-9][0-9]*$ ]]; then
+        bytes=$(stat -c%s -- "$STORE_DIR/activity.tsv" 2>/dev/null || printf 0)
+        if [[ $bytes =~ ^[0-9]+$ ]] && (( bytes > max_bytes )); then
+            temporary=$(mktemp "$STORE_DIR/.activity.tsv.XXXXXX") &&
+                tail -n "$keep_lines" "$STORE_DIR/activity.tsv" >"$temporary" &&
+                mv -T -- "$temporary" "$STORE_DIR/activity.tsv" || rm -f -- "${temporary:-}"
+        fi
+    fi
     exec {descriptor}>&-
 }
 # State files contain constrained identifiers and store-relative paths. Never source
@@ -556,6 +573,14 @@ profile_packages() {
         *) return 1 ;;
     esac
 }
+recommended_size_mib() {
+    case $1 in
+        minimal|network) printf 2048 ;;
+        build|python|web) printf 4096 ;;
+        rust|go) printf 6144 ;;
+        *) return 1 ;;
+    esac
+}
 list_profiles() {
     printf '%-12s %-9s %s\n' PROFILE SUGGESTED INCLUDES
     printf '%-12s %-9s %s\n' minimal '2 GiB' 'Debian minbase; a clean starting point' \
@@ -579,6 +604,7 @@ capabilities() {
 "suites":[{"id":"trixie","title":"Debian 13 (Trixie)"},{"id":"bookworm","title":"Debian 12 (Bookworm)"}],
 "limits":{"min_size_mib":512,"max_size_mib":1048576},
 "session_options":["disposable","isolated","share","read_only","restricted_dev"],
+"features":["import","prune-logs","delete-export","archive-sync","recover-operation"],
 "storage":{"allocation":"sparse","capacity_reserved":false},
 "operation_events":{"prefix":"CHROOTABLE_EVENT ","id_environment":"CHROOTABLE_OPERATION_ID","log_pattern":"logs/<id>.log"}}'
 }
@@ -789,6 +815,105 @@ export_image() (
     mv -T -- "$PENDING" "$archive" || return
     PENDING=
     printf '%s\n' "$archive"
+)
+canonicalize_archive_file() {
+    local original=$1 resolved
+    [[ -n $original && $original == /* && $original != *$'\n'* && $original != *$'\r'* ]] || { fail "Archive must be an absolute path without line breaks."; return 1; }
+    [[ ! -L $original ]] || { fail "Archive file must not be a symlink: $original"; return 1; }
+    IFS= read -r -d '' resolved < <(readlink -ez -- "$original") || { fail "Archive file does not exist: $original"; return 1; }
+    [[ -f $resolved && ! -L $resolved ]] || { fail "Archive must be an existing regular file: $original"; return 1; }
+    [[ $resolved == *.tar.gz || $resolved == *.tgz ]] || { fail "Archive must be a .tar.gz or .tgz file: $original"; return 1; }
+    printf -v "$2" '%s' "$resolved"
+}
+validate_tar_archive() {
+    local archive=$1 entry has_entry=0
+    gzip -t -- "$archive" 2>/dev/null || { fail "Archive is not a valid gzip-compressed file: $archive"; return 1; }
+    while IFS= read -r entry; do
+        [[ -n $entry ]] || continue
+        has_entry=1
+        if [[ $entry == /* || $entry == ../* || $entry == */../* || $entry == */.. || $entry == .. ]]; then
+            fail "Archive contains unsafe path traversal entry: $entry"
+            return 1
+        fi
+    done < <(tar -tzf "$archive" 2>/dev/null) || { fail "Could not read tar archive entries: $archive"; return 1; }
+    (( has_entry )) || { fail "Archive is empty: $archive"; return 1; }
+}
+import_image() (
+    local name=$1 archive=$2 size=${3:-} lifecycle=${4:-persistent} profile=${5:-minimal} image descriptor arch
+    unused_image "$name" || return
+    valid_lifecycle "$lifecycle" || { fail "Lifecycle must be persistent or ephemeral."; return 1; }
+    valid_profile "$profile" || { fail "Unknown profile: $profile. See --profiles."; return 1; }
+    [[ -n $size ]] || size=$(recommended_size_mib "$profile") || return
+    valid_size_mib "$size" || { fail "Size must be a whole number from 512 to 1048576 MiB."; return 1; }
+    canonicalize_archive_file "$archive" archive || return
+    validate_tar_archive "$archive" || return
+    image="$IMAGE_DIR/$name.img"
+    lock_image "$image" descriptor || return
+    unused_image "$name" || return
+    preflight_free_space "$((size * 1048576))" || return
+    begin_operation import "$name" || return
+    PENDING=$(mktemp "$IMAGE_DIR/.$name.XXXXXX.partial") || return
+    OP_PENDING=${PENDING#"$STORE_DIR/"}; operation_stage allocating || return
+    make_workdir || return
+    arch=$(dpkg --print-architecture) || return
+    info "Importing $name from ${archive##*/} / $profile / $size MiB. Log: $OP_LOG"
+    allocate_image "$PENDING" "$size" || return
+    operation_stage formatting || return
+    mkfs.ext4 -F -L "${name:0:16}" "$PENDING" >>"$OP_LOG" 2>&1 || return
+    operation_stage importing || return
+    run_worker import "$PENDING" "$WORK" "$name" "$archive" >>"$OP_LOG" 2>&1 || return
+    write_metadata "$PENDING" "$lifecycle" "$DEBIAN_SUITE" "$arch" "$size" "$(timestamp)" never "$profile" "import:${archive##*/}" || return
+    publish_image "$PENDING" "$image" || return
+    PENDING=
+    info "Imported '$name' from '${archive##*/}'."
+)
+prune_logs() (
+    local keep=${1:-20} record log base op_id removed=0 idx=0
+    local -A protected=() state=()
+    local -a logs=() sorted_logs=()
+    valid_keep_count "$keep" || { fail "Keep count must be a whole number from 0 to 10000."; return 1; }
+    [[ ! -L $LOG_DIR && ! -L $OPERATIONS_DIR ]] || { fail "Store subdirectories must not be symlinks."; return 1; }
+    for record in "$OPERATIONS_DIR/"*.state; do
+        [[ -f $record && ! -L $record ]] || continue
+        if ! read_operation_state "$record" state; then
+            base=${record##*/}; base=${base%.state}
+            protected["$LOG_DIR/$base.log"]=1
+            continue
+        fi
+        if operation_is_alive state || [[ ( ${state[status]} != completed && ${state[status]} != recovered ) && ${state[stage]} == publish-* ]]; then
+            protected["$LOG_DIR/${state[id]}.log"]=1
+        fi
+    done
+    for log in "$LOG_DIR/"*.log; do
+        [[ -f $log && ! -L $log ]] || continue
+        [[ -z ${protected[$log]:-} ]] || continue
+        logs+=("$log")
+    done
+    if (( ${#logs[@]} > 10#$keep )); then
+        mapfile -t sorted_logs < <(stat -c '%Y %n' -- "${logs[@]}" | sort -rn | cut -d' ' -f2-)
+        for (( idx = 10#$keep; idx < ${#sorted_logs[@]}; idx++ )); do
+            log=${sorted_logs[$idx]}
+            [[ -f $log && ! -L $log && -z ${protected[$log]:-} ]] || continue
+            rm -f -- "$log" || return
+            base=${log##*/}; op_id=${base%.log}
+            if valid_operation_id "$op_id" && [[ -f $OPERATIONS_DIR/$op_id.state && ! -L $OPERATIONS_DIR/$op_id.state ]]; then
+                rm -f -- "$OPERATIONS_DIR/$op_id.state" || return
+            fi
+            removed=$((removed + 1))
+        done
+    fi
+    record_event prune-logs store ok "" || return
+    info "Pruned $removed operation log(s) (retained up to $((10#$keep)) newest completed logs)."
+)
+delete_export() (
+    local filename=$1 target
+    valid_export_name "$filename" || { fail "Invalid export archive filename: $filename"; return 1; }
+    [[ ! -L $EXPORT_DIR ]] || { fail "Export directory must not be a symlink."; return 1; }
+    target="$EXPORT_DIR/$filename"
+    [[ -f $target && ! -L $target ]] || { fail "Export archive not found: $filename"; return 1; }
+    rm -f -- "$target" || return
+    record_event delete-export "${filename%.tar.gz}" ok "" || return
+    info "Deleted export archive '$filename'."
 )
 set_lifecycle() (
     local image=$1 lifecycle=$2 descriptor
@@ -1075,6 +1200,14 @@ worker_main() (
             mount -o loop,ro,noload "$image" "$WORKER_ROOT" || return
             tar --numeric-owner --acls --xattrs --one-file-system -C "$WORKER_ROOT" -czf "$1" . || return
             ;;
+        import)
+            local name=$1 archive=$2
+            mount -o loop "$image" "$WORKER_ROOT" || return
+            tar --numeric-owner --acls --xattrs --no-overwrite-dir -p -C "$WORKER_ROOT" -xzf "$archive" || return
+            if [[ -d $WORKER_ROOT/etc && ! -L $WORKER_ROOT/etc && ! -L $WORKER_ROOT/etc/hostname ]]; then
+                printf '%s\n' "$name" >"$WORKER_ROOT/etc/hostname" || return
+            fi
+            ;;
         enter)
             local name=$1 lifecycle=$2 network=$3 share=$4 read_only=$5
             shift 5
@@ -1209,7 +1342,8 @@ list_images() {
 }
 image_details() {
     local image=$1 name status=ready lifecycle=persistent suite=unknown architecture=unknown
-    local profile=minimal created_at='unknown (legacy image)' last_used_at=never mkey mval bytes=0 blocks=0
+    local profile=minimal created_at='unknown (legacy image)' last_used_at=never origin=none mkey mval bytes=0 blocks=0 record target
+    local -A op_state=()
     name=${image##*/}; name=${name%.img}
     if [[ -f $image.lock && ! -L $image.lock ]]; then status=$(image_status "$image"); fi
     if [[ -f $image.meta && ! -L $image.meta ]]; then
@@ -1221,6 +1355,7 @@ image_details() {
                 profile) [[ -z $mval ]] || profile=$mval ;;
                 created_at) [[ -z $mval ]] || created_at=$mval ;;
                 last_used_at) [[ -z $mval ]] || last_used_at=$mval ;;
+                origin) [[ -z $mval ]] || origin=$mval ;;
             esac
         done <"$image.meta"
     elif [[ -f $image.mode && ! -L $image.mode ]]; then
@@ -1231,9 +1366,23 @@ image_details() {
     printf '%s  /  %s  /  %s\n' "$name" "$status" "$lifecycle"
     printf '\nDebian %-14s Architecture %s\nProfile %-13s Snapshots    %s\n' \
         "$suite" "$architecture" "$profile" "$(snapshot_count "$name")"
-    printf 'Capacity %s MiB   Allocated %s\nCreated  %s\nLast run %s\nImage    %s\n' \
+    printf 'Capacity %s MiB   Allocated %s\nOrigin   %-13s Exports      %s\nCreated  %s\nLast run %s\nImage    %s\n' \
         "$((bytes / 1048576))" "$(human_bytes "$((blocks * 512))")" \
+        "$origin" "$(export_count "$name")" \
         "$created_at" "$last_used_at" "$image"
+    if [[ -d $OPERATIONS_DIR && ! -L $OPERATIONS_DIR && -r $OPERATIONS_DIR && -x $OPERATIONS_DIR ]]; then
+        for record in "$OPERATIONS_DIR/"*.state; do
+            [[ -f $record && ! -L $record ]] || continue
+            read_operation_state "$record" op_state || continue
+            [[ ${op_state[stage]} == publish-* && ${op_state[status]} != completed && ${op_state[status]} != recovered ]] || continue
+            ! operation_is_alive op_state || continue
+            target=${op_state[destination]:-}
+            if [[ $target == "images/$name.img" || $target == "snapshots/$name/"* ]]; then
+                printf 'Pending  Interrupted %s (%s) — recover with: sudo %s --recover-operation %s --yes\n' \
+                    "${op_state[action]}" "${op_state[id]}" "$0" "${op_state[id]}"
+            fi
+        done
+    fi
 }
 workspace_summary() {
     local image total=0 persistent=0 ephemeral=0 busy=0 bytes=0 snapshots=0 free=unknown lifecycle mkey mval blocks stat_output
@@ -1556,13 +1705,19 @@ choose_lifecycle() {
 }
 create_chrootable() {
     local name profile size lifecycle suggested=2048
-    profile=$(ui --menu "Start with a purpose. Each profile is Debian minbase plus a focused set of tools." 16 "$UI_WIDTH" 4 \
-        minimal "Clean Debian base" build "C/C++, make, Git and build tools" python "Python, virtual environments, pip and Git" network "DNS, HTTP, SSH and network diagnostics" 3>&1 1>&2 2>&3) || return 0
+    profile=$(ui --menu "Start with a purpose. Each profile is Debian minbase plus a focused set of tools." 19 "$UI_WIDTH" 7 \
+        minimal "Clean Debian base" \
+        build "C/C++, make, Git and build tools" \
+        python "Python, virtual environments, pip and Git" \
+        network "DNS, HTTP, SSH and network diagnostics" \
+        rust "Rust toolchain, cargo, Git and pkg-config" \
+        go "Go toolchain, Git and curl" \
+        web "Node.js, npm, Git and curl" 3>&1 1>&2 2>&3) || return 0
     name=$(ui --inputbox "Workspace name (letters, digits, dot, underscore, hyphen):" 10 "$UI_WIDTH" "$profile-lab" 3>&1 1>&2 2>&3) || return 0
     valid_name "$name" || { ui_message "Invalid name. Start with a letter or digit; use at most 64 characters."; return; }
-    [[ $profile != build && $profile != python ]] || suggested=4096
-    size=$(ui --inputbox "Image capacity in MiB. Suggested for $profile: $suggested MiB.\nThe image is fully allocated when created." 11 "$UI_WIDTH" "$suggested" 3>&1 1>&2 2>&3) || return 0
-    valid_size_mib "$size" || { ui_message "Enter a whole number from 1 to 1048576 MiB."; return; }
+    suggested=$(recommended_size_mib "$profile") || suggested=2048
+    size=$(ui --inputbox "Image capacity in MiB (512 to 1048576). Suggested for $profile: $suggested MiB.\nImages are sparse and grow as data is written; free space is checked before creation." 11 "$UI_WIDTH" "$suggested" 3>&1 1>&2 2>&3) || return 0
+    valid_size_mib "$size" || { ui_message "Enter a whole number from 512 to 1048576 MiB."; return; }
     lifecycle=$(choose_lifecycle) || return 0
     ui --yesno "Create $name?\n\nDebian: $DEBIAN_SUITE\nProfile: $profile\nCapacity: $size MiB\nSessions: $lifecycle\n\nThis downloads Debian and the selected profile packages." 17 "$UI_WIDTH" || return 0
     ui_run create_image "$name" "$size" "$lifecycle" "$profile"
@@ -1731,6 +1886,8 @@ Explore (no root required when the store is readable)
 
 Create and use (root required)
   --create NAME SIZE_MIB persistent|ephemeral [PROFILE]
+  --import NAME ARCHIVE.tar.gz [SIZE_MIB] [persistent|ephemeral] [PROFILE]
+                                   Rehydrate a .tar.gz export into a workspace
   --archive-sync SUITE [PROFILE...]
                                    Download everything creates of SUITE need
                                    (all profiles by default) so they work
@@ -1753,6 +1910,8 @@ Recovery and maintenance (root required)
   --drop-snapshot NAME LABEL --yes  Permanently delete one snapshot
   --repair NAME --yes              Forced ext4 repair
   --delete NAME --yes              Delete image; keep snapshots and exports
+  --delete-export FILENAME --yes   Delete a retained .tar.gz export archive
+  --prune-logs [KEEP_COUNT] --yes  Remove old completed logs (default: keep 20)
   --setup                          Install missing host dependencies
   --recover-operation ID --yes      Finish an interrupted staged publication
 
@@ -1824,12 +1983,15 @@ validate_cli() {
         --inspect) [[ $# == 2 || ( $# == 3 && $3 == --json ) ]] && valid_name "$2" ;;
         --snapshots|--logs|--export) [[ $# == 2 ]] && valid_name "$2" ;;
         --create) [[ $# == 4 || $# == 5 ]] && valid_name "$2" && valid_size_mib "$3" && valid_lifecycle "$4" && valid_profile "${5:-minimal}" ;;
+        --import) [[ $# -ge 3 && $# -le 6 ]] && valid_name "$2" && [[ -n $3 && $3 == /* && $3 != *$'\n'* && $3 != *$'\r'* ]] && { [[ -z ${4:-} ]] || valid_size_mib "$4"; } && valid_lifecycle "${5:-persistent}" && valid_profile "${6:-minimal}" ;;
         --archive-sync) [[ $# -ge 2 ]] && valid_suite "$2" && valid_profiles "${@:3}" ;;
         --clone|--snapshot) [[ $# == 3 ]] && valid_name "$2" && valid_name "$3" ;;
         --mode) [[ $# == 3 ]] && valid_name "$2" && valid_lifecycle "$3" ;;
         --resize) [[ $# == 3 ]] && valid_name "$2" && valid_size_mib "$3" ;;
         --restore|--drop-snapshot) [[ $# == 4 && $4 == --yes ]] && valid_name "$2" && valid_name "$3" ;;
         --repair|--delete) [[ $# == 3 && $3 == --yes ]] && valid_name "$2" ;;
+        --delete-export) [[ $# == 3 && $3 == --yes ]] && valid_export_name "$2" ;;
+        --prune-logs) ( [[ $# == 2 && $2 == --yes ]] ) || ( [[ $# == 3 && $3 == --yes ]] && valid_keep_count "$2" ) ;;
         --enter|--enter-isolated|--exec|--try) [[ $# -ge 2 ]] && valid_name "$2" && validate_session_arguments "$@" ;;
         *) return 1 ;;
     esac
@@ -1844,8 +2006,11 @@ run_cli() {
         --activity) activity ;; --logs) show_logs "$2" ;; --snapshots) list_snapshots "$2" ;;
         --setup) info "All host dependencies are available." ;;
         --recover-operation) recover_operation "$2" ;;
+        --prune-logs) if [[ $2 == --yes ]]; then prune_logs 20; else prune_logs "$2"; fi ;;
+        --delete-export) delete_export "$2" ;;
         --archive-sync) shift; archive_sync "$@" ;;
         --create) create_image "$2" "$3" "$4" "${5:-minimal}" ;;
+        --import) import_image "$2" "$3" "${4:-}" "${5:-persistent}" "${6:-minimal}" ;;
         --restore) restore_image "$2" "$3" ;;
         --drop-snapshot) drop_snapshot "$2" "$3" ;;
         *)
@@ -1885,7 +2050,7 @@ main() {
             NON_INTERACTIVE=0
             require_root && init_store && begin_operation setup host || return
             CHROOTABLE_DEP_LOG="$OP_LOG" check_prerequisites || return ;;
-        --recover-operation) require_root && init_store || return ;;
+        --recover-operation|--prune-logs|--delete-export) require_root && init_store || return ;;
         *)
             require_root && check_prerequisites && init_store || return ;;
     esac

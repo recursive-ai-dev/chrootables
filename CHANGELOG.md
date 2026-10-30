@@ -1,7 +1,37 @@
 # Changelog
 
-The current release is numbered `1.1.0`. Earlier development release numbers
+The current release is numbered `1.2.0`. Earlier development release numbers
 are retained below as historical records.
+
+## v1.2.0 — 2026-10-30
+
+- Add workspace archive import (`--import NAME ARCHIVE.tar.gz [SIZE_MIB] [persistent|ephemeral] [PROFILE]`)
+  in both the CLI and desktop workbench, validating tar archives against path
+  traversal, absolute paths and device/FIFO nodes before extracting into a fresh
+  sparse ext4 image.
+- Surface interrupted staged-publication operations in the desktop Recovery view
+  with a one-click **Recover publication** action (`--recover-operation ID --yes`).
+- Add safe operation cancellation (`Cancel` in the desktop task panel and broker
+  `cancel` action) that terminates in-flight bootstraps/copies while refusing to
+  interrupt atomic `publish-image` / `publish-metadata` commits.
+- Add store retention maintenance: `--prune-logs [KEEP_COUNT] --yes`,
+  `--delete-export FILENAME --yes`, retained export re-import/deletion in the
+  desktop Recovery view, and automatic tail compaction of `activity.tsv` when
+  the journal exceeds `CHROOTABLE_ACTIVITY_MAX_BYTES`.
+- Add desktop offline archive cache status and **Sync offline archive** action
+  (`--archive-sync SUITE`) in Host Health.
+- Support sub-GiB (`512–1048576 MiB`) capacity selection in the desktop Create
+  dialog alongside `GiB`, matching CLI capability bounds.
+- Update interactive TUI creation (`create_chrootable`) to offer all 7 profiles
+  (`minimal`, `build`, `python`, `network`, `rust`, `go`, `web`), profile-aware
+  recommended sizes, and accurate sparse-allocation messaging.
+- Add inline duplicate-name and duplicate-label collision validation in Clone
+  and Save Snapshot dialogs, and distinct profile badges (`Rs`, `Go`, `JS`, `Min`)
+  in workspace rows.
+- Expand external terminal detection (`ptyxis`, `kgx`, `alacritty`, `kitty`,
+  `wezterm`, `foot`, `xfce4-terminal`, `mate-terminal`, `tilix`), and add SGR
+  dim/strikethrough, `CSI b` (`REP`), `Ctrl+Arrow` navigation, and scrollback
+  search (`Ctrl+Shift+F`) plus scrollback clearing in the embedded terminal.
 
 ## v1.1.0 — 2026-10-27
 

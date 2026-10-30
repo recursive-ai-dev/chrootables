@@ -16,12 +16,33 @@ def valid_result(action, data):
         return isinstance(data, str)
     if action == "doctor":
         return fields(data, ("output",)) and type(data.get("ready")) is bool
+    if action == "cancel":
+        return isinstance(data, dict) and type(data.get("cancelled")) is bool and isinstance(data.get("stage", ""), str)
     if action == "inventory":
         if not fields(data, integers=("free_bytes", "total_bytes")):
             return False
         if "storage" in data and not fields(data["storage"], integers=(
                 "images_bytes", "snapshots_bytes", "exports_bytes", "logs_bytes")):
             return False
+        if "operations" in data:
+            if (not isinstance(data["operations"], list)
+                    or not all(fields(item, ("id", "action", "name", "status", "stage", "log"))
+                               and type(item.get("active")) is bool
+                               and type(item.get("recoverable")) is bool
+                               for item in data["operations"])):
+                return False
+        if "exports" in data:
+            if (not isinstance(data["exports"], list)
+                    or not all(fields(item, ("filename", "path", "updated_at"), ("size_bytes", "allocated_bytes"))
+                               for item in data["exports"])):
+                return False
+        if "archives" in data:
+            if (not isinstance(data["archives"], list)
+                    or not all(fields(item, ("id", "suite", "architecture", "updated_at"), ("size_bytes",))
+                               and isinstance(item.get("profiles"), list)
+                               and all(isinstance(p, str) for p in item["profiles"])
+                               for item in data["archives"])):
+                return False
         schemas = {
             "images": (("name", "status", "lifecycle", "suite", "profile", "architecture",
                         "created_at", "last_used_at", "origin"),

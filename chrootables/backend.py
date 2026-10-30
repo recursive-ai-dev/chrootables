@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import fcntl
+from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -18,7 +19,13 @@ ROOT = Path(__file__).resolve().parent.parent
 MANAGER = ROOT / "chrootable-manager"
 DEFAULT_STORE = Path("/var/lib/chrootable-manager")
 NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
-MUTATIONS = {"create", "clone", "snapshot", "restore", "drop-snapshot", "resize", "mode", "repair", "delete", "export", "setup"}
+OPERATION_ID_RE = re.compile(r"[a-f0-9]{32}\Z")
+EXPORT_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}\.tar\.gz\Z")
+MUTATIONS = {
+    "create", "import", "clone", "snapshot", "restore", "drop-snapshot",
+    "resize", "mode", "repair", "delete", "export", "setup",
+    "recover-operation", "prune-logs", "delete-export", "archive-sync",
+}
 
 
 def load_capabilities():
@@ -73,6 +80,44 @@ def size(value):
     return str(value)
 
 
+def operation_id(value):
+    if not isinstance(value, str) or not OPERATION_ID_RE.fullmatch(value):
+        raise ValueError("Operation ID must be 32 lowercase hexadecimal characters.")
+    return value
+
+
+def export_name(value):
+    if not isinstance(value, str) or not EXPORT_NAME_RE.fullmatch(value):
+        raise ValueError("Invalid export archive filename.")
+    return value
+
+
+def keep_count(value):
+    if type(value) is not int or not 0 <= value <= 10000:
+        raise ValueError("Keep count must be a whole number from 0 to 10000.")
+    return value
+
+
+def archive_file(value):
+    """Validate and resolve a host .tar.gz or .tgz archive without following a final symlink."""
+    if not isinstance(value, str) or not value or any(c in value for c in "\x00\r\n"):
+        raise ValueError("Choose an existing .tar.gz or .tgz archive with an absolute path.")
+    path = Path(value)
+    if not path.is_absolute():
+        raise ValueError("Archive path must be an absolute path.")
+    if os.path.islink(path):
+        raise ValueError("Archive file must not be a symlink.")
+    try:
+        resolved = path.resolve(strict=True)
+        if not resolved.is_file() or os.path.islink(resolved):
+            raise ValueError("Archive must be an existing regular file.")
+    except (OSError, RuntimeError) as error:
+        raise ValueError("Archive file is unavailable.") from error
+    if any(c in str(resolved) for c in "\r\n") or not str(resolved).endswith((".tar.gz", ".tgz")):
+        raise ValueError("Archive must be a .tar.gz or .tgz file.")
+    return str(resolved)
+
+
 def build_command(action, params):
     """Return an allowlisted argv and environment additions, never a command string."""
     if not isinstance(params, dict):
@@ -83,6 +128,27 @@ def build_command(action, params):
         return args + ["--setup"], {"CHROOTABLE_AUTO_INSTALL": "1"}
     if action not in MUTATIONS:
         raise ValueError("Unsupported operation.")
+    if action == "recover-operation":
+        if params.get("confirmed") is not True:
+            raise ValueError("This operation requires confirmation.")
+        return args + ["--recover-operation", operation_id(params.get("id")), "--yes"], env
+    if action == "prune-logs":
+        if params.get("confirmed") is not True:
+            raise ValueError("This operation requires confirmation.")
+        keep = keep_count(params.get("keep", 20))
+        return args + ["--prune-logs", str(keep), "--yes"], env
+    if action == "delete-export":
+        if params.get("confirmed") is not True:
+            raise ValueError("This operation requires confirmation.")
+        return args + ["--delete-export", export_name(params.get("filename")), "--yes"], env
+    if action == "archive-sync":
+        suite = params.get("suite", "trixie")
+        if suite not in SUITES and suite != "stable":
+            raise ValueError("Unsupported Debian release.")
+        profiles = params.get("profiles", [])
+        if not isinstance(profiles, list) or any(not isinstance(p, str) or p not in PROFILES for p in profiles):
+            raise ValueError("Unsupported profile.")
+        return args + ["--archive-sync", suite, *profiles], env
     target = name(params.get("name"))
     args += ["--" + action, target]
     if action == "create":
@@ -92,6 +158,14 @@ def build_command(action, params):
         if mode not in ("persistent", "ephemeral") or profile not in PROFILES or suite not in SUITES:
             raise ValueError("Unsupported lifecycle, profile or Debian release.")
         args += [size(params.get("size_mib")), mode, profile]
+        env["CHROOTABLE_DEBIAN_SUITE"] = suite
+    elif action == "import":
+        mode = params.get("lifecycle", "persistent")
+        profile = params.get("profile", "minimal")
+        suite = params.get("suite", "trixie")
+        if mode not in ("persistent", "ephemeral") or profile not in PROFILES or suite not in SUITES:
+            raise ValueError("Unsupported lifecycle, profile or Debian release.")
+        args += [archive_file(params.get("archive")), size(params.get("size_mib", 2048)), mode, profile]
         env["CHROOTABLE_DEBIAN_SUITE"] = suite
     elif action in ("clone", "snapshot", "restore", "drop-snapshot"):
         args.append(name(params.get("target")))
@@ -193,6 +267,17 @@ def metadata(path):
         return {}
 
 
+def _process_alive(pid, expected_start):
+    try:
+        if not isinstance(pid, str) or not pid.isdigit() or not expected_start:
+            return False
+        text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+        after_comm = text.rsplit(") ", 1)[1].split()
+        return len(after_comm) > 19 and after_comm[19] == expected_start
+    except (OSError, IndexError, ValueError):
+        return False
+
+
 class Store:
     def __init__(self, path=DEFAULT_STORE):
         self.path = Path(path)
@@ -203,10 +288,19 @@ class Store:
         self._snap_meta_cache = {}
         self._activity_sig = None
         self._activity_cache = []
+        self._operations_sig = None
+        self._operations_cache = []
+        self._operations_has_running = False
+        self._archives_sig = None
+        self._archives_cache = []
+        self._exports_cache = []
         self._inventory_lock = threading.Lock()
         self._storage_cache = {}
         self._storage_signature = None
         self._storage_checked = 0.0
+        self._active_lock = threading.Lock()
+        self._active_process = None
+        self._active_stage = ""
 
     def environment(self, extra=None):
         result = {
@@ -325,9 +419,123 @@ class Store:
         while not existing.exists():
             existing = existing.parent
         usage = shutil.disk_usage(existing)
+        storage = self.storage_summary(images, snapshots)
         return {"images": images, "snapshots": snapshots, "activity": activity,
+                "operations": self._scan_operations(), "exports": list(self._exports_cache),
+                "archives": self._scan_archives(),
                 "store": str(self.path), "free_bytes": usage.free, "total_bytes": usage.total,
-                "storage": self.storage_summary(images, snapshots)}
+                "storage": storage}
+
+    def _scan_operations(self):
+        op_dir = self.path / "operations"
+        try:
+            info = op_dir.lstat()
+        except FileNotFoundError:
+            self._operations_sig = None
+            self._operations_cache = []
+            self._operations_has_running = False
+            return []
+        if not stat.S_ISDIR(info.st_mode):
+            raise ValueError("Store directories must not be symlinks.")
+        sig = (info.st_ino, info.st_mtime_ns)
+        if sig == self._operations_sig and not self._operations_has_running:
+            return self._operations_cache
+        records = []
+        has_running = False
+        with os.scandir(op_dir) as entries:
+            state_entries = sorted(
+                (e for e in entries if not e.is_symlink() and e.name.endswith(".state") and e.is_file(follow_symlinks=False)),
+                key=lambda e: e.name,
+            )
+        for entry in state_entries:
+            op_id = entry.name[:-6]
+            if not OPERATION_ID_RE.fullmatch(op_id):
+                continue
+            state = metadata(Path(entry.path))
+            if state.get("format") != "1" or state.get("id") != op_id:
+                continue
+            action = state.get("action", "")
+            ws_name = state.get("name", "")
+            status = state.get("status", "")
+            stage = state.get("stage", "")
+            if not NAME_RE.fullmatch(ws_name) or status not in ("running", "completed", "failed", "interrupted", "recovered"):
+                continue
+            active = _process_alive(state.get("pid", ""), state.get("process_start", ""))
+            if status == "running":
+                has_running = True
+                if not active:
+                    status = "interrupted"
+            recoverable = (not active and status not in ("completed", "recovered") and stage.startswith("publish-"))
+            records.append({
+                "id": op_id,
+                "action": action,
+                "name": ws_name,
+                "status": status,
+                "stage": stage,
+                "log": str(self.path / "logs" / (op_id + ".log")),
+                "active": active,
+                "recoverable": recoverable,
+            })
+        self._operations_sig = sig
+        self._operations_cache = records
+        self._operations_has_running = has_running
+        return records
+
+    def _scan_archives(self):
+        arch_dir = self.path / "archive"
+        try:
+            info = arch_dir.lstat()
+        except FileNotFoundError:
+            self._archives_sig = None
+            self._archives_cache = []
+            return []
+        if not stat.S_ISDIR(info.st_mode):
+            raise ValueError("Store directories must not be symlinks.")
+        sig = (info.st_ino, info.st_mtime_ns)
+        if sig == self._archives_sig:
+            return self._archives_cache
+        archives = []
+        with os.scandir(arch_dir) as entries:
+            subdirs = sorted(
+                (e for e in entries if not e.is_symlink() and not e.name.startswith(".") and e.is_dir(follow_symlinks=False)),
+                key=lambda e: e.name,
+            )
+        for subdir in subdirs:
+            sub_path = Path(subdir.path)
+            base_tgz = sub_path / "base.tgz"
+            mirror_file = sub_path / "mirror"
+            if not base_tgz.is_file() or base_tgz.is_symlink() or not mirror_file.is_file() or mirror_file.is_symlink():
+                continue
+            suite, _, arch = subdir.name.rpartition("-")
+            if not suite or not arch:
+                continue
+            try:
+                profiles_raw = read_regular(sub_path / "profiles").splitlines() if (sub_path / "profiles").is_file() else []
+            except OSError:
+                profiles_raw = []
+            profiles = ["minimal"] + [p.strip() for p in profiles_raw if p.strip() and p.strip() != "minimal"]
+            total_bytes = 0
+            for root_dir, _, files in os.walk(sub_path, followlinks=False):
+                for fname in files:
+                    fpath = Path(root_dir) / fname
+                    try:
+                        fst = fpath.lstat()
+                    except OSError:
+                        continue
+                    if stat.S_ISREG(fst.st_mode):
+                        total_bytes += fst.st_blocks * 512
+            st = base_tgz.lstat()
+            archives.append({
+                "id": subdir.name,
+                "suite": suite,
+                "architecture": arch,
+                "profiles": profiles,
+                "size_bytes": total_bytes,
+                "updated_at": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds"),
+            })
+        self._archives_sig = sig
+        self._archives_cache = archives
+        return archives
 
     def storage_summary(self, images, snapshots):
         """Report allocated blocks, caching archive/log scans between changes.
@@ -349,6 +557,7 @@ class Store:
         now = time.monotonic()
         if signature != self._storage_signature or now - self._storage_checked >= 30:
             totals = {}
+            exports_list = []
             for directory, stamp in zip(directories, signature):
                 total = 0
                 if stamp is not None:
@@ -360,7 +569,17 @@ class Store:
                                 continue
                             if stat.S_ISREG(info.st_mode):
                                 total += info.st_blocks * 512
+                                if directory.name == "exports" and EXPORT_NAME_RE.fullmatch(entry.name):
+                                    exports_list.append({
+                                        "filename": entry.name,
+                                        "path": entry.path,
+                                        "size_bytes": info.st_size,
+                                        "allocated_bytes": info.st_blocks * 512,
+                                        "updated_at": datetime.fromtimestamp(info.st_mtime).isoformat(timespec="seconds"),
+                                    })
                 totals[directory.name + "_bytes"] = total
+            exports_list.sort(key=lambda item: (item["updated_at"], item["filename"]), reverse=True)
+            self._exports_cache = exports_list
             self._storage_cache = totals
             self._storage_signature = signature
             self._storage_checked = now
@@ -425,6 +644,17 @@ class Store:
             raise RuntimeError("Host health returned invalid storage capacity.")
         return report
 
+    def cancel_operation(self):
+        with self._active_lock:
+            process = self._active_process
+            stage = self._active_stage
+            if process is None or process.poll() is not None:
+                raise RuntimeError("No running operation to cancel.")
+            if stage.startswith("publish-"):
+                raise RuntimeError("Cannot cancel while atomic image publication is in progress.")
+            process.terminate()
+            return {"cancelled": True, "stage": stage}
+
     def operate(self, action, params, output, progress=None):
         args, extra = build_command(action, params)
         operation_id = uuid.uuid4().hex
@@ -432,6 +662,9 @@ class Store:
         operation_log = self.path / "logs" / (operation_id + ".log")
         # A reader thread drains the child while the main thread tails its operation log.
         process = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+        with self._active_lock:
+            self._active_process = process
+            self._active_stage = "starting"
         archives = []
         def drain():
             for line in process.stdout:
@@ -444,6 +677,8 @@ class Store:
                             and isinstance(event.get("stage"), str)
                             and 0 < len(event["stage"]) <= 256
                             and not any(ord(character) < 32 for character in event["stage"])):
+                        with self._active_lock:
+                            self._active_stage = event["stage"]
                         if progress:
                             progress(event["stage"])
                         continue
@@ -473,13 +708,20 @@ class Store:
                 tail_file(str(operation_log), operation_log.lstat())
             except (FileNotFoundError, OSError):
                 pass
-        while process.poll() is None:
+        try:
+            while process.poll() is None:
+                tail()
+                time.sleep(0.2)
+            reader.join()
+            process.stdout.close()
             tail()
-            time.sleep(0.2)
-        reader.join()
-        process.stdout.close()
-        tail()
+        finally:
+            with self._active_lock:
+                self._active_process = None
+                self._active_stage = ""
         self._storage_signature = None
+        self._operations_sig = None
+        self._archives_sig = None
         if process.returncode == 0 and action == "export" and params.get("destination"):
             if len(archives) != 1:
                 raise RuntimeError("Could not identify the completed export archive.")
@@ -533,10 +775,29 @@ def terminal_command(target, store=DEFAULT_STORE, *, disposable=False, isolated=
                      share=None, read_only=False, restricted_dev=False):
     command = session_command(target, store, disposable=disposable, isolated=isolated,
                               share=share, read_only=read_only, restricted_dev=restricted_dev)
+    title = "Chrootables · " + target
     if shutil.which("konsole"):
         return ["konsole", "--separate", "--hold", "-p", "tabtitle=" + target, "-e"] + command
     if shutil.which("gnome-terminal"):
         return ["gnome-terminal", "--wait", "--"] + command
+    if shutil.which("ptyxis"):
+        return ["ptyxis", "--standalone", "--title", title, "--"] + command
+    if shutil.which("kgx"):
+        return ["kgx", "--title", title, "--"] + command
+    if shutil.which("xfce4-terminal"):
+        return ["xfce4-terminal", "--disable-server", "--hold", "--title", title, "-x"] + command
+    if shutil.which("mate-terminal"):
+        return ["mate-terminal", "--disable-factory", "--title", title, "-x"] + command
+    if shutil.which("tilix"):
+        return ["tilix", "--title", title, "-e"] + command
+    if shutil.which("alacritty"):
+        return ["alacritty", "--hold", "--title", title, "-e"] + command
+    if shutil.which("kitty"):
+        return ["kitty", "--hold", "--title", title, "--"] + command
+    if shutil.which("wezterm"):
+        return ["wezterm", "start", "--always-new-process", "--"] + command
+    if shutil.which("foot"):
+        return ["foot", "--hold", "--title", title, "--"] + command
     if shutil.which("xterm"):
-        return ["xterm", "-hold", "-T", "Chrootables · " + target, "-e"] + command
-    raise RuntimeError("Install Konsole, GNOME Terminal or xterm to open workspace shells.")
+        return ["xterm", "-hold", "-T", title, "-e"] + command
+    raise RuntimeError("Install a supported terminal emulator (Konsole, GNOME Terminal, Ptyxis, GNOME Console, XFCE Terminal, Alacritty, Kitty, WezTerm, Foot or xterm) to open workspace shells.")

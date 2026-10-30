@@ -534,6 +534,53 @@ valid_mirror "https://deb.debian.org/debian" || exit 13
         result = subprocess.run(["bash", "-c", script, "supply-chain-test", str(MANAGER), str(self.path)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, f"exit {result.returncode}: {result.stderr}")
 
+    def test_new_commands_inventory_collections_and_cancellation(self):
+        archive = self.path / "exports/lab-20261015-120000.tar.gz"
+        archive.parent.mkdir(exist_ok=True)
+        archive.write_bytes(b"archive-data")
+        cache_dir = self.path / "archive/trixie-amd64"
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "base.tgz").write_bytes(b"cached-root")
+        op_id = "e" * 32
+        ops_dir = self.path / "operations"
+        ops_dir.mkdir(exist_ok=True)
+        (ops_dir / f"{op_id}.state").write_text(
+            f"id={op_id}\naction=clone\nname=lab\ntarget=copy\nstatus=running\nstage=publish-image\npid=999999\nupdated_at=2026-10-16T10:00:00\n"
+        )
+        cmd = build_command("import", {
+            "name": "imported", "archive": str(archive),
+            "size_mib": 512, "lifecycle": "persistent", "profile": "minimal",
+        }, manager="/usr/bin/chrootable-manager")
+        self.assertEqual(cmd, ["/usr/bin/chrootable-manager", "--import", "imported", str(archive.resolve()), "512", "persistent", "minimal"])
+        self.assertEqual(build_command("recover-operation", {"operation_id": op_id}, manager="/usr/bin/chrootable-manager"),
+                         ["/usr/bin/chrootable-manager", "--recover-operation", op_id])
+        self.assertEqual(build_command("prune-logs", {"keep": 25}, manager="/usr/bin/chrootable-manager"),
+                         ["/usr/bin/chrootable-manager", "--prune-logs", "25", "--yes"])
+        self.assertEqual(build_command("delete-export", {"filename": archive.name}, manager="/usr/bin/chrootable-manager"),
+                         ["/usr/bin/chrootable-manager", "--delete-export", archive.name, "--yes"])
+        self.assertEqual(build_command("archive-sync", {"suite": "trixie"}, manager="/usr/bin/chrootable-manager"),
+                         ["/usr/bin/chrootable-manager", "--archive-sync", "trixie"])
+        report = self.store.inventory()
+        self.assertEqual(len(report["operations"]), 1)
+        self.assertTrue(report["operations"][0]["recoverable"])
+        self.assertEqual(report["exports"][0]["filename"], archive.name)
+        self.assertEqual(report["archives"][0]["suite"], "trixie")
+        with self.assertRaisesRegex(RuntimeError, "No operation"):
+            self.store.cancel_operation()
+        proc = Mock()
+        proc.poll.return_value = None
+        self.store._active_process = proc
+        self.store._active_stage = "publish-image"
+        with self.assertRaisesRegex(RuntimeError, "atomic publication"):
+            self.store.cancel_operation()
+        self.store._active_stage = "Copying image"
+        self.assertTrue(self.store.cancel_operation()["cancelled"])
+        proc.terminate.assert_called_once()
+        self.store._active_process = None
+        with patch("chrootables.backend.shutil.which", side_effect=lambda name: "/usr/bin/alacritty" if name == "alacritty" else None):
+            self.assertEqual(terminal_command(["/usr/bin/chrootable-manager", "--shell", "lab"]),
+                             ["/usr/bin/alacritty", "-e", "/usr/bin/chrootable-manager", "--shell", "lab"])
+
 
 if __name__ == "__main__":
     unittest.main()

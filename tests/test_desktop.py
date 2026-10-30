@@ -662,6 +662,37 @@ class DesktopTests(unittest.TestCase):
         self.assertEqual(self.window.focusWidget(), self.window.activity_search)
         self.assertFalse(self.settings.contains("appearance/text_scale"))
 
+    def test_mib_create_mode_import_dialog_collision_checks_and_maintenance_actions(self):
+        from chrootables.app import CreateDialog, ImportDialog, ValueDialog
+        create_dlg = CreateDialog(self.window, existing={"python-playground"})
+        self.addCleanup(create_dlg.close)
+        create_dlg.name_input.setText("python-playground")
+        self.assertFalse(create_dlg.submit.isEnabled())
+        create_dlg.name_input.setText("sub-gib-lab")
+        create_dlg.size_unit.setCurrentIndex(1)
+        create_dlg.size_input.setValue(512)
+        self.assertEqual(create_dlg.values()["size_mib"], 512)
+
+        value_dlg = ValueDialog(
+            self.window, "Save recovery point", "Checkpoint", "Label",
+            "clean-base", "Save", forbidden={"clean-base"},
+            collision_message="A recovery point with this label already exists.",
+        )
+        self.addCleanup(value_dlg.close)
+        self.assertFalse(value_dlg.submit.isEnabled())
+        self.assertIn("already exists", value_dlg.feedback.text())
+        value_dlg.input.setText("fresh-point")
+        self.assertTrue(value_dlg.submit.isEnabled())
+
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = Path(tmp) / "export.tar.gz"
+            archive.write_bytes(b"tar-gz-placeholder")
+            import_dlg = ImportDialog(self.window, existing={"python-playground"}, initial_archive=str(archive))
+            self.addCleanup(import_dlg.close)
+            import_dlg.name_input.setText("imported-lab")
+            self.assertTrue(import_dlg.submit.isEnabled())
+            self.assertEqual(import_dlg.values()["name"], "imported-lab")
+
 
 if __name__ == "__main__":
     unittest.main()

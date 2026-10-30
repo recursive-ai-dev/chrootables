@@ -14,6 +14,7 @@ from PySide6.QtWidgets import QApplication
 from PySide6.QtTest import QTest
 
 from chrootables.terminal import (
+    BOLD, DIM, STRIKE,
     QT_KEY_BACKSPACE, QT_KEY_DELETE, QT_KEY_DOWN, QT_KEY_END,
     QT_KEY_ENTER, QT_KEY_HOME, QT_KEY_LEFT, QT_KEY_PAGEUP, QT_KEY_RIGHT,
     QT_KEY_TAB, QT_KEY_UP, PtyProcess, TerminalPane, TerminalWindow, VtScreen,
@@ -159,6 +160,15 @@ class VtScreenTests(unittest.TestCase):
         self.assertEqual((line[0][1].fg, line[0][1].flags & 1), (1, 1))
         self.assertEqual(line[4][1].fg, None)
 
+    def test_dim_strikethrough_sgr22_and_rep_csi_b(self):
+        screen = VtScreen(2, 20)
+        screen.feed("\x1b[1;2;9mA\x1b[22mB\x1b[29mC\x1b[3b")
+        line = screen.lines[0]
+        self.assertEqual(line[0][1].flags & (BOLD | DIM | STRIKE), BOLD | DIM | STRIKE)
+        self.assertEqual(line[1][1].flags & (BOLD | DIM | STRIKE), STRIKE)
+        self.assertEqual(line[2][1].flags & (BOLD | DIM | STRIKE), 0)
+        self.assertEqual(screen.plain().splitlines()[0], "ABCCCC")
+
     def test_extended_256_color(self):
         screen = VtScreen(2, 20)
         screen.feed("\x1b[38;5;196mX")
@@ -295,6 +305,10 @@ class KeyMappingTests(unittest.TestCase):
         self.assertEqual(key_to_bytes(0x43, "c", ctrl=True), b"\x03")
         self.assertEqual(key_to_bytes(0x41, "a", alt=True), b"\x1ba")
         self.assertEqual(key_to_bytes(QT_KEY_LEFT, "", alt=True), b"\x1b\x1b[D")
+        self.assertEqual(key_to_bytes(QT_KEY_LEFT, "", ctrl=True), b"\x1b[1;5D")
+        self.assertEqual(key_to_bytes(QT_KEY_RIGHT, "", ctrl=True), b"\x1b[1;5C")
+        self.assertEqual(key_to_bytes(QT_KEY_UP, "", ctrl=True), b"\x1b[1;5A")
+        self.assertEqual(key_to_bytes(QT_KEY_DOWN, "", ctrl=True), b"\x1b[1;5B")
 
 
 class PtyProcessTests(unittest.TestCase):
@@ -458,15 +472,33 @@ class TerminalPaneTests(unittest.TestCase):
     def test_attributes_reach_painter_and_wide_selection_copies_once(self):
         pane = TerminalPane()
         self.addCleanup(pane.close)
-        pane.screen.feed("\x1b[1;3;4m界e\u0301")
+        pane.screen.feed("\x1b[1;2;3;4;9m界e\u0301")
         with patch("chrootables.terminal.QPainter") as painter:
             pane.paintEvent(None)
         fonts = [call.args[0] for call in painter.return_value.setFont.call_args_list]
-        self.assertTrue(any(font.bold() and font.italic() and font.underline() for font in fonts))
+        self.assertTrue(any(font.bold() and font.italic() and font.underline() and font.strikeOut() for font in fonts))
+        pens = [call.args[0] for call in painter.return_value.setPen.call_args_list]
+        self.assertTrue(any(pen.red() < 230 for pen in pens))
         pane._selection_start, pane._selection_end = (0, 0), (0, 3)
         self.assertEqual(pane.selected_text(), "界e\u0301")
         pane._selection_start, pane._selection_end = (0, 1), (0, 2)
         self.assertEqual(pane.selected_text(), "界")
+
+    def test_scrollback_search_and_clear_scrollback(self):
+        pane = TerminalPane()
+        self.addCleanup(pane.close)
+        pane.screen = VtScreen(3, 20, scrollback=10)
+        pane._on_output("alpha needle\r\nbeta\r\ngamma\r\ndelta\r\nepsilon needle\r\n")
+        self.assertTrue(pane.find_text("needle", forward=True))
+        self.assertGreater(pane.scroll_offset, 0)
+        self.assertEqual(pane.selected_text(), "needle")
+        self.assertTrue(pane.find_text("needle", forward=True))
+        self.assertEqual(pane.scroll_offset, 0)
+        self.assertEqual(pane.selected_text(), "needle")
+        self.assertFalse(pane.find_text("nonexistent"))
+        pane.clear_scrollback()
+        self.assertEqual(len(pane.screen.history), 0)
+        self.assertEqual(pane.scroll_offset, 0)
 
     def test_history_navigation_after_exit_and_anchor_during_output(self):
         pane = TerminalPane()
@@ -617,6 +649,13 @@ class TerminalWindowTests(unittest.TestCase):
         self.assertEqual(window.windowTitle(), "Chrootables · lab")
         window.show()
         self.assertTrue(pump(self.app, lambda: "READY" in window.pane.screen.plain()))
+        self.assertFalse(window.search_bar.isVisible())
+        QTest.keyClick(window.pane, Qt.Key.Key_F,
+                       Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)
+        self.assertTrue(window.search_bar.isVisible())
+        window.search_input.setText("READY")
+        self.assertTrue(window.find_match(True))
+        self.assertEqual(window.pane.selected_text(), "READY")
         self.assertTrue(window.process.running)
         window.close()
         self.assertTrue(pump(self.app, lambda: window.process._finished and not window.isVisible()))

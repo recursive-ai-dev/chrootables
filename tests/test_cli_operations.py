@@ -310,6 +310,51 @@ mount_restricted_devices
             with self.subTest(size=size):
                 result = self.bash('validate_cli --create lab "$1" persistent minimal', size)
                 self.assertEqual(result.returncode == 0, valid)
+        operations = set(capabilities["operations"])
+        self.assertTrue({"import", "prune-logs", "delete-export", "recover-operation"}.issubset(operations))
+
+    def test_import_image_validates_archive_and_publishes_metadata(self):
+        archive = self.store / "exports/sample.tar.gz"
+        root = self.store / "sample-root"
+        (root / "etc").mkdir(parents=True)
+        (root / "etc/debian_version").write_text("13.0\n")
+        subprocess.run(["tar", "-C", str(root), "-czf", str(archive), "."], check=True)
+        result = self.bash('''
+validate_tar_archive "$1"
+create_sparse_ext4() { printf 'ext4-image' >"$1"; }
+unshare() { touch -- "$IMAGE_DIR/imported.img.import.${CHROOTABLE_OPERATION_ID}.partial"; }
+import_image imported "$1" 2048 persistent python
+''', archive)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.store / "images/imported.img").exists())
+        meta = (self.store / "images/imported.img.meta").read_text()
+        self.assertIn("origin=import:sample.tar.gz", meta)
+        self.assertIn("profile=python", meta)
+        self.assertEqual((self.state()["action"], self.state()["status"]), ("import", "completed"))
+
+    def test_validate_tar_archive_rejects_traversal_and_device_nodes(self):
+        bad_tar = self.store / "exports/traversal.tar.gz"
+        import io
+        import tarfile
+        with tarfile.open(bad_tar, "w:gz") as tf:
+            info = tarfile.TarInfo("../escaped")
+            info.size = 4
+            tf.addfile(info, io.BytesIO(b"data"))
+        result = self.bash('validate_tar_archive "$1"', bad_tar)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Unsafe path", result.stderr)
+
+    def test_prune_logs_and_delete_export(self):
+        for idx in range(5):
+            log_file = self.store / "logs" / f"old-{idx}.log"
+            log_file.write_text(f"log {idx}\n")
+        export_file = self.store / "exports/lab-20261015-120000.tar.gz"
+        export_file.write_bytes(b"archive-bytes")
+        result = self.bash('prune_logs 2 --yes && delete_export "lab-20261015-120000.tar.gz" --yes')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(export_file.exists())
+        remaining = [p for p in (self.store / "logs").glob("*.log") if p.name != f"{OPERATION_ID}.log"]
+        self.assertLessEqual(len(remaining), 2)
 
 
 if __name__ == "__main__":

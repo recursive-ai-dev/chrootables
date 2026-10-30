@@ -36,6 +36,10 @@ def serve(store, input_stream=sys.stdin, output_stream=sys.stdout, *, writable=F
                 data = store.doctor()
             elif action == "logs":
                 data = store.logs(params.get("name"), params.get("log"))
+            elif action == "cancel":
+                if not writable:
+                    raise PermissionError("Unlock the workspace store to make changes.")
+                data = store.cancel_operation()
             elif action in MUTATIONS:
                 if not writable:
                     raise PermissionError("Unlock the workspace store to make changes.")
