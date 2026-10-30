@@ -34,6 +34,7 @@ CANCELLABLE_STAGES = {
     "starting", "allocating", "formatting", "bootstrapping", "importing", "exporting",
     "copying", "copying-snapshot", "copying-restore", "checking-filesystem", "downloading-archive",
 }
+CANCEL_RESEND_SECONDS = 1.0
 
 
 class OperationCancelled(RuntimeError):
@@ -319,6 +320,7 @@ class Store:
         self._active_stage = ""
         self._active_action = ""
         self._cancel_requested = False
+        self._cancel_signalled_at = 0.0
 
     def environment(self, extra=None):
         result = {
@@ -695,7 +697,21 @@ class Store:
                 os.killpg(process.pid, signal.SIGTERM)
             except ProcessLookupError as error:
                 raise RuntimeError("No running operation to cancel.") from error
+            self._cancel_signalled_at = time.monotonic()
             return {"cancelled": True, "stage": stage}
+
+    def _repeat_cancel(self, process):
+        # A signal landing just before the shell forks misses the new child, and the
+        # shell defers its trap until that child exits, so one signal can be lost.
+        with self._active_lock:
+            if (not self._cancel_requested or self._active_stage not in CANCELLABLE_STAGES
+                    or time.monotonic() - self._cancel_signalled_at < CANCEL_RESEND_SECONDS):
+                return
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                return
+            self._cancel_signalled_at = time.monotonic()
 
     def operate(self, action, params, output, progress=None):
         if action == "import" and params.get("export") is not None:
@@ -761,6 +777,7 @@ class Store:
         try:
             while process.poll() is None:
                 tail()
+                self._repeat_cancel(process)
                 time.sleep(0.2)
             reader.join()
             process.stdout.close()

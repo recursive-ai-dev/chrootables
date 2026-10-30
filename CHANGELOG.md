@@ -16,7 +16,8 @@ are retained below as historical records.
   files of abandoned work and sets aside damaged records, so neither can block a
   workspace permanently.
 - Add operation cancellation (`Cancel` in the desktop task panel) that signals the
-  whole process group, removes staged files and reports "cancelled". Cancelling is
+  whole process group, repeating until it stops, removes staged files and reports
+  "cancelled". Cancelling is
   refused while live data is changing: publication, expansion, repair, deletion and
   package installation. Those steps also ignore Ctrl+C and SIGTERM on the command line.
 - Add store retention maintenance: `--prune-logs [KEEP_COUNT] --yes`,

@@ -1272,6 +1272,7 @@ enter_chrootable() (
 )
 worker_cleanup() {
     local status=$? cleanup_status=0
+    protect_from_signals
     cd / || true
     # Guest daemons get time to flush before the image is unmounted. In this PID
     # namespace "-1" means every process except this one and init, so the wait

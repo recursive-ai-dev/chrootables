@@ -622,7 +622,7 @@ main "$@"
         (self.path / "images/lab.img").write_bytes(b"image")
         return wrapper
 
-    def run_clone_and_cancel(self, overrides, *, wait_for_stage):
+    def run_clone_and_cancel(self, overrides, *, wait_for_stage, wait_for_file=None):
         wrapper = self.manager_wrapper(overrides)
         store = Store(self.path)
         outcome = {}
@@ -643,6 +643,9 @@ main "$@"
             begin = time.monotonic()
             worker.start()
             self.assertTrue(started.wait(10), "operation never reached " + wait_for_stage)
+            while wait_for_file is not None and not wait_for_file.exists():
+                self.assertLess(time.monotonic() - begin, 10, "child never became ready")
+                time.sleep(0.01)
             cancel = store.cancel_operation()
             worker.join(15)
         self.assertFalse(worker.is_alive())
@@ -667,6 +670,23 @@ main "$@"
                         self.assertNotIn(marker, (entry / "environ").read_bytes(), entry.name)
                 except OSError:
                     continue
+
+    def test_cancel_repeats_until_a_child_that_missed_the_signal_stops(self):
+        # A signal landing just before the shell forks misses the child, and the shell
+        # defers its own trap until that child exits. Surviving one signal models this.
+        ready = self.path / "child-ready"
+        child = (f'seen=0; trap "((seen++)) && exit 143" TERM; : >{shlex.quote(str(ready))}; '
+                 'for tick in {1..400}; do sleep 0.05; done')
+        outcome, elapsed = self.run_clone_and_cancel(
+            f"cp() {{ bash -c {shlex.quote(child)}; }}", wait_for_stage="copying", wait_for_file=ready)
+        self.assertIn("cancelled", outcome, outcome)
+        self.assertLess(elapsed, 10)
+        self.assertEqual(list((self.path / "images").glob(".copy.*")), [])
+
+    def test_worker_cleanup_cannot_be_interrupted_by_a_repeated_signal(self):
+        # Cancel repeats its signal, and cleanup is what unmounts the image.
+        body = MANAGER.read_text().split("\nworker_cleanup() {\n", 1)[1]
+        self.assertEqual(body.split("\n")[1], "    protect_from_signals", body[:80])
 
     def test_cancel_loses_the_race_against_publication_and_reports_success(self):
         # The desktop saw "copying", but the manager is already past the point of no
