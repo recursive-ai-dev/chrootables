@@ -1,6 +1,7 @@
 """Terminal emulation, key mapping, and pty round-trip tests. No root required."""
 import os
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 import time
@@ -9,12 +10,13 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPoint, Qt
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QPoint, QPointF, Qt, QTimer
+from PySide6.QtGui import QWheelEvent
+from PySide6.QtWidgets import QApplication, QPushButton
 from PySide6.QtTest import QTest
 
 from chrootables.terminal import (
-    BOLD, DIM, STRIKE,
+    BOLD, DIM, STRIKE, UNDERLINE,
     QT_KEY_BACKSPACE, QT_KEY_DELETE, QT_KEY_DOWN, QT_KEY_END,
     QT_KEY_ENTER, QT_KEY_HOME, QT_KEY_LEFT, QT_KEY_PAGEUP, QT_KEY_RIGHT,
     QT_KEY_TAB, QT_KEY_UP, PtyProcess, TerminalPane, TerminalWindow, VtScreen,
@@ -224,7 +226,9 @@ class VtScreenTests(unittest.TestCase):
             self.assertTrue(all(len(line) == columns for line in screen.lines))
             screen.feed(f"\x1b[{rows};{columns}HX")
             self.assertEqual(screen.lines[-1][-1][0], "X")
-        self.assertTrue(screen.plain().startswith("kept"))
+        # The cursor was on the last of five rows, so shrinking keeps that row
+        # visible and moves the rows above it to scrollback.
+        self.assertTrue("".join(cell[0] for cell in screen.history[0]).startswith("kept"))
 
     def test_resize_alternate_screen_also_resizes_saved_primary(self):
         for rows, columns in ((5, 40), (2, 20)):
@@ -257,7 +261,7 @@ class VtScreenTests(unittest.TestCase):
 
     def test_unsupported_csi_is_consumed_without_changing_screen(self):
         for params, final in (("?2", "J"), ("1?2", "A"), ("²", "A"),
-                              ("38:2:1:2:3", "m"), ("9" * 5000, "A"),
+                              ("9" * 5000, "A"),
                               ("9" * 5000, "m"), ("?" + "9" * 5000, "h")):
             with self.subTest(params=params[:30], final=final):
                 screen = VtScreen(2, 20)
@@ -269,6 +273,71 @@ class VtScreenTests(unittest.TestCase):
                 screen.feed(final + "tail")
                 self.assertEqual(screen.plain().splitlines()[0], "kepttail")
                 self.assertIsNone(screen.lines[0][4][1].fg)
+
+    def test_colon_form_sgr_colors_and_underline(self):
+        screen = VtScreen(2, 20)
+        screen.feed("\x1b[38:2::1:2:3;48:5:9;4:3mA\x1b[4:0mB")
+        style = screen.lines[0][0][1]
+        self.assertEqual((style.fg, style.bg), ((1, 2, 3), 9))
+        self.assertTrue(style.flags & UNDERLINE)
+        self.assertFalse(screen.lines[0][1][1].flags & UNDERLINE)
+        screen.feed("\x1b[0;38:2:1:2:3mC")
+        self.assertEqual(screen.lines[0][2][1].fg, (1, 2, 3))
+
+    def test_dec_special_graphics_draws_boxes_and_shift_selects_g1(self):
+        screen = VtScreen(3, 20)
+        screen.feed("\x1b(0lqk\x1b(Bq")
+        self.assertEqual(screen.plain().splitlines()[0], "\u250c\u2500\u2510q")
+        screen.feed("\r\n\x1b)0a\x0eq\x0fq")
+        self.assertEqual(screen.plain().splitlines()[1], "a\u2500q")
+
+    def test_string_sequences_and_two_byte_escapes_are_not_printed(self):
+        for sequence in ("\x1bP+q544e\x1b\\", "\x1b_apc\x1b\\", "\x1b^pm\x1b\\", "\x1bXsos\x1b\\",
+                         "\x1bPabort\x18", "\x1b#8", "\x1b%G", "\x1b F"):
+            with self.subTest(sequence=sequence):
+                screen = VtScreen(2, 20)
+                screen.feed("a" + sequence + "b")
+                self.assertEqual(screen.plain().splitlines()[0], "ab")
+
+    def test_status_queries_queue_replies(self):
+        screen = VtScreen(4, 20)
+        screen.feed("ab\x1b[6n\x1b[5n\x1b[c\x1b[0c\x1b[>c\x1b[?6n")
+        self.assertEqual(screen.responses, ["\x1b[1;3R", "\x1b[0n", "\x1b[?62;22c",
+                                            "\x1b[?62;22c", "\x1b[>0;0;0c"])
+        screen = VtScreen(2, 20)
+        screen.feed("x" * 20 + "\x1b[6n")
+        self.assertEqual(screen.responses, ["\x1b[1;20R"])
+
+    def test_insert_mode_autowrap_and_application_cursor_modes(self):
+        screen = VtScreen(2, 10)
+        screen.feed("abc\r\x1b[4hZ\x1b[4l")
+        self.assertEqual(screen.plain().splitlines()[0], "Zabc")
+        screen = VtScreen(2, 5)
+        screen.feed("\x1b[?7lhello world")
+        self.assertEqual(screen.plain().splitlines()[0], "helld")
+        screen.feed("\x1b[?7h")
+        self.assertTrue(screen._autowrap)
+        self.assertFalse(screen.application_cursor)
+        screen.feed("\x1b[?1h")
+        self.assertTrue(screen.application_cursor)
+        screen.feed("\x1bc")
+        self.assertFalse(screen.application_cursor)
+
+    def test_saved_cursor_includes_style_and_charset(self):
+        screen = VtScreen(2, 20)
+        screen.feed("\x1b[31m\x1b(0\x1b7\x1b[0m\x1b(B\x1b8q")
+        cell = screen.lines[0][0]
+        self.assertEqual((cell[0], cell[1].fg), ("\u2500", 1))
+
+    def test_shrinking_keeps_the_cursor_line_and_moves_rows_to_history(self):
+        screen = VtScreen(4, 20)
+        screen.feed("one\r\ntwo\r\nthree\r\nprompt$ ")
+        screen.resize(2, 20)
+        self.assertEqual(screen.plain().splitlines(), ["three", "prompt$"])
+        self.assertEqual(screen.row, 1)
+        self.assertEqual(["".join(cell[0] for cell in line).rstrip() for line in screen.history],
+                         ["one", "two"])
+        self.assertEqual(screen.history_count, 2)
 
     def test_erase_to_start_of_display_clears_previous_rows(self):
         screen = VtScreen(4, 20)
@@ -304,11 +373,146 @@ class KeyMappingTests(unittest.TestCase):
     def test_modifiers(self):
         self.assertEqual(key_to_bytes(0x43, "c", ctrl=True), b"\x03")
         self.assertEqual(key_to_bytes(0x41, "a", alt=True), b"\x1ba")
-        self.assertEqual(key_to_bytes(QT_KEY_LEFT, "", alt=True), b"\x1b\x1b[D")
+        self.assertEqual(key_to_bytes(QT_KEY_LEFT, "", alt=True), b"\x1b[1;3D")
         self.assertEqual(key_to_bytes(QT_KEY_LEFT, "", ctrl=True), b"\x1b[1;5D")
         self.assertEqual(key_to_bytes(QT_KEY_RIGHT, "", ctrl=True), b"\x1b[1;5C")
         self.assertEqual(key_to_bytes(QT_KEY_UP, "", ctrl=True), b"\x1b[1;5A")
         self.assertEqual(key_to_bytes(QT_KEY_DOWN, "", ctrl=True), b"\x1b[1;5B")
+
+
+class ExtendedKeyMappingTests(unittest.TestCase):
+    def test_application_cursor_mode_uses_ss3_only_without_modifiers(self):
+        self.assertEqual(key_to_bytes(QT_KEY_UP, "", application_cursor=True), b"\x1bOA")
+        self.assertEqual(key_to_bytes(QT_KEY_HOME, "", application_cursor=True), b"\x1bOH")
+        self.assertEqual(key_to_bytes(QT_KEY_UP, "", ctrl=True, application_cursor=True), b"\x1b[1;5A")
+
+    def test_function_keys_backtab_and_modified_editing_keys(self):
+        f1 = Qt.Key.Key_F1.value
+        expected = [b"\x1bOP", b"\x1bOQ", b"\x1bOR", b"\x1bOS", b"\x1b[15~", b"\x1b[17~",
+                    b"\x1b[18~", b"\x1b[19~", b"\x1b[20~", b"\x1b[21~", b"\x1b[23~", b"\x1b[24~"]
+        self.assertEqual([key_to_bytes(f1 + index, "") for index in range(12)], expected)
+        self.assertEqual(key_to_bytes(f1, "", shift=True), b"\x1b[1;2P")
+        self.assertEqual(key_to_bytes(f1 + 4, "", ctrl=True), b"\x1b[15;5~")
+        self.assertEqual(key_to_bytes(Qt.Key.Key_Backtab.value, ""), b"\x1b[Z")
+        self.assertEqual(key_to_bytes(QT_KEY_DELETE, "", ctrl=True), b"\x1b[3;5~")
+        self.assertEqual(key_to_bytes(QT_KEY_BACKSPACE, "", ctrl=True), b"\x08")
+        self.assertEqual(key_to_bytes(Qt.Key.Key_Escape.value, "\x1b"), b"\x1b")
+
+    def test_control_symbols_match_xterm(self):
+        for key, value in ((" ", 0), ("@", 0), ("2", 0), ("[", 27), ("\\", 28), ("]", 29),
+                           ("^", 30), ("_", 31), ("?", 127)):
+            with self.subTest(key=key):
+                self.assertEqual(key_to_bytes(ord(key), "", ctrl=True), bytes([value]))
+        self.assertEqual(key_to_bytes(0x43, "", ctrl=True, alt=True), b"\x1b\x03")
+
+
+class SessionTerminalTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def run_session(self, command, input_text=None, seconds=8):
+        chunks = []
+        process = PtyProcess(command)
+        self.addCleanup(process.terminate)
+        process.output.connect(chunks.append)
+        done = []
+        process.finished.connect(done.append)
+        if input_text is not None:
+            QTimer.singleShot(300, lambda: process.write(input_text))
+        deadline = time.monotonic() + seconds
+        while not done and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(0.01)
+        self.assertTrue(done, "session did not finish: " + "".join(chunks))
+        return "".join(chunks), done[0]
+
+    @unittest.skipUnless(shutil.which("setsid"), "setsid is required")
+    def test_session_owns_the_pty_as_controlling_terminal(self):
+        script = 'import os\nprint("TTY", os.tcgetpgrp(0) == os.getpgrp(), os.getsid(0) == os.getpid(), flush=True)\n'
+        output, code = self.run_session([sys.executable, "-I", "-S", "-c", script])
+        self.assertEqual(code, 0, output)
+        self.assertIn("TTY True True", output)
+
+    @unittest.skipUnless(shutil.which("setsid"), "setsid is required")
+    def test_ctrl_c_interrupts_the_foreground_process(self):
+        script = ('import signal, sys, time\nprint("READY", flush=True)\n'
+                  'try:\n    time.sleep(30)\nexcept KeyboardInterrupt:\n    print("INTERRUPTED", flush=True)\n')
+        output, code = self.run_session([sys.executable, "-I", "-S", "-c", script], "\x03")
+        self.assertEqual(code, 0, output)
+        self.assertIn("INTERRUPTED", output)
+
+    def test_unsignalable_session_group_hangs_up_and_finishes(self):
+        process = PtyProcess(["sleep", "30"])
+        finished = []
+        process.finished.connect(finished.append)
+        with patch("chrootables.terminal.os.killpg", side_effect=PermissionError):
+            process.terminate()
+        deadline = time.monotonic() + 6
+        while not finished and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(0.01)
+        self.assertTrue(finished)
+        self.assertIsNone(process.master)
+
+    def test_session_ignoring_sigterm_is_hung_up_after_grace_period(self):
+        process = PtyProcess([sys.executable, "-I", "-S", "-c",
+                              "import signal,time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                              "signal.signal(signal.SIGHUP, signal.SIG_IGN)\ntime.sleep(30)\n"])
+        finished = []
+        process.finished.connect(finished.append)
+        with patch("chrootables.terminal.TERMINATE_GRACE_MS", 100), patch("chrootables.terminal.HANGUP_GRACE_MS", 300):
+            time.sleep(0.3)
+            process.terminate()
+            deadline = time.monotonic() + 5
+            while not finished and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(0.01)
+        self.assertTrue(finished)
+
+
+class TerminalWindowKeyboardTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        self.window = TerminalWindow(["sleep", "30"], "test", external=lambda: None)
+        self.addCleanup(self.window.process.terminate)
+        self.sent = []
+        self.window.process.write = self.sent.append
+        self.window.show()
+        self.app.processEvents()
+
+    def test_pane_starts_with_focus_and_no_button_can_be_triggered_by_enter(self):
+        self.assertIs(self.window.focusWidget(), self.window.pane)
+        for control in self.window.findChildren(QPushButton):
+            self.assertFalse(control.autoDefault(), control.text())
+
+    def test_tab_and_backtab_reach_the_session(self):
+        QTest.keyClick(self.window.pane, Qt.Key.Key_Tab)
+        QTest.keyClick(self.window.pane, Qt.Key.Key_Backtab)
+        self.assertEqual(self.sent, [b"\t", b"\x1b[Z"])
+        self.assertIs(self.window.focusWidget(), self.window.pane)
+
+    def test_status_query_reply_is_written_back_to_the_session(self):
+        self.window.pane._on_output("\x1b[6n")
+        self.assertEqual(self.sent, ["\x1b[1;1R"])
+        self.assertEqual(self.window.pane.screen.responses, [])
+
+    def test_find_maps_columns_when_lowercasing_changes_length(self):
+        self.window.pane._on_output("\u0130\u0130 needle")
+        self.assertTrue(self.window.pane.find_text("needle"))
+        self.assertEqual(self.window.pane._selection_start[1], 3)
+        self.assertEqual(self.window.pane._selection_end[1], 9)
+
+    def test_wheel_on_alternate_screen_sends_arrows(self):
+        self.window.pane._on_output("\x1b[?1049h\x1b[?1h")
+        event = QWheelEvent(QPointF(5, 5), QPointF(5, 5), QPoint(0, 0), QPoint(0, 120),
+                            Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
+                            Qt.ScrollPhase.NoScrollPhase, False)
+        self.window.pane.wheelEvent(event)
+        self.assertEqual(self.sent, [b"\x1bOA" * 3])
 
 
 class PtyProcessTests(unittest.TestCase):

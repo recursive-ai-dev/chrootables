@@ -1,8 +1,12 @@
 """Operation recovery and capacity checks using temporary files, without mounts/root."""
+import io
 import json
 import os
 from pathlib import Path
+import re
+import shutil
 import subprocess
+import tarfile
 import tempfile
 import unittest
 
@@ -310,39 +314,510 @@ mount_restricted_devices
             with self.subTest(size=size):
                 result = self.bash('validate_cli --create lab "$1" persistent minimal', size)
                 self.assertEqual(result.returncode == 0, valid)
-        operations = set(capabilities["operations"])
-        self.assertTrue({"import", "prune-logs", "delete-export", "recover-operation"}.issubset(operations))
+        features = set(capabilities["features"])
+        self.assertTrue({"import", "prune-logs", "delete-export", "recover-operation",
+                         "discard-operation", "archive-sync"}.issubset(features))
+
+    IMPORT_STUBS = """
+make_workdir() { WORK="$STORE_DIR/work"; mkdir -p "$WORK"; }
+mkfs.ext4() { :; }
+"""
+
+    def write_archive(self, name="sample.tar.gz", payload=b"13.0\n"):
+        archive = self.store / "exports" / name
+        root = self.store / "sample-root"
+        (root / "etc").mkdir(parents=True, exist_ok=True)
+        (root / "etc/debian_version").write_bytes(payload)
+        subprocess.run(["tar", "-C", str(root), "-czf", str(archive), "."], check=True)
+        return archive
+
+    def write_tar(self, *members, name="crafted.tar.gz"):
+        archive = self.store / "exports" / name
+        with tarfile.open(archive, "w:gz") as output:
+            for member in members:
+                output.addfile(member, io.BytesIO(b"x" * member.size) if member.isreg() else None)
+        return archive
+
+    @staticmethod
+    def member(name, kind=tarfile.REGTYPE, size=0, **fields):
+        info = tarfile.TarInfo(name)
+        info.type = kind
+        info.size = size
+        for key, value in fields.items():
+            setattr(info, key, value)
+        return info
 
     def test_import_image_validates_archive_and_publishes_metadata(self):
-        archive = self.store / "exports/sample.tar.gz"
-        root = self.store / "sample-root"
-        (root / "etc").mkdir(parents=True)
-        (root / "etc/debian_version").write_text("13.0\n")
-        subprocess.run(["tar", "-C", str(root), "-czf", str(archive), "."], check=True)
-        result = self.bash('''
-validate_tar_archive "$1"
-create_sparse_ext4() { printf 'ext4-image' >"$1"; }
-unshare() { touch -- "$IMAGE_DIR/imported.img.import.${CHROOTABLE_OPERATION_ID}.partial"; }
+        archive = self.write_archive()
+        result = self.bash(self.IMPORT_STUBS + """
+run_worker() { printf 'suite=bookworm\\narchitecture=riscv64\\n' >"$WORK/import.info"; }
 import_image imported "$1" 2048 persistent python
-''', archive)
+""", archive)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.store / "images/imported.img").exists())
         meta = (self.store / "images/imported.img.meta").read_text()
         self.assertIn("origin=import:sample.tar.gz", meta)
         self.assertIn("profile=python", meta)
+        self.assertIn("suite=bookworm", meta)
+        self.assertIn("architecture=riscv64", meta)
         self.assertEqual((self.state()["action"], self.state()["status"]), ("import", "completed"))
 
-    def test_validate_tar_archive_rejects_traversal_and_device_nodes(self):
-        bad_tar = self.store / "exports/traversal.tar.gz"
-        import io
-        import tarfile
-        with tarfile.open(bad_tar, "w:gz") as tf:
-            info = tarfile.TarInfo("../escaped")
-            info.size = 4
-            tf.addfile(info, io.BytesIO(b"data"))
-        result = self.bash('validate_tar_archive "$1"', bad_tar)
+    def test_import_rejects_capacity_below_the_archive_requirement_before_writing(self):
+        archive = self.write_archive()
+        # Report a 700 MiB member without having to write one.
+        result = self.bash(self.IMPORT_STUBS + """
+tar() { printf -- '-rw-r--r-- 0/0 %s 2026-10-30 12:00 ./big\\n' 734003200; }
+gzip() { :; }
+run_worker() { :; }
+import_image tooSmall "$1" 512 persistent minimal
+""", archive)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Unsafe path", result.stderr)
+        self.assertIn("needs at least", result.stderr)
+        self.assertFalse((self.store / "images/tooSmall.img").exists())
+        self.assertFalse((self.store / "operations" / (OPERATION_ID + ".state")).exists())
+
+    def test_import_without_a_size_fits_the_archive_with_headroom(self):
+        archive = self.write_archive()
+        result = self.bash(self.IMPORT_STUBS + """
+tar() { printf -- '-rw-r--r-- 0/0 %s 2026-10-30 12:00 ./big\\n' 5368709120; }
+gzip() { :; }
+run_worker() { :; }
+required=$(required_capacity_mib 5368709120 1)
+import_image fitted "$1" "" persistent minimal
+printf '%s\\n' "$required"
+""", archive)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        required = int(result.stdout.split()[-1])
+        size = int(re.search(r"size_mib=(\d+)", (self.store / "images/fitted.img.meta").read_text()).group(1))
+        self.assertEqual(size, required + required // 4)
+
+    def test_validate_tar_archive_rejects_traversal_and_device_nodes(self):
+        for member, message in (
+                (self.member("../escaped", size=4), "Unsafe path"),
+                (self.member("a/../../escaped", size=4), "Unsafe path"),
+                (self.member("/absolute", size=4), "Unsafe path"),
+                (self.member("link", tarfile.LNKTYPE, linkname="../../etc/passwd"), "Unsafe path"),
+                (self.member("disk", tarfile.BLKTYPE, devmajor=8, devminor=0), "block device"),
+                (self.member("mem", tarfile.CHRTYPE, devmajor=1, devminor=1), "device node"),
+                (self.member("nvme", tarfile.CHRTYPE, devmajor=239, devminor=0), "device node")):
+            with self.subTest(member=member.name):
+                result = self.bash('validate_tar_archive "$1"', self.write_tar(member))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+
+    def test_validate_tar_archive_accepts_a_normal_root_filesystem(self):
+        archive = self.write_tar(
+            self.member("./"  , tarfile.DIRTYPE), self.member("./etc", tarfile.DIRTYPE),
+            self.member("./etc/name with -> arrow", size=3),
+            self.member("./bin", tarfile.SYMTYPE, linkname="usr/bin"),
+            self.member("./abs", tarfile.SYMTYPE, linkname="/usr/share/absolute-targets-are-normal"),
+            self.member("./hard", tarfile.LNKTYPE, linkname="./etc/name with -> arrow"),
+            self.member("./fifo", tarfile.FIFOTYPE),
+            self.member("./dev/null", tarfile.CHRTYPE, devmajor=1, devminor=3),
+            self.member("./dev/ptmx", tarfile.CHRTYPE, devmajor=5, devminor=2))
+        result = self.bash('validate_tar_archive "$1"; printf "%s" "$IMPORT_REQUIRED_MIB"', archive)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertGreater(int(result.stdout), 0)
+
+    def test_validate_tar_archive_rejects_unreadable_and_empty_archives(self):
+        not_tar = self.store / "exports/plain.tar.gz"
+        subprocess.run(["sh", "-c", 'printf "this is not a tar stream, only some text" | gzip > "$0"', str(not_tar)], check=True)
+        empty = self.write_tar(name="empty.tar.gz")
+        not_gzip = self.store / "exports/raw.tar.gz"
+        not_gzip.write_bytes(b"raw bytes")
+        for archive in (not_tar, empty, not_gzip):
+            with self.subTest(archive=archive.name):
+                self.assertNotEqual(self.bash('validate_tar_archive "$1"', archive).returncode, 0)
+
+    @unittest.skipUnless(shutil.which("mkfs.ext4") or Path("/usr/sbin/mkfs.ext4").exists(), "mke2fs is required")
+    def test_required_capacity_holds_the_payload_on_a_real_filesystem(self):
+        path = os.pathsep.join([os.environ.get("PATH", ""), "/usr/sbin", "/sbin"])
+        for payload_mib in (0, 1, 100, 400, 480, 1024, 4096, 16384, 70000, 200000):
+            with self.subTest(payload_mib=payload_mib):
+                payload = payload_mib * 1048576
+                result = self.bash('required_capacity_mib "$1" 1000', payload)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                capacity = int(result.stdout)
+                image = Path(self.temporary.name) / "capacity.img"
+                image.unlink(missing_ok=True)
+                with image.open("wb") as handle:
+                    handle.truncate(capacity * 1048576)
+                env = {**os.environ, "PATH": path}
+                subprocess.run(["mkfs.ext4", "-q", "-F", str(image)], check=True, env=env, capture_output=True)
+                dump = subprocess.run(["dumpe2fs", "-h", str(image)], check=True, env=env,
+                                      capture_output=True, text=True).stdout
+                field = lambda label: int(re.search(rf"^{label}:\s+(\d+)", dump, re.M).group(1))
+                unreserved = (field("Free blocks") - field("Reserved block count")) * field("Block size")
+                self.assertGreaterEqual(unreserved, payload, f"capacity {capacity} MiB")
+                self.assertGreaterEqual(field("Free inodes"), 1000)
+                image.unlink()
+
+    def test_required_capacity_honors_the_inode_bound(self):
+        result = self.bash('required_capacity_mib 0 1000000')
+        self.assertEqual(int(result.stdout), 15625)
+
+    def test_import_details_are_read_through_guest_links_only(self):
+        root = self.store / "guest"
+        (root / "etc").mkdir(parents=True)
+        (root / "usr/lib").mkdir(parents=True)
+        (root / "var/lib/dpkg").mkdir(parents=True)
+        (root / "usr/lib/os-release").write_text('NAME="Debian"\nVERSION_CODENAME="bookworm"\n')
+        (root / "etc/os-release").symlink_to("/usr/lib/os-release")
+        (root / "var/lib/dpkg/arch").write_text("arm64\n")
+        work = self.store / "work"
+        work.mkdir()
+        result = self.bash("""
+dpkg() { printf 'amd64\\n'; }
+WORKER_ROOT=$1
+record_import_details "$2"
+""", root, work)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((work / "import.info").read_text(), "suite=bookworm\narchitecture=arm64\n")
+        self.assertIn("arm64", result.stderr)
+
+    def test_guest_resolve_cannot_leave_the_root(self):
+        root = self.store / "guest"
+        (root / "etc").mkdir(parents=True)
+        (root / "run/resolve").mkdir(parents=True)
+        for link, target in (("abs", "/run/resolve/stub"), ("rel", "../run/resolve/stub"),
+                             ("escape", "../../../../outside"), ("chain", "abs")):
+            (root / "etc" / link).symlink_to(target)
+        (root / "etc/loop").symlink_to("loop")
+        expected = {"/etc/abs": "/run/resolve/stub", "/etc/rel": "/run/resolve/stub",
+                    "/etc/escape": "/outside", "/etc/chain": "/run/resolve/stub", "/etc/plain": "/etc/plain"}
+        for path, target in expected.items():
+            with self.subTest(path=path):
+                result = self.bash('guest_resolve "$1" "$2"', root, path)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), f"{root}{target}")
+        self.assertNotEqual(self.bash('guest_resolve "$1" /etc/loop', root).returncode, 0)
+
+    def test_resolver_setup_never_touches_host_files_through_a_guest_symlink(self):
+        root = self.store / "guest"
+        (root / "etc").mkdir(parents=True)
+        host_target = self.store / "host-file-must-not-appear"
+        (root / "etc/resolv.conf").symlink_to(host_target)
+        work = self.store / "work"
+        work.mkdir()
+        result = self.bash("""
+mount() { printf '%s\\n' "${@: -1}" >>"$STORE_DIR/mounts"; }
+setup_resolv_conf "$1" "$2"
+""", work, root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(host_target.exists())
+        confined = f"{root}{host_target}"
+        self.assertTrue(Path(confined).is_file())
+        self.assertEqual((self.store / "mounts").read_text().splitlines()[0], confined)
+
+    def test_restricted_session_gets_proc_run_and_shm_and_refuses_guest_symlinks(self):
+        root = self.store / "guest"
+        root.mkdir()
+        script = """
+mount() { printf '%s\\n' "$*" >>"$STORE_DIR/mounts"; }
+mknod() { :; }
+ln() { :; }
+WORKER_ROOT=$1
+mount_restricted_devices
+"""
+        result = self.bash(script, root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        mounts = (self.store / "mounts").read_text()
+        for line in (f"-t proc proc {root}/proc", f"{root}/run", f"-t devpts", f"{root}/dev/shm"):
+            self.assertIn(line, mounts)
+        shutil.rmtree(root)
+        root.mkdir()
+        (self.store / "mounts").unlink()
+        (root / "proc").symlink_to(self.store)
+        result = self.bash(script, root)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("/proc must be a directory", result.stderr)
+        self.assertFalse((self.store / "mounts").exists())
+
+    def test_session_teardown_waits_for_processes_before_killing(self):
+        result = self.bash("""
+count=0
+kill() {
+    printf '%s\\n' "$*" >>"$STORE_DIR/kills"
+    if [[ $1 == -0 ]]; then count=$((count + 1)); (( count < 3 )); return; fi
+    return 0
+}
+sleep() { printf 'sleep\\n' >>"$STORE_DIR/kills"; }
+mountpoint() { return 1; }
+WORKER_ROOT=/nonexistent WORKER_LOWER=/nonexistent WORKER_OVERLAY=/nonexistent WORKER_SHARE_TARGET=
+( worker_cleanup )
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.store / "kills").read_text().splitlines(),
+                         ["-TERM -1", "-0 -1", "sleep", "-0 -1", "sleep", "-0 -1", "-KILL -1"])
+
+    def test_session_teardown_wait_is_bounded(self):
+        result = self.bash("""
+kill() { [[ $1 == -0 ]] && printf 'probe\\n' >>"$STORE_DIR/probes"; return 0; }
+sleep() { :; }
+mountpoint() { return 1; }
+CHROOTABLE_STOP_GRACE_TICKS=5
+WORKER_ROOT=/nonexistent WORKER_LOWER=/nonexistent WORKER_OVERLAY=/nonexistent WORKER_SHARE_TARGET=
+( worker_cleanup )
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len((self.store / "probes").read_text().splitlines()), 5)
+
+    def test_expansion_and_publication_finish_despite_termination_signals(self):
+        result = self.bash("""
+fsck_preflight() { :; }
+truncate() { :; }
+resize2fs() { kill -TERM "$BASHPID"; command sleep 0.2; printf survived >"$STORE_DIR/resize-done"; }
+image_size_mib() { printf 600; }
+preflight_free_space() { :; }
+assert_offline() { :; }
+resize_image "$IMAGE_DIR/lab.img" 1024
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.store / "resize-done").read_text(), "survived")
+        self.assertIn("size_mib=1024", self.image.with_suffix(".img.meta").read_text())
+        result = self.bash("""
+begin_operation restore lab
+PENDING="$IMAGE_DIR/.lab.ABC123.partial"
+printf 'replacement image' >"$PENDING"
+printf 'lifecycle=ephemeral\\n' >"$PENDING.meta"
+mv() { kill -TERM "$BASHPID"; command mv "$@"; }
+publish_image "$PENDING" "$IMAGE_DIR/lab.img"
+printf 'continued\\n'
+""", identifier="b2" * 16)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("continued", result.stdout)
+        self.assertEqual(self.image.read_bytes(), b"replacement image")
+
+    def write_record(self, identifier=OPERATION_ID, status="running", stage="copying", action="clone",
+                     pending="", destination="", pid=2147483647, start=1):
+        record = self.store / "operations" / f"{identifier}.state"
+        record.write_text(f"format=1\nid={identifier}\npid={pid}\nprocess_start={start}\nstatus={status}\nstage={stage}\n"
+                          f"action={action}\nname=lab\npending={pending}\ndestination={destination}\n"
+                          "image_inode=\nimage_size=\nmeta_inode=\nmeta_size=\n")
+        return record
+
+    def test_discard_removes_partial_files_of_interrupted_work_and_unblocks(self):
+        partial = self.store / "images/.copy.ABC123.partial"
+        partial.write_bytes(b"partial data")
+        Path(str(partial) + ".meta").write_text("lifecycle=persistent\n")
+        record = self.write_record(pending="images/.copy.ABC123.partial")
+        result = self.bash('discard_operation "$1"', OPERATION_ID, identifier="c3" * 16)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(partial.exists())
+        self.assertFalse(Path(str(partial) + ".meta").exists())
+        self.assertIn("status=failed", record.read_text())
+        self.assertIn("stage=discarded", record.read_text())
+        self.assertNotEqual(self.bash('discard_operation "$1"', OPERATION_ID).returncode, 0)
+
+    def test_discard_rolls_back_a_prepared_publication_but_not_a_later_one(self):
+        partial = self.store / "images/.lab.ABC123.partial"
+        meta = Path(str(partial) + ".meta")
+        partial.write_bytes(b"staged")
+        meta.write_text("lifecycle=ephemeral\n")
+        pending = "images/.lab.ABC123.partial"
+        self.write_record(stage="publish-metadata", action="restore", pending=pending, destination="images/lab.img")
+        result = self.bash('discard_operation "$1"', OPERATION_ID)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--recover-operation", result.stderr)
+        self.assertTrue(partial.exists())
+        self.write_record(stage="publish-prepared", action="restore", pending=pending, destination="images/lab.img")
+        meta.unlink()
+        self.assertNotEqual(self.bash('discard_operation "$1"', OPERATION_ID).returncode, 0)
+        self.assertTrue(partial.exists())
+        meta.write_text("lifecycle=ephemeral\n")
+        result = self.bash('discard_operation "$1"', OPERATION_ID)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(partial.exists())
+        self.assertEqual(self.image.read_bytes(), b"original image")
+        self.assertEqual(self.bash('lock_image "$IMAGE_DIR/lab.img" descriptor').returncode, 0)
+
+    def test_discard_refuses_unsafe_paths_live_and_finished_operations(self):
+        outside = self.store / "precious"
+        outside.write_text("keep")
+        for pending in ("../precious", "precious", "images/../precious", "images/not-a-partial",
+                        "snapshots/../../precious/.x.ABC123.partial", "/etc/passwd"):
+            with self.subTest(pending=pending):
+                self.write_record(pending=pending)
+                result = self.bash('discard_operation "$1"', OPERATION_ID)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertTrue(outside.exists())
+        target = self.store / "images/.lab.ABC123.partial"
+        target.symlink_to(outside)
+        self.write_record(pending="images/.lab.ABC123.partial")
+        self.assertNotEqual(self.bash('discard_operation "$1"', OPERATION_ID).returncode, 0)
+        self.assertEqual(outside.read_text(), "keep")
+        target.unlink()
+        self.write_record(status="completed", stage="completed")
+        self.assertNotEqual(self.bash('discard_operation "$1"', OPERATION_ID).returncode, 0)
+        result = self.bash("""
+PROCESS=$$
+sed_start=$(process_start_time "$PROCESS")
+cat >"$OPERATIONS_DIR/$1.state" <<RECORD
+format=1
+id=$1
+pid=$PROCESS
+process_start=$sed_start
+status=running
+stage=copying
+action=clone
+name=lab
+pending=
+destination=
+RECORD
+discard_operation "$1"
+""", OPERATION_ID)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("still running", result.stderr)
+
+    def test_discard_sets_aside_a_damaged_record_so_the_store_is_usable(self):
+        record = self.store / "operations" / f"{OPERATION_ID}.state"
+        record.write_text("garbage line\n")
+        self.assertNotEqual(self.bash('lock_image "$IMAGE_DIR/lab.img" descriptor').returncode, 0)
+        listed = self.bash("list_operations json")
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertEqual(json.loads(listed.stdout), [])
+        result = self.bash('discard_operation "$1"', OPERATION_ID, identifier="c3" * 16)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(record.exists())
+        self.assertEqual(Path(str(record) + ".invalid").read_text(), "garbage line\n")
+        self.assertEqual(self.bash('lock_image "$IMAGE_DIR/lab.img" descriptor').returncode, 0)
+
+    def test_list_operations_reports_what_can_be_done(self):
+        self.write_record(identifier="d4" * 16, stage="publish-metadata", pending="images/.x.ABC123.partial", destination="images/lab.img")
+        self.write_record(identifier="e5" * 16, stage="copying")
+        self.write_record(identifier="f6" * 16, status="completed", stage="completed")
+        operations = {item["id"]: item for item in json.loads(self.bash("list_operations json").stdout)}
+        self.assertEqual((operations["d4" * 16]["recoverable"], operations["d4" * 16]["discardable"]), (True, True))
+        self.assertEqual((operations["e5" * 16]["recoverable"], operations["e5" * 16]["discardable"]), (False, True))
+        self.assertEqual((operations["f6" * 16]["recoverable"], operations["f6" * 16]["discardable"]), (False, False))
+
+    def test_operation_history_is_trimmed_automatically_and_keeps_unfinished_work(self):
+        for index in range(60):
+            identifier = f"{index:032x}"
+            self.write_record(identifier=identifier, status="completed", stage="completed")
+            log = self.store / "logs" / f"{identifier}.log"
+            log.write_text("done\n")
+            os.utime(log, (1000 + index, 1000 + index))
+        self.write_record(identifier="9" * 32, stage="copying", pending="images/.x.ABC123.partial")
+        (self.store / "logs" / ("9" * 32 + ".log")).write_text("stopped\n")
+        os.utime(self.store / "logs" / ("9" * 32 + ".log"), (1, 1))
+        no_log = self.write_record(identifier="8" * 32, status="completed", stage="completed")
+        result = self.bash("""
+CHROOTABLE_OPERATION_KEEP=5
+begin_operation mode lab
+exit 0
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        records = {path.name[:-6] for path in (self.store / "operations").glob("*.state")}
+        self.assertLessEqual(len(records), 7)
+        self.assertIn("9" * 32, records)
+        self.assertIn(OPERATION_ID, records)
+        self.assertFalse(no_log.exists())
+        self.assertTrue((self.store / "logs" / ("9" * 32 + ".log")).exists())
+        self.assertFalse((self.store / "logs" / (f"{0:032x}.log")).exists())
+
+    def test_history_below_the_margin_is_left_alone(self):
+        for index in range(10):
+            self.write_record(identifier=f"{index:032x}", status="completed", stage="completed")
+            (self.store / "logs" / f"{index:032x}.log").write_text("done\n")
+        result = self.bash('CHROOTABLE_OPERATION_KEEP=5\nbegin_operation mode lab\nexit 0')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(list((self.store / "operations").glob("*.state"))), 11)
+
+    def archive_sync_script(self, body=""):
+        return """
+require_root() { :; }
+init_store() { :; }
+make_workdir() { WORK="$STORE_DIR/work"; mkdir -p "$WORK"; }
+dpkg() { printf 'amd64\\n'; }
+run_worker() { printf new >"$ARCHIVE_STAGING/base.tgz"; }
+ARCHIVE_DIR="$STORE_DIR/archive"
+mkdir -p "$ARCHIVE_DIR"
+""" + body + "\narchive_sync trixie build\n"
+
+    def test_archive_sync_replaces_the_archive_and_clears_abandoned_directories(self):
+        archive = self.store / "archive/trixie-amd64"
+        archive.mkdir(parents=True)
+        (archive / "base.tgz").write_text("old")
+        stale = self.store / "archive/.trixie-amd64.ZZZZZZ"
+        stale.mkdir()
+        other = self.store / "archive/.bookworm-amd64.ZZZZZZ"
+        other.mkdir()
+        result = self.bash(self.archive_sync_script())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((archive / "base.tgz").read_text(), "new")
+        self.assertFalse(stale.exists())
+        self.assertTrue(other.exists())
+        self.assertEqual([path.name for path in (self.store / "archive").glob(".trixie*")], [])
+
+    def test_archive_sync_restores_the_old_archive_when_the_swap_fails(self):
+        archive = self.store / "archive/trixie-amd64"
+        archive.mkdir(parents=True)
+        (archive / "base.tgz").write_text("old")
+        result = self.bash(self.archive_sync_script("""
+mv() {
+    if [[ ${@: -2:1} == "$ARCHIVE_DIR"/.trixie-amd64.?????? ]]; then return 1; fi
+    command mv "$@"
+}
+"""))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((archive / "base.tgz").read_text(), "old")
+
+    def test_archive_sync_recovers_an_archive_lost_between_renames(self):
+        old = self.store / "archive/.trixie-amd64.ABCDEF.old"
+        old.mkdir(parents=True)
+        (old / "base.tgz").write_text("survivor")
+        result = self.bash(self.archive_sync_script('run_worker() { return 9; }'))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((self.store / "archive/trixie-amd64/base.tgz").read_text(), "survivor")
+
+    def test_archive_sync_refuses_to_run_twice_at_once(self):
+        (self.store / "archive").mkdir()
+        result = self.bash(self.archive_sync_script("""
+exec {held}>>"$ARCHIVE_DIR/.sync.lock"
+flock -n "$held"
+(
+  exec {held}>&-
+  archive_sync trixie build
+)
+exit $?
+"""))
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_create_waits_for_a_shared_archive_lock(self):
+        (self.store / "archive").mkdir()
+        (self.store / "archive/.lock").touch()
+        holder = subprocess.Popen(["flock", "-x", str(self.store / "archive/.lock"), "sleep", "1"])
+        self.addCleanup(holder.wait)
+        import time
+        time.sleep(0.2)
+        started = time.monotonic()
+        result = self.bash("""
+preflight_free_space() { :; }
+begin_operation() { return 19; }
+create_image waited 512 persistent minimal
+""")
+        self.assertEqual(result.returncode, 19, result.stderr)
+        self.assertGreater(time.monotonic() - started, 0.4)
+
+    def test_export_count_does_not_merge_similarly_named_workspaces(self):
+        for filename in ("lab-20261015-120000-AbCd12.tar.gz", "lab-20261015-120000.tar.gz", "lab.tar.gz",
+                         "lab-bench-20261015-120000-AbCd12.tar.gz", "lab-notes.tar.gz"):
+            (self.store / "exports" / filename).write_bytes(b"x")
+        self.assertEqual(self.bash("export_count lab").stdout, "3")
+        self.assertEqual(self.bash("export_count lab-bench").stdout, "1")
+
+    def test_dropping_the_last_snapshot_removes_its_folder(self):
+        for label in ("one", "two"):
+            (self.store / f"snapshots/lab/{label}.img").write_bytes(b"s")
+        script = """
+assert_offline() { :; }
+drop_snapshot lab "$1"
+"""
+        self.assertEqual(self.bash(script, "one", identifier="c3" * 16).returncode, 0)
+        self.assertTrue((self.store / "snapshots/lab").exists())
+        self.assertEqual(self.bash(script, "two", identifier="d4" * 16).returncode, 0)
+        self.assertFalse((self.store / "snapshots/lab").exists())
 
     def test_prune_logs_and_delete_export(self):
         for idx in range(5):

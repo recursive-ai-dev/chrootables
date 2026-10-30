@@ -348,19 +348,59 @@ doctor json
         activity = self.store / "activity.tsv"
         activity.write_text("".join(f"2026-10-15T10:00:{i:02d}\tcreate\tlab-{i}\tok\t\n" for i in range(40)))
         (self.store / "exports/lab-20261015-120000.tar.gz").write_bytes(b"export")
+        (self.store / "operations").mkdir(exist_ok=True)
         op_file = self.store / "operations" / ("d" * 32 + ".state")
-        op_file.write_text("id=" + "d" * 32 + "\naction=clone\nname=lab\ntarget=copy\nstatus=running\nstage=publish-image\npid=999999\n")
+        op_file.write_text("format=1\nid=" + "d" * 32 + "\npid=2147483647\nprocess_start=1\nstatus=running\n"
+                           "stage=publish-metadata\naction=clone\nname=lab\n"
+                           "pending=images/.copy.ABC123.partial\ndestination=images/lab.img\n")
+        (self.store / "images").mkdir(exist_ok=True)
+        (self.store / "images/lab.img").write_bytes(b"image")
         result = self.bash('''
-CHROOTABLE_ACTIVITY_MAX_BYTES=200 CHROOTABLE_ACTIVITY_KEEP_LINES=10 record_event snapshot lab ok
+CHROOTABLE_ACTIVITY_MAX_BYTES=200 CHROOTABLE_ACTIVITY_KEEP_LINES=10 record_event snapshot lab ok ""
 image_details "$IMAGE_DIR/lab.img"
 ''')
         self.assertEqual(result.returncode, 0, result.stderr)
         lines = activity.read_text().splitlines()
         self.assertEqual(len(lines), 10)
         self.assertTrue(lines[-1].endswith("\tsnapshot\tlab\tok\t"))
-        self.assertIn("Origin:", result.stdout)
-        self.assertIn("Exports:", result.stdout)
+        self.assertRegex(result.stdout, r"Origin\s+none")
+        self.assertRegex(result.stdout, r"Exports\s+1")
         self.assertIn("--recover-operation", result.stdout)
+
+    def test_terminal_menu_import_collects_values_and_runs_the_operation(self):
+        answers = self.store / "answers"
+        answers.write_text("/backups/lab.tar.gz\nrestored\n\npersistent\n")
+        result = self.bash('''
+exec 9<"$1"
+ui() {
+    case " $* " in
+        *--inputbox*|*--menu*) IFS= read -r reply <&9; printf '%s' "$reply" >&2 ;;
+    esac
+    return 0
+}
+ui_run() { printf 'RUN'; printf ' [%s]' "$@"; printf '\n'; }
+UI_WIDTH=80 UI_HEIGHT=22
+ui_import
+''', answers)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "RUN [import_image] [restored] [/backups/lab.tar.gz] [] [persistent] [minimal]")
+
+    def test_terminal_menu_lists_only_interrupted_operations(self):
+        operations = self.store / "operations"
+        operations.mkdir(exist_ok=True)
+        for identifier, status, stage in (("a" * 32, "running", "copying"), ("b" * 32, "completed", "completed")):
+            (operations / f"{identifier}.state").write_text(
+                f"format=1\nid={identifier}\npid=2147483647\nprocess_start=1\nstatus={status}\n"
+                f"stage={stage}\naction=clone\nname=lab\n")
+        result = self.bash('''
+ui() { printf '%s\n' "$*" >>"$STORE_DIR/menu"; return 1; }
+UI_WIDTH=80 UI_HEIGHT=22
+ui_interrupted
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        menu = (self.store / "menu").read_text()
+        self.assertIn("a" * 32, menu)
+        self.assertNotIn("b" * 32, menu)
 
     def test_recommended_size_mib_covers_all_seven_profiles(self):
         result = self.bash('''
@@ -370,8 +410,8 @@ done
 ''')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), [
-            "minimal=2048", "build=8192", "python=4096", "network=2048",
-            "rust=8192", "go=6144", "web=6144",
+            "minimal=2048", "build=4096", "python=4096", "network=2048",
+            "rust=6144", "go=6144", "web=4096",
         ])
 
 

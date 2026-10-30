@@ -79,7 +79,9 @@ Expand an image; shrinking is unsupported.
 Create a compressed filesystem archive and print its path.
 .TP
 .B --import NAME ARCHIVE.tar.gz [SIZE_MIB] [persistent|ephemeral] [PROFILE]
-Import a validated .tar.gz archive into a new sparse ext4 image.
+Import a validated .tar.gz archive into a new sparse ext4 image. Path traversal,
+block devices and non-standard character devices are refused, as is a capacity too
+small for the contents. An empty SIZE_MIB fits capacity to the archive.
 .SH SESSION OPTIONS
 .TP
 .B --isolated
@@ -107,6 +109,11 @@ Permanently remove one snapshot.
 .B --recover-operation ID --yes
 Finish an interrupted staged image publication after validating recorded files.
 Active operations and unsafe or inconsistent records are refused.
+.TP
+.B --discard-operation ID --yes
+Abandon an interrupted operation and remove its staged files, or set aside a
+damaged operation record. A publication that has already replaced metadata must
+be recovered instead.
 .TP
 .B --repair NAME --yes
 Force an ext4 filesystem check and repair.

@@ -664,34 +664,110 @@ class DesktopTests(unittest.TestCase):
 
     def test_mib_create_mode_import_dialog_collision_checks_and_maintenance_actions(self):
         from chrootables.app import CreateDialog, ImportDialog, ValueDialog
-        create_dlg = CreateDialog(self.window, existing={"python-playground"})
+        create_dlg = CreateDialog({"python-playground"}, self.window)
         self.addCleanup(create_dlg.close)
         create_dlg.name_input.setText("python-playground")
-        self.assertFalse(create_dlg.submit.isEnabled())
+        create_dlg.validate()
+        self.assertIn("already in use", create_dlg.error.text())
         create_dlg.name_input.setText("sub-gib-lab")
-        create_dlg.size_unit.setCurrentIndex(1)
-        create_dlg.size_input.setValue(512)
-        self.assertEqual(create_dlg.values()["size_mib"], 512)
+        create_dlg.set_size_mib(512)
+        self.assertEqual(create_dlg.parameters()["size_mib"], 512)
 
         value_dlg = ValueDialog(
-            self.window, "Save recovery point", "Checkpoint", "Label",
-            "clean-base", "Save", forbidden={"clean-base"},
-            collision_message="A recovery point with this label already exists.",
+            "Save recovery point", "Checkpoint", "Label", "clean-base", parent=self.window,
+            forbidden={"clean-base"}, collision_message="A recovery point with this label already exists.",
         )
         self.addCleanup(value_dlg.close)
-        self.assertFalse(value_dlg.submit.isEnabled())
-        self.assertIn("already exists", value_dlg.feedback.text())
+        self.assertFalse(value_dlg.ok_button.isEnabled())
+        self.assertIn("already exists", value_dlg.error.text())
         value_dlg.input.setText("fresh-point")
-        self.assertTrue(value_dlg.submit.isEnabled())
+        self.assertTrue(value_dlg.ok_button.isEnabled())
 
         with tempfile.TemporaryDirectory() as tmp:
             archive = Path(tmp) / "export.tar.gz"
             archive.write_bytes(b"tar-gz-placeholder")
-            import_dlg = ImportDialog(self.window, existing={"python-playground"}, initial_archive=str(archive))
+            import_dlg = ImportDialog({"python-playground"}, str(archive), self.window)
             self.addCleanup(import_dlg.close)
             import_dlg.name_input.setText("imported-lab")
-            self.assertTrue(import_dlg.submit.isEnabled())
-            self.assertEqual(import_dlg.values()["name"], "imported-lab")
+            import_dlg.validate()
+            self.assertEqual(import_dlg.result(), QDialog.DialogCode.Accepted)
+            values = import_dlg.parameters()
+            self.assertEqual((values["name"], values["archive"]), ("imported-lab", str(archive)))
+            self.assertNotIn("size_mib", values, "Capacity should fit the archive by default.")
+            import_dlg.auto_size.setChecked(False)
+            self.assertTrue(import_dlg.size_input.isEnabled())
+            self.assertEqual(import_dlg.parameters()["size_mib"], import_dlg.size_input.value())
+
+    def test_retained_export_imports_by_name_without_reading_the_store(self):
+        from chrootables.app import ImportDialog
+        unreadable = "/var/lib/chrootable-manager/exports/lab-20261015-120000-AbCd12.tar.gz"
+        dialog = ImportDialog(set(), unreadable, self.window, managed_export=Path(unreadable).name)
+        self.addCleanup(dialog.close)
+        self.assertTrue(dialog.archive_input.isReadOnly())
+        self.assertFalse(dialog.browse_button.isEnabled())
+        with patch("chrootables.app.archive_file", side_effect=ValueError("must not be called")):
+            dialog.validate()
+        self.assertEqual(dialog.result(), QDialog.DialogCode.Accepted)
+        values = dialog.parameters()
+        self.assertEqual(values["export"], Path(unreadable).name)
+        self.assertNotIn("archive", values)
+
+    def test_interrupted_work_is_visible_and_can_be_discarded(self):
+        operations = [
+            {"id": "a" * 32, "action": "clone", "name": "lab", "status": "interrupted", "stage": "copying",
+             "log": "", "active": False, "recoverable": False, "discardable": True, "reclaimable_bytes": 3 * 1048576},
+            {"id": "b" * 32, "action": "restore", "name": "lab", "status": "interrupted", "stage": "publish-metadata",
+             "log": "", "active": False, "recoverable": True, "discardable": True, "reclaimable_bytes": 0},
+        ]
+        self.window.data = {**self.window.data, "operations": operations}
+        self.window.demo = False
+        self.window.render_recovery()
+        self.assertFalse(self.window.interrupted_frame.isHidden())
+        self.assertIn("frees 3 MiB", self.window.interrupted_label.text())
+        self.assertIn("1 more", self.window.interrupted_label.text())
+        self.assertTrue(self.window.recover_operation_button.isHidden())
+        self.assertTrue(self.window.discard_operation_button.isEnabled())
+        with patch.object(self.window, "confirm", return_value=True), patch.object(self.window, "perform") as perform:
+            self.window.discard_interrupted_operation()
+        perform.assert_called_once_with("discard-operation", {"id": "a" * 32, "confirmed": True})
+        self.window.data = {**self.window.data, "operations": operations[1:]}
+        self.window.render_recovery()
+        self.assertFalse(self.window.recover_operation_button.isHidden())
+        self.window.demo = True
+
+    def test_cancelled_operation_is_not_reported_as_a_failure(self):
+        from chrootables.client import BackendError
+        captured = {}
+        self.window.demo = False
+        with patch.object(self.window.client, "request", side_effect=lambda action, params, done: captured.update(done=done)):
+            self.window.run_operation("clone", {"name": "lab", "target": "copy"})
+            self.assertTrue(self.window.busy)
+            captured["done"](False, BackendError("Clone was cancelled.", "cancelled"))
+        self.assertFalse(self.window.busy)
+        self.assertIn("cancelled", self.window.task_title.text())
+        self.assertNotIn("failed", self.window.task_title.text())
+        self.window.demo = True
+
+    def test_cancelling_authentication_returns_to_a_read_only_connection(self):
+        self.window.demo = False
+        self.window.client.requested_writable = True
+        with patch.object(self.window.client, "start") as start:
+            self.window.disconnected("Administrator access was cancelled or the helper closed.")
+            self.app.processEvents()
+            start.assert_called_once_with(False)
+            start.reset_mock()
+            self.window.client.requested_writable = False
+            self.window.disconnected("The workspace helper stopped.")
+            self.app.processEvents()
+            start.assert_not_called()
+        self.window.demo = True
+
+    def test_export_keeps_an_importable_suffix(self):
+        self.window.selected = "python-playground"
+        with patch("chrootables.app.QFileDialog.getSaveFileName", return_value=("/tmp/chrootables-test-backup", "")), \
+                patch.object(self.window, "perform") as perform:
+            self.window.export()
+        perform.assert_called_once_with("export", {"name": "python-playground", "destination": "/tmp/chrootables-test-backup.tar.gz"})
 
 
 if __name__ == "__main__":

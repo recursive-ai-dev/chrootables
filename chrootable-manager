@@ -10,9 +10,9 @@ DEBIAN_SUITE=${CHROOTABLE_DEBIAN_SUITE:-stable}
 DEBIAN_MIRROR=${CHROOTABLE_DEBIAN_MIRROR:-https://deb.debian.org/debian}
 NON_INTERACTIVE=1
 DEMO=0
-REQUIRED_COMMANDS=(awk basename chmod chroot cp date dd debootstrap df dpkg du e2fsck find flock gpgv
-    gzip hostname install ip ln losetup mkdir mkfs.ext4 mknod mktemp mount mountpoint mv readlink
-    resize2fs rm rmdir sha256sum stat sync tail tar truncate umount unshare wget whiptail xz)
+REQUIRED_COMMANDS=(awk basename chmod chroot cp cut date dd debootstrap df dpkg du e2fsck find flock gpgv
+    grep gzip hostname install ip ln losetup mkdir mkfs.ext4 mknod mktemp mount mountpoint mv readlink
+    resize2fs rm rmdir sha256sum sleep sort stat sync tail tar touch truncate umount unshare wget whiptail xz)
 
 configure_paths() {
     IMAGE_DIR="$STORE_DIR/images"
@@ -162,9 +162,13 @@ snapshot_count() {
     printf '%s' "$count"
 }
 export_count() {
-    local file count=0
+    local file rest count=0
+    # Match the generated NAME-DATE-TIME-TOKEN form so "foo" never claims the
+    # exports of "foo-bar".
     for file in "$EXPORT_DIR/$1-"*.tar.gz "$EXPORT_DIR/$1.tar.gz"; do
-        [[ -f $file && ! -L $file ]] && count=$((count + 1))
+        [[ -f $file && ! -L $file ]] || continue
+        rest=${file##*/}; rest=${rest#"$1"}
+        [[ $rest == .tar.gz || $rest =~ ^-[0-9]{8}-[0-9]{6}(-[A-Za-z0-9]{6})?\.tar\.gz$ ]] && count=$((count + 1))
     done
     printf '%s' "$count"
 }
@@ -198,7 +202,7 @@ package_for_command() {
         esac
     fi
     case $1 in
-        whiptail|debootstrap|dpkg|hostname|tar|gzip|gpgv|wget) printf '%s' "$1" ;;
+        whiptail|debootstrap|dpkg|grep|hostname|tar|gzip|gpgv|wget) printf '%s' "$1" ;;
         xz) printf xz-utils ;;
         mkfs.ext4|e2fsck|resize2fs) printf e2fsprogs ;;
         mount|umount|mountpoint|unshare|flock|losetup) printf util-linux ;;
@@ -360,12 +364,12 @@ check_pending_publications() {
     [[ ! -L $OPERATIONS_DIR ]] || { fail "Operation records must not be symlinks."; return 1; }
     for record in "$OPERATIONS_DIR/"*.state; do
         [[ -f $record && ! -L $record ]] || continue
-        read_operation_state "$record" state || { fail "Invalid operation record: $record. Inspect the store before continuing."; return 1; }
+        read_operation_state "$record" state || { target=${record##*/}; fail "Invalid operation record: $record. Inspect the store, then set it aside with: $0 --discard-operation ${target%.state} --yes"; return 1; }
         [[ ${state[id]} != "${RECOVERING_OPERATION:-}" ]] || continue
         [[ ${state[stage]} == publish-* && ${state[status]} != completed && ${state[status]} != recovered ]] || continue
         target=${state[destination]:-}
         if [[ $target == "images/${image##*/}" ]]; then
-            fail "Interrupted publication ${state[id]} must be recovered first: $0 --recover-operation ${state[id]} --yes"
+            fail "Interrupted publication ${state[id]} must be recovered first: $0 --recover-operation ${state[id]} --yes (or abandon it with --discard-operation)"
             return 1
         fi
         if [[ $target == snapshots/* ]]; then
@@ -396,12 +400,20 @@ begin_operation() {
     OP_STATUS=running; OP_STAGE=starting
     printf '%s  %s  %s\n' "$(timestamp)" "$1" "$2" >>"$OP_LOG"
     trap finish_operation EXIT
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
+    allow_signals
     operation_stage starting
 }
+allow_signals() {
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+}
+# Stopping these steps midway would damage data rather than abandon work. Ignored
+# signals are inherited, so child processes such as resize2fs are covered too.
+protect_from_signals() { trap '' HUP INT TERM; }
 finish_operation() {
     local status=$?
+    protect_from_signals
     # Publication is a recoverable two-file transaction. Retain both the staged
     # image and its record after a failure; explicit recovery can finish it.
     if [[ ${OP_STAGE:-} == publish-* && $status != 0 ]]; then
@@ -416,7 +428,7 @@ finish_operation() {
     fi
     if [[ -n ${ARCHIVE_STAGING:-} ]]; then rm -rf --one-file-system -- "$ARCHIVE_STAGING" || true; fi
     if [[ -n ${WORK:-} ]]; then
-        rm -f -- "$WORK/started" "$WORK/resolv.conf" "$WORK/resolv.conf.tmp" || true
+        rm -f -- "$WORK/started" "$WORK/resolv.conf" "$WORK/resolv.conf.tmp" "$WORK/import.info" || true
         rmdir "$WORK/root" "$WORK/lower" "$WORK/overlay" "$WORK" 2>/dev/null || true
     fi
     if (( status == 0 )); then
@@ -427,11 +439,20 @@ finish_operation() {
         record_event "$OPERATION" "$OP_NAME" failed "$OP_LOG" || true
         info "Operation failed (status $status). Log: $OP_LOG"
     fi
+    auto_prune_history || true
     return "$status"
 }
 make_workdir() { WORK=$(mktemp -d /run/chrootable-manager.XXXXXX); }
 run_worker() { unshare --mount --uts --ipc --pid --fork --kill-child "$SCRIPT_PATH" --worker "$@"; }
 publish_image() {
+    local status=0
+    # Once this starts the only outcomes are published or explicitly recoverable.
+    protect_from_signals
+    publish_image_steps "$@" || status=$?
+    allow_signals
+    return "$status"
+}
+publish_image_steps() {
     local pending=$1 destination=$2
     OP_PENDING=${pending#"$STORE_DIR/"}
     OP_DESTINATION=${destination#"$STORE_DIR/"}
@@ -474,6 +495,8 @@ publication_paths_valid() {
 recover_operation() (
     local identifier=$1 record pending destination lock_name descriptor
     local -A state=()
+    # This resumes another operation's record, so emit no events under the caller's ID.
+    unset CHROOTABLE_OPERATION_ID
     valid_operation_id "$identifier" || { fail "Invalid operation ID."; return 1; }
     record="$OPERATIONS_DIR/$identifier.state"
     read_operation_state "$record" state && [[ ${state[id]} == "$identifier" ]] || { fail "Operation record is missing or invalid."; return 1; }
@@ -529,16 +552,91 @@ recover_operation() (
     record_event recover "$OP_NAME" ok "$OP_LOG" || return
     info "Recovered publication $identifier. Image and metadata are consistent."
 )
+staged_path_valid() {
+    local path=$1 folder base=${1##*/}
+    case $path in
+        images/*|exports/*)
+            [[ ${path%/*} == images || ${path%/*} == exports ]] || return 1
+            [[ $base =~ ^\.[A-Za-z0-9][A-Za-z0-9._-]{0,63}\.[A-Za-z0-9]{6}\.partial$ ]] ;;
+        snapshots/*/*)
+            folder=${path#snapshots/}; folder=${folder%%/*}
+            [[ $path == "snapshots/$folder/$base" ]] && valid_name "$folder" &&
+                [[ ! -L $SNAPSHOT_DIR/$folder && $base =~ ^\.[A-Za-z0-9][A-Za-z0-9._-]{0,63}\.[A-Za-z0-9]{6}\.partial$ ]] ;;
+        archive/*)
+            [[ ${path%/*} == archive && $base =~ ^\.[a-z0-9][a-z0-9.-]{0,31}-[a-z0-9]+\.[A-Za-z0-9]{6}$ ]] ;;
+        *) return 1 ;;
+    esac
+}
+discard_operation() (
+    local identifier=$1 record pending destination descriptor lock_name
+    local -A state=()
+    unset CHROOTABLE_OPERATION_ID
+    valid_operation_id "$identifier" || { fail "Invalid operation ID."; return 1; }
+    record="$OPERATIONS_DIR/$identifier.state"
+    [[ -f $record && ! -L $record ]] || { fail "Operation record is missing."; return 1; }
+    if ! read_operation_state "$record" state; then
+        # A damaged record cannot name its files, but it must not block the store.
+        mv -T -- "$record" "$record.invalid" || return
+        record_event discard-operation store ok "" || return
+        info "Set aside the damaged record as $record.invalid. Check $STORE_DIR for leftover .partial files."
+        return 0
+    fi
+    [[ ${state[id]} == "$identifier" ]] || { fail "Operation record is invalid."; return 1; }
+    ! operation_is_alive state || { fail "This operation is still running. Wait for it to finish."; return 1; }
+    [[ ${state[status]} == running || ${state[status]} == interrupted ]] || {
+        fail "Operation $identifier already finished as ${state[status]}. Nothing needs discarding."; return 1;
+    }
+    pending=${state[pending]:-}; destination=${state[destination]:-}
+    if [[ -n $pending ]]; then
+        staged_path_valid "$pending" || { fail "Unsafe staged path in operation record. Nothing was changed."; return 1; }
+        [[ ! -L $STORE_DIR/$pending && ! -L $STORE_DIR/$pending.meta ]] || { fail "Refusing a symlinked staged path. Nothing was changed."; return 1; }
+    fi
+    if [[ ${state[action]} != archive ]]; then
+        if [[ $destination == images/* ]]; then lock_name=${destination#images/}; lock_name=${lock_name%.img}
+        elif [[ $destination == snapshots/* ]]; then lock_name=${destination#snapshots/}; lock_name=${lock_name%%/*}
+        else lock_name=${state[name]}; fi
+        RECOVERING_OPERATION=$identifier
+        lock_image "$IMAGE_DIR/$lock_name.img" descriptor || return
+    fi
+    # Metadata may already be published. Only roll back while both staged files
+    # still exist; otherwise the image and metadata would be left mismatched.
+    if [[ ${state[stage]} == publish-* && -n $pending && -f $STORE_DIR/$pending ]]; then
+        [[ ${state[stage]} == publish-prepared && -f $STORE_DIR/$pending.meta ]] || {
+            fail "This publication already replaced metadata. Finish it instead: $0 --recover-operation $identifier --yes"
+            return 1
+        }
+    fi
+    if [[ -n $pending ]]; then
+        pending="$STORE_DIR/$pending"
+        if [[ -d $pending ]]; then rm -rf --one-file-system -- "$pending" || return
+        else
+            if [[ -e $pending ]]; then assert_offline "$pending" || return; fi
+            rm -f -- "$pending" "$pending.meta" || return
+        fi
+    fi
+    OP_ID=$identifier; OP_PID=$BASHPID; OP_PROCESS_START=$(process_start_time "$OP_PID") || return
+    OPERATION=${state[action]}; OP_NAME=${state[name]}; OP_STATUS=failed; OP_STAGE=discarded
+    OP_PENDING=; OP_DESTINATION=; OP_IMAGE_INODE=; OP_IMAGE_SIZE=; OP_META_INODE=; OP_META_SIZE=
+    OP_LOG="$LOG_DIR/$identifier.log"
+    operation_stage discarded || return
+    record_event discard-operation "$OP_NAME" ok "$OP_LOG" || return
+    info "Discarded interrupted ${state[action]} $identifier and removed its staged files."
+)
 list_operations() {
-    local record comma= status active
+    local record comma= status active recoverable discardable
     local -A state=()
     [[ ${1:-text} != json ]] || printf '['
     for record in "$OPERATIONS_DIR/"*.state; do
         [[ -f $record && ! -L $record ]] || continue
-        read_operation_state "$record" state || { fail "Invalid operation record: $record"; return 1; }
+        read_operation_state "$record" state || { info "Invalid operation record: $record. Remove it with --discard-operation."; continue; }
         active=false; operation_is_alive state && active=true
         status=${state[status]}
         [[ $status != running || $active == true ]] || status=interrupted
+        recoverable=false; discardable=false
+        if [[ $active == false && $status == interrupted ]]; then
+            discardable=true
+            [[ ${state[stage]} != publish-* ]] || recoverable=true
+        fi
         if [[ ${1:-text} == json ]]; then
             printf '%s{"id":' "$comma"; json_string "${state[id]}"
             printf ',"action":'; json_string "${state[action]}"
@@ -546,7 +644,7 @@ list_operations() {
             printf ',"status":'; json_string "$status"
             printf ',"stage":'; json_string "${state[stage]}"
             printf ',"log":'; json_string "$LOG_DIR/${state[id]}.log"
-            printf ',"active":%s}' "$active"; comma=,
+            printf ',"active":%s,"recoverable":%s,"discardable":%s}' "$active" "$recoverable" "$discardable"; comma=,
         else
             printf '%s\t%s\t%s\t%s\t%s\n' "${state[id]}" "${state[action]}" "${state[name]}" "$status" "${state[stage]}"
         fi
@@ -604,7 +702,7 @@ capabilities() {
 "suites":[{"id":"trixie","title":"Debian 13 (Trixie)"},{"id":"bookworm","title":"Debian 12 (Bookworm)"}],
 "limits":{"min_size_mib":512,"max_size_mib":1048576},
 "session_options":["disposable","isolated","share","read_only","restricted_dev"],
-"features":["import","prune-logs","delete-export","archive-sync","recover-operation"],
+"features":["import","prune-logs","delete-export","archive-sync","recover-operation","discard-operation"],
 "storage":{"allocation":"sparse","capacity_reserved":false},
 "operation_events":{"prefix":"CHROOTABLE_EVENT ","id_environment":"CHROOTABLE_OPERATION_ID","log_pattern":"logs/<id>.log"}}'
 }
@@ -626,7 +724,7 @@ archive_has_profile() {
 archive_sync() (
     # Rebuilds the suite's archive as a whole so the lists, base tarball and
     # debs always come from a single resolution.
-    local suite=$1 arch archive profile
+    local suite=$1 arch archive profile sync_lock swap_lock old stale newest=
     shift
     local -a profiles=("$@")
     require_root || return
@@ -641,7 +739,20 @@ archive_sync() (
     [[ -d $ARCHIVE_DIR ]] || install -d -m 0700 "$ARCHIVE_DIR" || return
     arch=$(dpkg --print-architecture) || return
     archive=$(archive_path "$suite" "$arch")
+    exec {sync_lock}>>"$ARCHIVE_DIR/.sync.lock" || return
+    flock -n "$sync_lock" || { fail "Another offline archive sync is running."; return 1; }
     begin_operation archive "$suite" || return
+    # Holding the sync lock, any staging or previous directory for this archive
+    # was abandoned by a crash. Put back an archive lost between the two renames.
+    for stale in "$ARCHIVE_DIR/.$suite-$arch."*.old; do
+        [[ -d $stale && ! -L $stale ]] || continue
+        [[ -n $newest && ! $stale -nt $newest ]] || newest=$stale
+    done
+    if [[ -n $newest && ! -e $archive ]]; then mv -T -- "$newest" "$archive" || return; fi
+    for stale in "$ARCHIVE_DIR/.$suite-$arch."*; do
+        [[ -d $stale && ! -L $stale ]] || continue
+        rm -rf --one-file-system -- "$stale" || return
+    done
     make_workdir || return
     ARCHIVE_STAGING=$(mktemp -d "$ARCHIVE_DIR/.$suite-$arch.XXXXXX") || return
     OP_PENDING=${ARCHIVE_STAGING#"$STORE_DIR/"}; operation_stage downloading-archive || return
@@ -653,11 +764,22 @@ archive_sync() (
     rm -rf --one-file-system -- "$ARCHIVE_STAGING/scratch" || return
     printf '%s\n' "$DEBIAN_MIRROR" >"$ARCHIVE_STAGING/mirror" || return
     printf '%s\n' "${profiles[@]}" >"$ARCHIVE_STAGING/profiles" || return
+    # Creates hold this lock shared while they read the archive, so the swap
+    # waits for them and a create never sees a half-replaced archive.
+    exec {swap_lock}>>"$ARCHIVE_DIR/.lock" || return
+    flock -x "$swap_lock" || return
+    old="$ARCHIVE_STAGING.old"
+    protect_from_signals
     if [[ -e $archive ]]; then
-        mv -T -- "$archive" "$ARCHIVE_STAGING.old" || return
+        mv -T -- "$archive" "$old" || return
     fi
-    mv -T -- "$ARCHIVE_STAGING" "$archive" || return
-    ARCHIVE_STAGING="$ARCHIVE_STAGING.old"
+    if ! mv -T -- "$ARCHIVE_STAGING" "$archive"; then
+        if [[ -e $old ]]; then mv -T -- "$old" "$archive" || true; fi
+        return 1
+    fi
+    allow_signals
+    exec {swap_lock}>&-
+    ARCHIVE_STAGING=$old
     rm -rf --one-file-system -- "$ARCHIVE_STAGING" || return
     ARCHIVE_STAGING=
     info "Archive ready: $archive ($(du -sh -- "$archive" | cut -f1)). Creates for $suite now work offline."
@@ -677,8 +799,8 @@ archive_worker() {
     # profile dependencies against exactly the base a create will have.
     debootstrap --variant=minbase --arch="$arch" --unpack-tarball="$staging/base.tgz" "$suite" "$WORKER_ROOT" || return
     printf 'deb %s %s main\n' "$DEBIAN_MIRROR" "$suite" >"$WORKER_ROOT/etc/apt/sources.list" || return
-    setup_resolv_conf "$work" "$WORKER_ROOT"
     mount_session_devices || return
+    setup_resolv_conf "$work" "$WORKER_ROOT"
     chroot "$WORKER_ROOT" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get update || return
     for profile in "$@"; do
         read -r -a package_list <<<"$(profile_packages "$profile")"
@@ -721,7 +843,7 @@ allocate_image() {
 }
 
 create_image() (
-    local name=$1 size=$2 lifecycle=$3 profile=${4:-minimal} image descriptor arch
+    local name=$1 size=$2 lifecycle=$3 profile=${4:-minimal} image descriptor arch archive_lock
     unused_image "$name" || return
     valid_size_mib "$size" || { fail "Size must be a whole number from 512 to 1048576 MiB."; return 1; }
     valid_lifecycle "$lifecycle" || { fail "Lifecycle must be persistent or ephemeral."; return 1; }
@@ -732,6 +854,10 @@ create_image() (
     lock_image "$image" descriptor || return
     unused_image "$name" || return
     preflight_free_space "$((size * 1048576))" || return
+    if [[ -d $ARCHIVE_DIR && ! -L $ARCHIVE_DIR ]]; then
+        exec {archive_lock}>>"$ARCHIVE_DIR/.lock" || return
+        flock -s "$archive_lock" || return
+    fi
     begin_operation create "$name" || return
     PENDING=$(mktemp "$IMAGE_DIR/.$name.XXXXXX.partial") || return
     OP_PENDING=${PENDING#"$STORE_DIR/"}; operation_stage allocating || return
@@ -785,9 +911,11 @@ resize_image() (
     operation_stage checking-filesystem || return
     fsck_preflight "$image" "$OP_LOG" || return
     operation_stage expanding || return
+    protect_from_signals
     truncate -s "${requested}M" "$image" >>"$OP_LOG" 2>&1 || return
     resize2fs "$image" >>"$OP_LOG" 2>&1 || return
     metadata_set "$image" size_mib "$requested" || return
+    allow_signals
     info "Expanded '$(basename "$image" .img)' to $requested MiB."
 )
 repair_image() (
@@ -796,7 +924,9 @@ repair_image() (
     assert_offline "$image" || return
     begin_operation repair "$(basename "$image" .img)" || return
     operation_stage repairing-filesystem || return
+    protect_from_signals
     e2fsck -f -y "$image" >>"$OP_LOG" 2>&1 || status=$?
+    allow_signals
     (( status <= 1 )) || return "$status"
     info "Filesystem repair completed. Log: $OP_LOG"
 )
@@ -812,7 +942,10 @@ export_image() (
     token=${PENDING%.partial}; token=${token##*.}
     archive="$EXPORT_DIR/$name-$(date +%Y%m%d-%H%M%S)-$token.tar.gz"
     run_worker export "$image" "$WORK" "$PENDING" >>"$OP_LOG" 2>&1 || return
+    # A crash must never leave a truncated archive under its final name.
+    durable_sync "$PENDING" || return
     mv -T -- "$PENDING" "$archive" || return
+    durable_sync "$EXPORT_DIR" || return
     PENDING=
     printf '%s\n' "$archive"
 )
@@ -825,28 +958,96 @@ canonicalize_archive_file() {
     [[ $resolved == *.tar.gz || $resolved == *.tgz ]] || { fail "Archive must be a .tar.gz or .tgz file: $original"; return 1; }
     printf -v "$2" '%s' "$resolved"
 }
+# Capacity needed for payload bytes across a number of filesystem entries. For a
+# capacity C, mke2fs leaves about 0.93 C for data: 5% is reserved for root,
+# 256-byte inodes per 16 KiB take 1.5625%, and bitmaps and descriptors stay under
+# 0.5%. The journal J(C) is a step function of C and never shrinks as C grows, so
+# iterating C = (payload + J(C)) / 0.93 upward reaches a fixed point. Inodes add
+# the bound C >= entries * 16 KiB. The result is at least the 512 MiB minimum image
+# size, which also keeps mke2fs off its denser "small" profile, used below 512 MiB.
+# tests/test_cli_operations.py checks all of this against a real mke2fs.
+journal_bytes_for() {
+    local blocks=$(($1 / 4096))
+    if (( blocks < 32768 )); then printf 4194304
+    elif (( blocks < 262144 )); then printf 16777216
+    elif (( blocks < 524288 )); then printf 33554432
+    elif (( blocks < 4194304 )); then printf 67108864
+    elif (( blocks < 8388608 )); then printf 134217728
+    elif (( blocks < 16777216 )); then printf 268435456
+    elif (( blocks < 33554432 )); then printf 536870912
+    else printf 1073741824; fi
+}
+required_capacity_mib() {
+    local payload=$1 entries=$2 capacity=536870912 next journal
+    while :; do
+        journal=$(journal_bytes_for "$capacity")
+        next=$(( (payload + journal) * 100 / 93 + 1 ))
+        (( next > entries * 16384 )) || next=$((entries * 16384))
+        (( next > capacity )) || break
+        capacity=$next
+    done
+    printf '%s' "$(( (capacity + 1048575) / 1048576 ))"
+}
+# debootstrap creates exactly these nodes; anything else could reach a host device
+# because sessions mount images without nodev.
+allowed_character_device() {
+    case $1 in 1,3|1,5|1,7|1,8|1,9|5,0|5,1|5,2) return 0 ;; *) return 1 ;; esac
+}
+unsafe_archive_path() { [[ $1 == /* || $1 == ../* || $1 == */../* || $1 == */.. || $1 == .. ]]; }
 validate_tar_archive() {
-    local archive=$1 entry has_entry=0
+    local archive=$1 perms owner bytes day clock entry target type payload=0 entries=0 status=
     gzip -t -- "$archive" 2>/dev/null || { fail "Archive is not a valid gzip-compressed file: $archive"; return 1; }
-    while IFS= read -r entry; do
-        [[ -n $entry ]] || continue
-        has_entry=1
-        if [[ $entry == /* || $entry == ../* || $entry == */../* || $entry == */.. || $entry == .. ]]; then
-            fail "Archive contains unsafe path traversal entry: $entry"
+    # GNU tar quotes control characters in names, so each entry is one line and
+    # --numeric-owner keeps the owner a single field. --absolute-names shows names
+    # as stored, not with a leading / already removed. The status line cannot be
+    # confused with an entry, whose first field is always a mode string.
+    while read -r perms owner bytes day clock entry; do
+        if [[ $perms == status ]]; then status=$owner; continue; fi
+        type=${perms:0:1}
+        target=
+        # Symlink targets may be absolute: GNU tar defers them until extraction ends.
+        case $type in
+            l) entry=${entry%% -> *} ;;
+            h) target=${entry#* link to }; entry=${entry%% link to *} ;;
+        esac
+        if unsafe_archive_path "$entry" || { [[ -n $target ]] && unsafe_archive_path "$target"; }; then
+            fail "Unsafe path in archive: $entry"
             return 1
         fi
-    done < <(tar -tzf "$archive" 2>/dev/null) || { fail "Could not read tar archive entries: $archive"; return 1; }
-    (( has_entry )) || { fail "Archive is empty: $archive"; return 1; }
+        case $type in
+            -) [[ $bytes =~ ^[0-9]+$ ]] || { fail "Could not read the size of archive entry: $entry"; return 1; }
+               payload=$((payload + (bytes + 4095) / 4096 * 4096)) ;;
+            d) payload=$((payload + 4096)) ;;
+            l|h|p) ;;
+            c) allowed_character_device "$bytes" || { fail "Archive contains an unsupported device node: $entry"; return 1; } ;;
+            b) fail "Archive contains a block device node: $entry"; return 1 ;;
+            *) fail "Archive contains an unsupported entry type '$type': $entry"; return 1 ;;
+        esac
+        entries=$((entries + 1))
+    done < <(LC_ALL=C tar --numeric-owner --absolute-names -tvzf "$archive" 2>/dev/null; printf 'status %s\n' "$?")
+    [[ $status == 0 ]] || { fail "Could not read tar archive entries: $archive"; return 1; }
+    (( entries )) || { fail "Archive is empty: $archive"; return 1; }
+    IMPORT_REQUIRED_MIB=$(required_capacity_mib "$payload" "$entries")
 }
 import_image() (
     local name=$1 archive=$2 size=${3:-} lifecycle=${4:-persistent} profile=${5:-minimal} image descriptor arch
     unused_image "$name" || return
     valid_lifecycle "$lifecycle" || { fail "Lifecycle must be persistent or ephemeral."; return 1; }
     valid_profile "$profile" || { fail "Unknown profile: $profile. See --profiles."; return 1; }
-    [[ -n $size ]] || size=$(recommended_size_mib "$profile") || return
-    valid_size_mib "$size" || { fail "Size must be a whole number from 512 to 1048576 MiB."; return 1; }
+    [[ -z $size ]] || valid_size_mib "$size" || { fail "Size must be a whole number from 512 to 1048576 MiB."; return 1; }
     canonicalize_archive_file "$archive" archive || return
     validate_tar_archive "$archive" || return
+    if [[ -n $size ]]; then
+        (( size >= IMPORT_REQUIRED_MIB )) || { fail "This archive needs at least $IMPORT_REQUIRED_MIB MiB of capacity; $size MiB was requested."; return 1; }
+    else
+        # Automatic sizing leaves working room: a quarter again, at least 512 MiB.
+        size=$(recommended_size_mib "$profile") || return
+        local headroom=$((IMPORT_REQUIRED_MIB / 4))
+        (( headroom >= 512 )) || headroom=512
+        (( size >= IMPORT_REQUIRED_MIB + headroom )) || size=$((IMPORT_REQUIRED_MIB + headroom))
+        (( size <= 1048576 )) || size=1048576
+    fi
+    (( size >= IMPORT_REQUIRED_MIB )) || { fail "This archive needs $IMPORT_REQUIRED_MIB MiB, more than the 1048576 MiB limit."; return 1; }
     image="$IMAGE_DIR/$name.img"
     lock_image "$image" descriptor || return
     unused_image "$name" || return
@@ -862,16 +1063,28 @@ import_image() (
     mkfs.ext4 -F -L "${name:0:16}" "$PENDING" >>"$OP_LOG" 2>&1 || return
     operation_stage importing || return
     run_worker import "$PENDING" "$WORK" "$name" "$archive" >>"$OP_LOG" 2>&1 || return
-    write_metadata "$PENDING" "$lifecycle" "$DEBIAN_SUITE" "$arch" "$size" "$(timestamp)" never "$profile" "import:${archive##*/}" || return
+    # The archive's own release and architecture are recorded when it names them.
+    local key value suite=$DEBIAN_SUITE origin=${archive##*/}
+    if [[ -f $WORK/import.info ]]; then
+        while IFS='=' read -r key value; do
+            case $key in
+                suite) ! valid_suite "$value" || suite=$value ;;
+                architecture) [[ ! $value =~ ^[a-z0-9-]{1,32}$ ]] || arch=$value ;;
+            esac
+        done <"$WORK/import.info"
+    fi
+    write_metadata "$PENDING" "$lifecycle" "$suite" "$arch" "$size" "$(timestamp)" never "$profile" "import:$origin" || return
     publish_image "$PENDING" "$image" || return
     PENDING=
     info "Imported '$name' from '${archive##*/}'."
 )
-prune_logs() (
-    local keep=${1:-20} record log base op_id removed=0 idx=0
+# Remove logs and terminal records beyond the newest KEEP. Anything still running,
+# or stopped partway, stays: its record is the only map to its staged files.
+prune_history() {
+    local keep=$1 record log base op_id idx=0
     local -A protected=() state=()
     local -a logs=() sorted_logs=()
-    valid_keep_count "$keep" || { fail "Keep count must be a whole number from 0 to 10000."; return 1; }
+    PRUNED_COUNT=0
     [[ ! -L $LOG_DIR && ! -L $OPERATIONS_DIR ]] || { fail "Store subdirectories must not be symlinks."; return 1; }
     for record in "$OPERATIONS_DIR/"*.state; do
         [[ -f $record && ! -L $record ]] || continue
@@ -880,8 +1093,10 @@ prune_logs() (
             protected["$LOG_DIR/$base.log"]=1
             continue
         fi
-        if operation_is_alive state || [[ ( ${state[status]} != completed && ${state[status]} != recovered ) && ${state[stage]} == publish-* ]]; then
+        if operation_is_alive state || [[ ${state[status]} == running || ${state[status]} == interrupted ]]; then
             protected["$LOG_DIR/${state[id]}.log"]=1
+        elif [[ ! -e $LOG_DIR/${state[id]}.log ]]; then
+            rm -f -- "$record" || return
         fi
     done
     for log in "$LOG_DIR/"*.log; do
@@ -899,12 +1114,27 @@ prune_logs() (
             if valid_operation_id "$op_id" && [[ -f $OPERATIONS_DIR/$op_id.state && ! -L $OPERATIONS_DIR/$op_id.state ]]; then
                 rm -f -- "$OPERATIONS_DIR/$op_id.state" || return
             fi
-            removed=$((removed + 1))
+            PRUNED_COUNT=$((PRUNED_COUNT + 1))
         done
     fi
+}
+prune_logs() (
+    local keep=${1:-20}
+    valid_keep_count "$keep" || { fail "Keep count must be a whole number from 0 to 10000."; return 1; }
+    prune_history "$keep" || return
     record_event prune-logs store ok "" || return
-    info "Pruned $removed operation log(s) (retained up to $((10#$keep)) newest completed logs)."
+    info "Pruned $PRUNED_COUNT operation log(s) (retained up to $((10#$keep)) newest completed logs)."
 )
+# Every session and mutation adds a record that later operations must scan, so
+# trim automatically. The margin avoids rescanning on every single operation.
+auto_prune_history() {
+    local keep=${CHROOTABLE_OPERATION_KEEP:-200} margin=50
+    local -a records=()
+    valid_keep_count "$keep" || keep=200
+    records=("$OPERATIONS_DIR/"*.state)
+    (( ${#records[@]} > 10#$keep + margin )) || return 0
+    prune_history "$keep" 2>/dev/null
+}
 delete_export() (
     local filename=$1 target
     valid_export_name "$filename" || { fail "Invalid export archive filename: $filename"; return 1; }
@@ -996,6 +1226,7 @@ drop_snapshot() (
     begin_operation drop-snapshot "$name" || return
     operation_stage deleting-snapshot || return
     rm -f -- "$snapshot" "$snapshot.meta" || return
+    rmdir -- "$SNAPSHOT_DIR/$name" 2>/dev/null || true
     info "Deleted snapshot '$name / $label'."
 )
 list_snapshots() {
@@ -1042,8 +1273,15 @@ enter_chrootable() (
 worker_cleanup() {
     local status=$? cleanup_status=0
     cd / || true
+    # Guest daemons get time to flush before the image is unmounted. In this PID
+    # namespace "-1" means every process except this one and init, so the wait
+    # ends as soon as nothing is left. Sessions with no daemons pay nothing.
+    local waited=0 grace_ticks=${CHROOTABLE_STOP_GRACE_TICKS:-100}
     kill -TERM -1 2>/dev/null || true
-    sleep 0.05 2>/dev/null || true
+    while (( waited < grace_ticks )) && kill -0 -1 2>/dev/null; do
+        sleep 0.05 2>/dev/null || true
+        waited=$((waited + 1))
+    done
     kill -KILL -1 2>/dev/null || true
     if [[ -n ${WORKER_SHARE_TARGET:-} ]]; then
         if mountpoint -q "$WORKER_SHARE_TARGET"; then
@@ -1053,7 +1291,7 @@ worker_cleanup() {
             rmdir -- "$WORKER_SHARE_TARGET" 2>/dev/null || true
         fi
     fi
-    if mountpoint -q "$WORKER_ROOT/etc/resolv.conf"; then umount "$WORKER_ROOT/etc/resolv.conf" 2>/dev/null || true; fi
+    if [[ ! -L $WORKER_ROOT/etc/resolv.conf ]] && mountpoint -q "$WORKER_ROOT/etc/resolv.conf"; then umount "$WORKER_ROOT/etc/resolv.conf" 2>/dev/null || true; fi
     if mountpoint -q "$WORKER_ROOT/dev/ptmx"; then umount "$WORKER_ROOT/dev/ptmx" 2>/dev/null || true; fi
     if mountpoint -q "$WORKER_ROOT/dev/pts"; then umount "$WORKER_ROOT/dev/pts" 2>/dev/null || true; fi
     if mountpoint -q "$WORKER_ROOT"; then umount -R "$WORKER_ROOT" 2>/dev/null || umount -l "$WORKER_ROOT" || cleanup_status=$?; fi
@@ -1062,9 +1300,40 @@ worker_cleanup() {
     (( status != 0 || cleanup_status == 0 )) || status=$cleanup_status
     exit "$status"
 }
+# Resolve PATH as the guest would see it, returning a host path inside ROOT. Every
+# component is checked, so no guest symlink, absolute or relative, can lead out.
+guest_resolve() {
+    local root=$1 current= part link hops=0
+    local -a pending=() linked=()
+    IFS='/' read -r -a pending <<<"$2"
+    while (( ${#pending[@]} )); do
+        part=${pending[0]}; pending=("${pending[@]:1}")
+        case $part in
+            ''|.) continue ;;
+            ..) current=${current%/*}; continue ;;
+        esac
+        if [[ -L $root$current/$part ]]; then
+            (( ++hops <= 40 )) || { fail "Too many symbolic links resolving guest path: $2"; return 1; }
+            link=$(readlink -- "$root$current/$part") || return
+            [[ $link != /* ]] || current=
+            IFS='/' read -r -a linked <<<"$link"
+            pending=("${linked[@]}" "${pending[@]}")
+            continue
+        fi
+        current+="/$part"
+    done
+    printf '%s\n' "$root$current"
+}
+guest_mountpoint() {
+    local target="$WORKER_ROOT/$1"
+    [[ ! -L $target ]] || { fail "Guest /$1 must be a directory, not a symbolic link."; return 1; }
+    mkdir -p -- "$target"
+}
+# Mount after /run exists: a guest resolver link usually points below /run, and
+# mounting the tmpfs afterwards would hide the bind.
 setup_resolv_conf() {
-    local work=$1 root=$2 source_file=""
-    local target="$root/etc/resolv.conf" dest="$work/resolv.conf"
+    local work=$1 root=$2 source_file="" target
+    local dest="$work/resolv.conf"
 
     if [[ -f /run/systemd/resolve/resolv.conf && -r /run/systemd/resolve/resolv.conf ]]; then
         source_file="/run/systemd/resolve/resolv.conf"
@@ -1090,31 +1359,41 @@ setup_resolv_conf() {
     chmod 0644 "$dest" || return
 
     if [[ -d $root/etc ]]; then
-        touch "$target" 2>/dev/null || true
+        target=$(guest_resolve "$root" /etc/resolv.conf) || return 0
+        mkdir -p -- "${target%/*}" 2>/dev/null || true
+        [[ -e $target || -L $target ]] || : >"$target" 2>/dev/null || true
+        [[ -f $target && ! -L $target ]] || return 0
         mount --bind "$dest" "$target" 2>/dev/null || true
         mount --make-rslave "$target" 2>/dev/null || true
     fi
 }
-mount_session_devices() {
-    mkdir -p "$WORKER_ROOT/proc" "$WORKER_ROOT/dev" "$WORKER_ROOT/run" || return
+mount_session_filesystems() {
+    guest_mountpoint proc && guest_mountpoint run || return
     mount -t proc proc "$WORKER_ROOT/proc" || return
+    mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs "$WORKER_ROOT/run"
+}
+mount_session_devices() {
+    mount_session_filesystems || return
+    guest_mountpoint dev || return
     mount --rbind /dev "$WORKER_ROOT/dev" || return
     mount --make-rslave "$WORKER_ROOT/dev" || return
     if mkdir -p "$WORKER_ROOT/dev/pts" 2>/dev/null; then
         mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts "$WORKER_ROOT/dev/pts" 2>/dev/null &&
             mount --bind "$WORKER_ROOT/dev/pts/ptmx" "$WORKER_ROOT/dev/ptmx" 2>/dev/null || true
     fi
-    mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs "$WORKER_ROOT/run"
 }
 mount_restricted_devices() {
     # Opt-in reduced /dev: a fresh tmpfs with only the character devices a
-    # Debian shell needs. No host device nodes are exposed.
+    # Debian shell needs. No host device nodes are exposed. /proc and /run are
+    # still needed: /dev/fd and /dev/stdin below resolve through /proc.
     local dev="$WORKER_ROOT/dev"
-    mkdir -p "$dev" || return
+    mount_session_filesystems || return
+    guest_mountpoint dev || return
     mount -t tmpfs -o mode=0755,nosuid tmpfs "$dev" || return
     # Create mountpoints inside the new tmpfs, after it hides the guest /dev.
-    mkdir -p "$dev/pts" || return
+    mkdir -p "$dev/pts" "$dev/shm" || return
     mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts "$dev/pts" || return
+    mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs "$dev/shm" || return
     ln -s pts/ptmx "$dev/ptmx" || return
     ln -s /proc/self/fd "$dev/fd" && ln -s /proc/self/fd/0 "$dev/stdin" &&
         ln -s /proc/self/fd/1 "$dev/stdout" && ln -s /proc/self/fd/2 "$dev/stderr" || return
@@ -1148,6 +1427,24 @@ mount_shared_folder() {
     # A plain bind excludes submounts within the source folder.
     mount --bind -- "$source" "$target" || return
     if [[ $read_only == 1 ]]; then mount -o remount,bind,ro -- "$target" || return; fi
+}
+# Report what the imported filesystem says about itself, read as the guest would.
+record_import_details() {
+    local work=$1 path line suite= architecture=
+    path=$(guest_resolve "$WORKER_ROOT" /etc/os-release) || return
+    if [[ -f $path ]]; then
+        while IFS= read -r line || [[ -n $line ]]; do
+            if [[ $line == VERSION_CODENAME=* ]]; then
+                suite=${line#*=}; suite=${suite//\"/}; suite=${suite//\'/}
+            fi
+        done <"$path"
+    fi
+    path=$(guest_resolve "$WORKER_ROOT" /var/lib/dpkg/arch) || return
+    if [[ -f $path ]]; then IFS= read -r architecture <"$path" || true; fi
+    if [[ -n $architecture && $architecture != "$(dpkg --print-architecture)" ]]; then
+        info "Warning: this archive is for $architecture; sessions on this host may not run its programs."
+    fi
+    printf 'suite=%s\narchitecture=%s\n' "$suite" "$architecture" >"$work/import.info"
 }
 worker_main() (
     local kind=$1 image=$2 work=$3
@@ -1187,8 +1484,8 @@ worker_main() (
                     mount -t tmpfs -o mode=0700,nosuid,nodev tmpfs "$WORKER_OVERLAY" || return
                     archive_install_profile "$archive" "${package_list[@]}" || return
                 else
-                    setup_resolv_conf "$work" "$WORKER_ROOT"
                     mount_session_devices || return
+                    setup_resolv_conf "$work" "$WORKER_ROOT"
                     chroot "$WORKER_ROOT" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get update || return
                     chroot "$WORKER_ROOT" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${package_list[@]}" || return
                 fi
@@ -1198,15 +1495,19 @@ worker_main() (
         archive) archive_worker "$image" "$@" || return ;;
         export)
             mount -o loop,ro,noload "$image" "$WORKER_ROOT" || return
-            tar --numeric-owner --acls --xattrs --one-file-system -C "$WORKER_ROOT" -czf "$1" . || return
+            tar --numeric-owner --acls --xattrs --xattrs-include='*' --one-file-system -C "$WORKER_ROOT" -czf "$1" . || return
             ;;
         import)
             local name=$1 archive=$2
             mount -o loop "$image" "$WORKER_ROOT" || return
-            tar --numeric-owner --acls --xattrs --no-overwrite-dir -p -C "$WORKER_ROOT" -xzf "$archive" || return
+            # Extraction otherwise restores only user.* xattrs, losing file capabilities.
+            tar --numeric-owner --acls --xattrs --xattrs-include='*' --no-overwrite-dir -p -C "$WORKER_ROOT" -xzf "$archive" || return
+            # Sessions exec /usr/bin/env inside the image, so it must exist.
+            [[ -L $WORKER_ROOT/usr/bin/env || -f $WORKER_ROOT/usr/bin/env ]] || { fail "Archive is not a Linux root filesystem: /usr/bin/env is missing."; return 1; }
             if [[ -d $WORKER_ROOT/etc && ! -L $WORKER_ROOT/etc && ! -L $WORKER_ROOT/etc/hostname ]]; then
                 printf '%s\n' "$name" >"$WORKER_ROOT/etc/hostname" || return
             fi
+            record_import_details "$work" || return
             ;;
         enter)
             local name=$1 lifecycle=$2 network=$3 share=$4 read_only=$5
@@ -1220,15 +1521,15 @@ worker_main() (
             else
                 mount -o loop "$image" "$WORKER_ROOT" || return
             fi
-            if [[ $network == isolated ]]; then
-                ip link set lo up 2>/dev/null || ifconfig lo up 2>/dev/null || true
-            else
-                setup_resolv_conf "$work" "$WORKER_ROOT"
-            fi
             if [[ ${CHROOTABLE_RESTRICTED_DEV:-0} == 1 ]]; then
                 mount_restricted_devices || return
             else
                 mount_session_devices || return
+            fi
+            if [[ $network == isolated ]]; then
+                ip link set lo up 2>/dev/null || ifconfig lo up 2>/dev/null || true
+            else
+                setup_resolv_conf "$work" "$WORKER_ROOT"
             fi
             mount_shared_folder "$share" "$read_only" || return
             hostname "$name" || return
@@ -1811,16 +2112,66 @@ recovery_library() {
     choice=$(ui --cancel-button Back --menu "Recovery library\nIncludes snapshots of deleted workspaces." "$UI_HEIGHT" "$UI_WIDTH" "$((UI_HEIGHT - 10))" "${entries[@]}" 3>&1 1>&2 2>&3) || return 0
     ui_snapshots "$choice"
 }
+ui_import() {
+    local archive name size lifecycle base
+    archive=$(ui --inputbox "Absolute path to a workspace export (.tar.gz or .tgz):" 10 "$UI_WIDTH" 3>&1 1>&2 2>&3) || return 0
+    [[ -n $archive ]] || return 0
+    base=${archive##*/}; base=${base%.tar.gz}; base=${base%.tgz}
+    name=$(ui --inputbox "Workspace name:" 10 "$UI_WIDTH" "${base:0:64}" 3>&1 1>&2 2>&3) || return 0
+    valid_name "$name" || { ui_message "Invalid name. Start with a letter or digit; use at most 64 characters."; return; }
+    size=$(ui --inputbox "Capacity in MiB (512 to 1048576). Leave empty to fit the archive." 10 "$UI_WIDTH" 3>&1 1>&2 2>&3) || return 0
+    [[ -z $size ]] || valid_size_mib "$size" || { ui_message "Enter a whole number from 512 to 1048576 MiB, or leave it empty."; return; }
+    lifecycle=$(choose_lifecycle) || return 0
+    ui --yesno "Import $name?\n\nArchive: $archive\nCapacity: ${size:-fit to archive}\nSessions: $lifecycle" 13 "$UI_WIDTH" || return 0
+    ui_run import_image "$name" "$archive" "$size" "$lifecycle" minimal
+}
+ui_interrupted() {
+    local record choice action; local -A state=(); local -a entries=()
+    while true; do
+        entries=()
+        for record in "$OPERATIONS_DIR/"*.state; do
+            [[ -f $record && ! -L $record ]] || continue
+            read_operation_state "$record" state || continue
+            ! operation_is_alive state || continue
+            [[ ${state[status]} == running || ${state[status]} == interrupted ]] || continue
+            entries+=("${state[id]}" "${state[action]} / ${state[name]} / ${state[stage]}")
+        done
+        if (( ${#entries[@]} == 0 )); then ui_message "No interrupted operations."; return; fi
+        choice=$(ui --cancel-button Back --menu "Interrupted operations\n\nRecover finishes a staged publication. Discard removes its staged files." "$UI_HEIGHT" "$UI_WIDTH" "$((UI_HEIGHT - 11))" "${entries[@]}" 3>&1 1>&2 2>&3) || return 0
+        action=$(ui --cancel-button Back --menu "Operation $choice" 13 "$UI_WIDTH" 2 recover "Finish this publication" discard "Abandon it and remove staged files" 3>&1 1>&2 2>&3) || continue
+        case $action in
+            recover) ui_run recover_operation "$choice" ;;
+            discard)
+                ui --defaultno --yesno "Discard operation $choice?\n\nIts staged files are removed permanently." 11 "$UI_WIDTH" || continue
+                ui_run discard_operation "$choice" ;;
+        esac
+    done
+}
+ui_maintenance() {
+    local choice
+    while true; do
+        choice=$(ui --cancel-button Back --menu "Maintenance" 13 "$UI_WIDTH" 2 \
+            interrupted "Recover or discard interrupted operations" prune "Remove old completed logs (keep 20)" 3>&1 1>&2 2>&3) || return 0
+        case $choice in
+            interrupted) ui_interrupted ;;
+            prune)
+                ui --defaultno --yesno "Remove completed operation logs, keeping the 20 newest?" 10 "$UI_WIDTH" || continue
+                ui_run prune_logs 20 ;;
+        esac
+    done
+}
 main_menu() {
     local choice hint
     while true; do
         hint="Build something. Break things. Keep a recovery point."
         [[ -d $IMAGE_DIR ]] && compgen -G "$IMAGE_DIR/*.img" >/dev/null || hint="Start with New workspace. Choose a profile; make it your own."
-        choice=$(ui --cancel-button Quit --menu "$(workspace_summary)\n\n$hint" "$UI_HEIGHT" "$UI_WIDTH" 7 \
-            workspaces "Open your workspace library" new "Create a workspace from a profile" recovery "Browse snapshots, including deleted workspaces" \
+        choice=$(ui --cancel-button Quit --menu "$(workspace_summary)\n\n$hint" "$UI_HEIGHT" "$UI_WIDTH" 9 \
+            workspaces "Open your workspace library" new "Create a workspace from a profile" import "Create a workspace from an export archive" \
+            recovery "Browse snapshots, including deleted workspaces" maintenance "Interrupted operations and log cleanup" \
             activity "See recent operations" health "Check host tools and kernel support" profiles "Explore development profiles" help "Shortcuts, workflows and isolation notes" 3>&1 1>&2 2>&3) || return 0
         case $choice in
-            workspaces) select_chrootable ;; new) create_chrootable ;; recovery) recovery_library ;;
+            workspaces) select_chrootable ;; new) create_chrootable ;; import) ui_import ;;
+            recovery) recovery_library ;; maintenance) ui_maintenance ;;
             activity) ui_view "Workspace activity" "$(activity)" || true ;;
             health) ui_view "Host health" "$(doctor || true)" || true ;;
             profiles) ui_view "Start with a purpose" "$(list_profiles)" || true ;;
@@ -1887,7 +2238,8 @@ Explore (no root required when the store is readable)
 Create and use (root required)
   --create NAME SIZE_MIB persistent|ephemeral [PROFILE]
   --import NAME ARCHIVE.tar.gz [SIZE_MIB] [persistent|ephemeral] [PROFILE]
-                                   Rehydrate a .tar.gz export into a workspace
+                                   Rehydrate a .tar.gz export into a workspace.
+                                   An empty SIZE_MIB fits capacity to the archive
   --archive-sync SUITE [PROFILE...]
                                    Download everything creates of SUITE need
                                    (all profiles by default) so they work
@@ -1914,6 +2266,8 @@ Recovery and maintenance (root required)
   --prune-logs [KEEP_COUNT] --yes  Remove old completed logs (default: keep 20)
   --setup                          Install missing host dependencies
   --recover-operation ID --yes      Finish an interrupted staged publication
+  --discard-operation ID --yes      Abandon interrupted work and remove its staged
+                                   files, or set aside a damaged operation record
 
 Profiles: minimal (default), build, python, network, rust, go, web.
 Sizes are MiB, from 512 to 1048576 (1 TiB). Images are sparse; capacity is not
@@ -1976,7 +2330,7 @@ validate_cli() {
         --help|-h|--version|--dashboard|--profiles|--activity|--setup) [[ $# == 1 ]] ;;
         --capabilities) [[ $# == 2 && $2 == --json ]] ;;
         --operations) [[ $# == 1 || ( $# == 2 && $2 == --json ) ]] ;;
-        --recover-operation) [[ $# == 3 && $3 == --yes ]] && valid_operation_id "$2" ;;
+        --recover-operation|--discard-operation) [[ $# == 3 && $3 == --yes ]] && valid_operation_id "$2" ;;
         --doctor) [[ $# == 1 || ( $# == 2 && $2 == --json ) ]] ;;
         --list) [[ $# == 1 || ( $# == 2 && $2 == --json ) ]] ;;
         --demo) [[ $# == 1 || ( $# == 2 && $2 == --dashboard ) ]] ;;
@@ -2006,6 +2360,7 @@ run_cli() {
         --activity) activity ;; --logs) show_logs "$2" ;; --snapshots) list_snapshots "$2" ;;
         --setup) info "All host dependencies are available." ;;
         --recover-operation) recover_operation "$2" ;;
+        --discard-operation) discard_operation "$2" ;;
         --prune-logs) if [[ $2 == --yes ]]; then prune_logs 20; else prune_logs "$2"; fi ;;
         --delete-export) delete_export "$2" ;;
         --archive-sync) shift; archive_sync "$@" ;;
@@ -2043,6 +2398,10 @@ main() {
         return
     fi
     validate_cli "$@" || { usage_error; return 2; }
+    # Operations run in subshells that clean up on signals. The desktop signals the
+    # whole process group, so stay alive to report the true exit status: a bash trap
+    # runs only after the foreground subshell has finished.
+    trap ':' TERM
     case $1 in
         --help|-h|--version|--profiles|--capabilities|--doctor|--demo) ;;
         --dashboard|--list|--inspect|--activity|--logs|--snapshots|--operations) check_readable_store || return ;;
@@ -2050,7 +2409,7 @@ main() {
             NON_INTERACTIVE=0
             require_root && init_store && begin_operation setup host || return
             CHROOTABLE_DEP_LOG="$OP_LOG" check_prerequisites || return ;;
-        --recover-operation|--prune-logs|--delete-export) require_root && init_store || return ;;
+        --recover-operation|--discard-operation|--prune-logs|--delete-export) require_root && init_store || return ;;
         *)
             require_root && check_prerequisites && init_store || return ;;
     esac

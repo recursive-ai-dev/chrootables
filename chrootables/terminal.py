@@ -10,6 +10,7 @@ import codecs
 from collections import deque
 import fcntl
 import os
+import shutil
 import signal
 import struct
 import subprocess
@@ -26,6 +27,10 @@ from PySide6.QtWidgets import (
 DEFAULT_ROWS = 24
 DEFAULT_COLUMNS = 80
 DEFAULT_SCROLLBACK = 2000
+# Closing escalates from SIGTERM to a pty hangup, then stops waiting. A session
+# run through sudo may be unsignalable from here, and must not pin its window.
+TERMINATE_GRACE_MS = 3000
+HANGUP_GRACE_MS = 2000
 
 BOLD = 1 << 0
 ITALIC = 1 << 1
@@ -55,6 +60,19 @@ QT_KEY_INSERT = Qt.Key.Key_Insert.value
 QT_KEY_DELETE = Qt.Key.Key_Delete.value
 QT_KEY_PAGEUP = Qt.Key.Key_PageUp.value
 QT_KEY_PAGEDOWN = Qt.Key.Key_PageDown.value
+QT_KEY_RETURN_KEYPAD = Qt.Key.Key_Enter.value
+QT_KEY_ESCAPE = Qt.Key.Key_Escape.value
+QT_KEY_BACKTAB = Qt.Key.Key_Backtab.value
+QT_KEY_SPACE = Qt.Key.Key_Space.value
+QT_KEY_F1 = Qt.Key.Key_F1.value
+QT_KEY_F12 = Qt.Key.Key_F12.value
+
+# VT100 special graphics (ESC ( 0), which ncurses selects for line drawing.
+DEC_SPECIAL_GRAPHICS = dict(zip(
+    map(ord, "`abcdefghijklmnopqrstuvwxyz{|}~"),
+    "\u25c6\u2592\u2409\u240c\u240d\u240a\u00b0\u00b1\u2424\u240b\u2518\u2510\u250c\u2514\u253c"
+    "\u23ba\u23bb\u2500\u23bc\u23bd\u251c\u2524\u2534\u252c\u2502\u2264\u2265\u03c0\u2260\u00a3\u00b7",
+))
 
 
 class Style:
@@ -104,7 +122,7 @@ def normalize_cells(line):
     return line
 
 # Parser states.
-_GROUND, _ESC, _CSI, _OSC, _OSC_ESC, _CHARSET, _CSI_IGNORE = range(7)
+_GROUND, _ESC, _CSI, _OSC, _OSC_ESC, _CHARSET, _CSI_IGNORE, _STRING, _STRING_ESC = range(9)
 MAX_CSI_PARAMS = 256
 
 
@@ -123,7 +141,7 @@ class VtScreen:
         self.row = 0
         self.column = 0
         self.cursor_visible = True
-        self._saved_cursor = (0, 0)
+        self._saved_cursor = (0, 0, DEFAULT_STYLE, ("B", "B"), 0)
         self._alt_active = False
         self._primary = None
         self._top = 0
@@ -135,6 +153,13 @@ class VtScreen:
         self.history_count = 0
         self.bracketed_paste = False
         self._last_char = ""
+        self.application_cursor = False
+        self.responses = []
+        self._autowrap = True
+        self._insert_mode = False
+        self._charsets = ["B", "B"]
+        self._shift = 0
+        self._charset_target = None
 
     def _blank_line(self):
         return [(" ", DEFAULT_STYLE)] * self.columns
@@ -183,12 +208,20 @@ class VtScreen:
                 text, style = self.lines[row][column]
                 self.lines[row][column] = (text + character, style)
             return
+        if self._charsets[self._shift] == "0":
+            character = DEC_SPECIAL_GRAPHICS.get(ord(character), character)
+            width = cell_width(character)
         if width > self.columns:
             character, width = "\ufffd", 1
         self._last_char = character
-        if self.column >= self.columns or self.column + width > self.columns:
-            self.column = 0
-            self._line_feed()
+        if self.column + width > self.columns:
+            if self._autowrap:
+                self.column = 0
+                self._line_feed()
+            else:
+                self.column = self.columns - width
+        if self._insert_mode:
+            self._insert_blanks(width)
         self._erase(self.row, self.column, self.column + width)
         self.lines[self.row][self.column] = (character, self.style)
         if width == 2:
@@ -233,9 +266,13 @@ class VtScreen:
         # Only implement decimal parameters and the private modes we support.
         # Other CSI forms must not reach integer conversion or alter the screen.
         params = self._params
+        if params in (">", ">0") and final == "c":
+            self.responses.append("\x1b[>0;0;0c")
+            return
         if params.startswith("?") and final in ("h", "l"):
             params = params[1:]
-        if any(character not in "0123456789;" for character in params):
+        allowed = "0123456789;:" if final == "m" else "0123456789;"
+        if any(character not in allowed for character in params):
             return
         count = lambda index=0: max(1, self._param(index))
         if final == "A":
@@ -311,9 +348,19 @@ class VtScreen:
                 self._top, self._bottom = top, bottom
                 self.row, self.column = 0, 0
         elif final == "s":
-            self._saved_cursor = (self.row, self.column)
+            self._save_cursor()
         elif final == "u":
-            self.row, self.column = self._saved_cursor
+            self._restore_cursor()
+        elif final == "n":  # DSR
+            mode = self._param(0, 0)
+            if mode == 5:
+                self.responses.append("\x1b[0n")
+            elif mode == 6:
+                self._clamp_cursor()
+                self.responses.append(f"\x1b[{self.row + 1};{self.column + 1}R")
+        elif final == "c":  # DA: VT220 with ANSI color
+            if self._param(0, 0) == 0:
+                self.responses.append("\x1b[?62;22c")
         elif final == "m":
             self._apply_sgr()
         elif final in ("h", "l"):
@@ -324,14 +371,22 @@ class VtScreen:
         chunks = [chunk for chunk in self._params.split(";")] if self._params else ["0"]
         params = []
         for chunk in chunks:
-            params.append(int(chunk) if chunk.isdigit() else 0)
-        if not params:
-            params = [0]
+            params.append(chunk.split(":") if ":" in chunk else int(chunk) if chunk.isdigit() else 0)
         fg, bg, flags = self.style.fg, self.style.bg, self.style.flags
         index = 0
         while index < len(params):
             value = params[index]
-            if value == 0:
+            if isinstance(value, list):  # ISO 8613-6 colon form
+                head = value[0]
+                if head in ("38", "48"):
+                    color = self._colon_color(value)
+                    if head == "38":
+                        fg = color
+                    else:
+                        bg = color
+                elif head == "4":
+                    flags = flags & ~UNDERLINE if value[1:2] == ["0"] else flags | UNDERLINE
+            elif value == 0:
                 fg, bg, flags = None, None, 0
             elif value == 1:
                 flags |= BOLD
@@ -387,13 +442,38 @@ class VtScreen:
             return tuple(min(255, value) for value in params[index + 1:index + 4]), index + 3
         return None, index
 
+    @staticmethod
+    def _colon_color(parts):
+        """Parse 38:5:N and 38:2:[colorspace]:R:G:B; unknown forms use the default."""
+        digits = [int(part) if part.isdigit() else 0 for part in parts]
+        if len(parts) >= 3 and parts[1] == "5":
+            return digits[2] % 256
+        if len(parts) >= 5 and parts[1] == "2":
+            red, green, blue = digits[-3:] if len(parts) >= 6 else digits[2:5]
+            return (min(255, red), min(255, green), min(255, blue))
+        return None
+
+    def _save_cursor(self):
+        self._saved_cursor = (self.row, self.column, self.style, tuple(self._charsets), self._shift)
+
+    def _restore_cursor(self):
+        self.row, self.column, self.style, charsets, self._shift = self._saved_cursor
+        self._charsets = list(charsets)
+        self._clamp_cursor()
+
     def _apply_mode(self, enable):
         private = self._params.startswith("?")
         values = [int(chunk) if chunk.isdigit() else 0 for chunk in self._params.lstrip("?").split(";")] if self._params else []
         for value in values:
             if not private:
+                if value == 4:  # IRM
+                    self._insert_mode = enable
                 continue
-            if value == 25:
+            if value == 1:  # DECCKM
+                self.application_cursor = enable
+            elif value == 7:  # DECAWM
+                self._autowrap = enable
+            elif value == 25:
                 self.cursor_visible = enable
             elif value == 2004:
                 self.bracketed_paste = enable
@@ -406,14 +486,14 @@ class VtScreen:
         if active:
             self._primary = (self.lines, self.row, self.column, self._top, self._bottom)
             if save_cursor:
-                self._saved_cursor = (self.row, self.column)
+                self._save_cursor()
             self.lines = [self._blank_line() for _ in range(self.rows)]
         else:
             if self._primary is not None:
                 self.lines, self.row, self.column, self._top, self._bottom = self._primary
             self._primary = None
             if save_cursor:
-                self.row, self.column = self._saved_cursor
+                self._restore_cursor()
         self._alt_active = active
         self._clamp_cursor()
 
@@ -427,8 +507,13 @@ class VtScreen:
         self._alt_active = False
         self.bracketed_paste = False
         self.cursor_visible = True
-        self._saved_cursor = (0, 0)
+        self._saved_cursor = (0, 0, DEFAULT_STYLE, ("B", "B"), 0)
         self._last_char = ""
+        self.application_cursor = False
+        self._autowrap = True
+        self._insert_mode = False
+        self._charsets = ["B", "B"]
+        self._shift = 0
 
     # -- public interface ---------------------------------------------------
 
@@ -440,8 +525,12 @@ class VtScreen:
                     self._state = _ESC
                 elif character == "\r":
                     self.column = 0
-                elif character == "\n":
+                elif character in "\n\x0b\x0c":
                     self._line_feed()
+                elif character == "\x0e":  # SO
+                    self._shift = 1
+                elif character == "\x0f":  # SI
+                    self._shift = 0
                 elif character == "\t":
                     self.column = min(self.columns - 1, (self.column // 8 + 1) * 8)
                 elif character == "\b":
@@ -455,15 +544,20 @@ class VtScreen:
                     self._params = ""
                 elif character == "]":
                     self._state = _OSC
+                elif character in "PX^_":  # DCS, SOS, PM, APC
+                    self._state = _STRING
                 elif character in "()*+":
                     self._state = _CHARSET
+                    self._charset_target = "()*+".index(character)
+                elif " " <= character <= "/":  # Other two-byte escapes, such as ESC # 8.
+                    self._state = _CHARSET
+                    self._charset_target = None
                 else:
                     self._state = _GROUND
                     if character == "7":
-                        self._saved_cursor = (self.row, self.column)
+                        self._save_cursor()
                     elif character == "8":
-                        self.row, self.column = self._saved_cursor
-                        self._clamp_cursor()
+                        self._restore_cursor()
                     elif character == "D":
                         self._line_feed()
                     elif character == "M":
@@ -495,8 +589,17 @@ class VtScreen:
                     self._state = _OSC_ESC
             elif state == _OSC_ESC:
                 self._state = _GROUND
+            elif state == _STRING:
+                if character == "\x1b":
+                    self._state = _STRING_ESC
+                elif character in "\x18\x1a":
+                    self._state = _GROUND
+            elif state == _STRING_ESC:
+                self._state = _GROUND if character == "\\" else _STRING
             elif state == _CHARSET:
                 self._state = _GROUND
+                if self._charset_target in (0, 1):
+                    self._charsets[self._charset_target] = "0" if character == "0" else "B"
         if self._state in (_CSI,):
             self._clamp_cursor()
 
@@ -513,11 +616,24 @@ class VtScreen:
                 normalize_cells(result[index])
             return result
 
-        self.lines = resized(self.lines)
+        def to_history(lines, row):
+            # Shrinking keeps the cursor's line visible, as other terminals do;
+            # rows pushed off the top remain reachable through scrollback.
+            overflow = max(0, row + 1 - rows)
+            for line in lines[:overflow]:
+                self.history.append(line)
+                self.history_count += 1
+            return lines[overflow:], row - overflow
+
+        if self._alt_active:
+            self.lines = resized(self.lines)
+        else:
+            lines, self.row = to_history(self.lines, self.row)
+            self.lines = resized(lines)
         if self._primary is not None:
             lines, row, column, _, _ = self._primary
-            self._primary = (resized(lines), min(row, rows - 1),
-                             min(column, columns - 1), 0, rows - 1)
+            lines, row = to_history(lines, row)
+            self._primary = (resized(lines), row, min(column, columns - 1), 0, rows - 1)
         self.rows, self.columns = rows, columns
         self._top, self._bottom = 0, rows - 1
         self._clamp_cursor()
@@ -537,33 +653,45 @@ class VtScreen:
                 for line in lines[start:start + self.rows]]
 
 
-def key_to_bytes(key, text, ctrl=False, alt=False):
-    """Translate a Qt key event into the bytes sent to the session."""
-    ctrl_arrows = {
-        QT_KEY_UP: b"\x1b[1;5A", QT_KEY_DOWN: b"\x1b[1;5B",
-        QT_KEY_RIGHT: b"\x1b[1;5C", QT_KEY_LEFT: b"\x1b[1;5D",
-    }
-    if ctrl and key in ctrl_arrows:
-        return (b"\x1b" if alt else b"") + ctrl_arrows[key]
-    special = {
-        QT_KEY_ENTER: b"\r", QT_KEY_TAB: b"\t", QT_KEY_BACKSPACE: b"\x7f",
-        QT_KEY_LEFT: b"\x1b[D", QT_KEY_UP: b"\x1b[A", QT_KEY_RIGHT: b"\x1b[C",
-        QT_KEY_DOWN: b"\x1b[B", QT_KEY_HOME: b"\x1b[H", QT_KEY_END: b"\x1b[F",
-        QT_KEY_INSERT: b"\x1b[2~", QT_KEY_DELETE: b"\x1b[3~",
-        QT_KEY_PAGEUP: b"\x1b[5~", QT_KEY_PAGEDOWN: b"\x1b[6~",
-    }
-    if key in special:
-        return (b"\x1b" if alt else b"") + special[key]
+def key_to_bytes(key, text, ctrl=False, alt=False, shift=False, application_cursor=False):
+    """Translate a Qt key event into the bytes xterm would send to the session."""
+    modifier = 1 + (1 if shift else 0) + (2 if alt else 0) + (4 if ctrl else 0)
+    cursor = {QT_KEY_UP: "A", QT_KEY_DOWN: "B", QT_KEY_RIGHT: "C", QT_KEY_LEFT: "D",
+              QT_KEY_HOME: "H", QT_KEY_END: "F"}
+    if key in cursor:
+        if modifier > 1:
+            return f"\x1b[1;{modifier}{cursor[key]}".encode()
+        return ("\x1bO" if application_cursor else "\x1b[").encode() + cursor[key].encode()
+    tilde = {QT_KEY_INSERT: 2, QT_KEY_DELETE: 3, QT_KEY_PAGEUP: 5, QT_KEY_PAGEDOWN: 6,
+             QT_KEY_F1 + 4: 15, QT_KEY_F1 + 5: 17, QT_KEY_F1 + 6: 18, QT_KEY_F1 + 7: 19,
+             QT_KEY_F1 + 8: 20, QT_KEY_F1 + 9: 21, QT_KEY_F1 + 10: 23, QT_KEY_F1 + 11: 24}
+    if key in tilde:
+        suffix = f";{modifier}" if modifier > 1 else ""
+        return f"\x1b[{tilde[key]}{suffix}~".encode()
+    if QT_KEY_F1 <= key <= QT_KEY_F1 + 3:
+        final = "PQRS"[key - QT_KEY_F1]
+        return f"\x1b[1;{modifier}{final}".encode() if modifier > 1 else f"\x1bO{final}".encode()
+    prefix = b"\x1b" if alt else b""
+    if key == QT_KEY_BACKTAB:
+        return b"\x1b[Z"
+    if key in (QT_KEY_ENTER, QT_KEY_RETURN_KEYPAD):
+        return prefix + b"\r"
+    if key == QT_KEY_TAB:
+        return prefix + b"\t"
+    if key == QT_KEY_ESCAPE:
+        return prefix + b"\x1b"
+    if key == QT_KEY_BACKSPACE:
+        return prefix + (b"\x08" if ctrl else b"\x7f")
     if ctrl:
         if ord("A") <= key <= ord("Z"):
-            return bytes([key - ord("A") + 1])
-        if key == QT_KEY_HOME:
-            return b"\x1b[H"
-        if key == QT_KEY_END:
-            return b"\x1b[F"
-        return b""
+            return prefix + bytes([key - ord("A") + 1])
+        controls = {QT_KEY_SPACE: 0, ord("@"): 0, ord("2"): 0, ord("["): 27, ord("3"): 27,
+                    ord("\\"): 28, ord("4"): 28, ord("]"): 29, ord("5"): 29, ord("^"): 30,
+                    ord("6"): 30, ord("_"): 31, ord("7"): 31, ord("/"): 31, ord("?"): 127,
+                    ord("8"): 127}
+        return prefix + bytes([controls[key]]) if key in controls else b""
     if text:
-        return (b"\x1b" if alt else b"") + text.encode("utf-8")
+        return prefix + text.encode("utf-8")
     return b""
 
 
@@ -584,9 +712,15 @@ class PtyProcess(QObject):
             environment.setdefault("TERM", "xterm-256color")
             if env:
                 environment.update(env)
+            # sudo, Ctrl+C and SIGWINCH all need the pty to be the session's
+            # controlling terminal, which a new session does not get by itself.
+            # A Popen child is never a group leader, so setsid execs in place
+            # and keeps the pid; preexec_fn would be unsafe beside Qt's threads.
+            setsid = shutil.which("setsid", path=environment.get("PATH"))
             self.process = subprocess.Popen(
-                argv, stdin=slave, stdout=slave, stderr=slave,
-                start_new_session=True, env=environment, close_fds=True,
+                [setsid, "--ctty", *argv] if setsid else argv,
+                stdin=slave, stdout=slave, stderr=slave,
+                start_new_session=not setsid, env=environment, close_fds=True,
             )
         except BaseException:
             os.close(self.master)
@@ -604,6 +738,7 @@ class PtyProcess(QObject):
         self._reaper = QTimer(self)
         self._reaper.setInterval(25)
         self._reaper.timeout.connect(self._check_finished)
+        self._closing = False
 
     def _set_window_size(self, descriptor, rows, columns):
         winsize = struct.pack("HHHH", rows, columns, 0, 0)
@@ -619,11 +754,7 @@ class PtyProcess(QObject):
         except OSError:
             data = b""
         if not data:
-            self._notifier.setEnabled(False)
-            self._write_notifier.setEnabled(False)
-            self._pending_input.clear()
-            descriptor, self.master = self.master, None
-            os.close(descriptor)
+            self._close_master()
             remaining = self._decoder.decode(b"", final=True)
             if remaining:
                 self.output.emit(remaining)
@@ -631,6 +762,14 @@ class PtyProcess(QObject):
             self._check_finished()
             return
         self.output.emit(self._decoder.decode(data))
+
+    def _close_master(self):
+        self._notifier.setEnabled(False)
+        self._write_notifier.setEnabled(False)
+        self._pending_input.clear()
+        descriptor, self.master = self.master, None
+        if descriptor is not None:
+            os.close(descriptor)
 
     def _check_finished(self):
         code = self.process.poll()
@@ -671,11 +810,41 @@ class PtyProcess(QObject):
     def terminate(self):
         # start_new_session creates a private group. Stop its children too:
         # Ubuntu's /bin/sh can leave cat holding the PTY after the shell exits.
-        if not self._finished:
-            try:
-                os.killpg(self.process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+        if self._finished or self._closing:
+            return
+        self._closing = True
+        grace = TERMINATE_GRACE_MS
+        try:
+            os.killpg(self.process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            # The child may not have reached setsid yet.
+            self._signal_child(signal.SIGTERM)
+        except PermissionError:
+            # A root-owned sudo group cannot be signaled; hang up instead.
+            grace = 0
+        QTimer.singleShot(grace, self._hang_up)
+
+    def _signal_child(self, number):
+        try:
+            self.process.send_signal(number)
+        except (PermissionError, ProcessLookupError):
+            pass
+
+    def _hang_up(self):
+        if self._finished:
+            return
+        # Closing the master delivers SIGHUP to the session, including root sudo.
+        self._close_master()
+        self._signal_child(signal.SIGKILL)
+        self._reaper.start()
+        QTimer.singleShot(HANGUP_GRACE_MS, self._abandon)
+
+    def _abandon(self):
+        if self._finished:
+            return
+        self._finished = True
+        self._reaper.stop()
+        self.finished.emit(self.process.poll() if self.process.poll() is not None else -1)
 
     @property
     def running(self):
@@ -696,7 +865,7 @@ class TerminalPane(QWidget):
         self._selection_end = None
         self._selecting = False
         self._search_cursor = None
-        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setCursor(Qt.CursorShape.IBeamCursor)
         self.setToolTip("Select text to copy with Ctrl+Shift+C. Paste with Ctrl+Shift+V. "
                         "Scroll with the mouse wheel or Shift+PageUp / PageDown.")
@@ -721,6 +890,10 @@ class TerminalPane(QWidget):
         previous_count = self.screen.history_count
         previous_alt = self.screen._alt_active
         self.screen.feed(text)
+        if self.screen.responses:
+            replies, self.screen.responses = self.screen.responses, []
+            if self.process is not None and self.process.running:
+                self.process.write("".join(replies))
         if self.screen._alt_active or previous_alt != self.screen._alt_active:
             self.scroll_offset = 0
         elif self.scroll_offset:
@@ -835,6 +1008,10 @@ class TerminalPane(QWidget):
                              self.screen.row * self.cell_height,
                              self.cell_width, self.cell_height, foreground)
 
+    def focusNextPrevChild(self, next_child):
+        # Tab and Shift+Tab belong to the session, not to widget navigation.
+        return False
+
     def keyPressEvent(self, event):
         modifiers = event.modifiers()
         shift = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
@@ -863,8 +1040,8 @@ class TerminalPane(QWidget):
             return
         payload = key_to_bytes(
             event.key(), event.text(),
-            bool(modifiers & Qt.KeyboardModifier.ControlModifier),
-            bool(modifiers & Qt.KeyboardModifier.AltModifier),
+            ctrl, bool(modifiers & Qt.KeyboardModifier.AltModifier), shift,
+            self.screen.application_cursor,
         )
         if payload:
             self.scroll_offset = 0
@@ -881,7 +1058,13 @@ class TerminalPane(QWidget):
     def wheelEvent(self, event):
         delta = event.angleDelta().y()
         lines = int(delta / 120 * 3) if delta else int(event.pixelDelta().y() / self.cell_height)
-        self.scroll(lines)
+        if self.screen._alt_active:
+            # Full-screen programs have no scrollback; let them scroll themselves.
+            if lines and self.process is not None and self.process.running:
+                key = QT_KEY_UP if lines > 0 else QT_KEY_DOWN
+                self.process.write(key_to_bytes(key, "", application_cursor=self.screen.application_cursor) * abs(lines))
+        else:
+            self.scroll(lines)
         event.accept()
 
     def clear_selection(self):
@@ -968,10 +1151,12 @@ class TerminalPane(QWidget):
             col_map = []
             for col, (cell_text, _) in enumerate(line):
                 if cell_text:
-                    for ch in cell_text:
+                    # Lowering can change length (for example U+0130), so map
+                    # each lowered character back to its own column.
+                    for ch in cell_text.lower():
                         row_chars.append(ch)
                         col_map.append((col, col + max(1, cell_width(cell_text))))
-            haystack = "".join(row_chars).lower()
+            haystack = "".join(row_chars)
             pos = 0
             while True:
                 idx = haystack.find(needle, pos)
@@ -1022,8 +1207,10 @@ class TerminalWindow(QDialog):
         self.search_input.setPlaceholderText("Find in scrollback and screen…")
         self.search_input.returnPressed.connect(lambda: self.find_match(True))
         self.find_prev_button = QPushButton("Previous")
+        self.find_prev_button.setAutoDefault(False)
         self.find_prev_button.clicked.connect(lambda: self.find_match(False))
         self.find_next_button = QPushButton("Next")
+        self.find_next_button.setAutoDefault(False)
         self.find_next_button.clicked.connect(lambda: self.find_match(True))
         search_layout.addWidget(self.search_input, 1)
         search_layout.addWidget(self.find_prev_button)
@@ -1039,19 +1226,24 @@ class TerminalWindow(QDialog):
         buttons = QHBoxLayout()
         if external is not None:
             external_button = QPushButton("Open in external terminal")
+            external_button.setAutoDefault(False)
             external_button.clicked.connect(self._open_external)
             buttons.addWidget(external_button)
         self.find_button = QPushButton("Find…")
+        self.find_button.setAutoDefault(False)
         self.find_button.clicked.connect(self.toggle_search)
         buttons.addWidget(self.find_button)
         self.clear_scrollback_button = QPushButton("Clear scrollback")
+        self.clear_scrollback_button.setAutoDefault(False)
         self.clear_scrollback_button.clicked.connect(self.pane.clear_scrollback)
         buttons.addWidget(self.clear_scrollback_button)
         buttons.addStretch(1)
         close_button = QPushButton("Close session")
+        close_button.setAutoDefault(False)
         close_button.clicked.connect(self.close)
         buttons.addWidget(close_button)
         layout.addLayout(buttons)
+        self.pane.setFocus()
 
     def toggle_search(self):
         visible = not self.search_bar.isVisible()

@@ -199,11 +199,16 @@ The desktop window runs as your user. **Unlock workspace store** opens a polkit
 administrator prompt and starts a separate, headless helper connected only to the
 window through standard input/output. It accepts a fixed set of validated
 operations and does not listen on a socket. Access lasts until you lock the store
-or close the app. Terminal sessions authenticate separately with `sudo`.
+or close the app. Terminal sessions authenticate separately with `sudo`, or with
+`pkexec` on hosts without it.
 
 Write operations are serialized by the desktop helper. Image locks also prevent
 conflicts with other terminals and managers. Closing the desktop is blocked while
-an operation is active, so an image copy or filesystem repair can finish. If the
+an operation is active, so an image copy or filesystem repair can finish. **Cancel**
+stops work that can be abandoned, such as a bootstrap, copy, export or import, and
+removes its staged files. Steps that change live data cannot be cancelled and always
+run to completion: publication, expansion, repair, deletion and package installation.
+If the
 window disappears unexpectedly, the helper finishes the running operation before
 exiting. Successful operations and failures are recorded in the store's journal.
 Durable operation records retain the current stage and identify incomplete
@@ -225,6 +230,25 @@ sudo chrootable-manager --recover-operation OPERATION_ID --yes
 Recovery validates the recorded file identities and refuses active operations or
 unsafe paths. Incomplete work before publication remains available for inspection;
 recovery does not automatically delete partial files or resume a bootstrap.
+
+To abandon interrupted work instead, which also removes its staged files or sets
+aside a damaged record:
+
+```bash
+sudo chrootable-manager --discard-operation OPERATION_ID --yes
+```
+
+A publication that has already replaced workspace metadata must be recovered. The
+desktop's Recovery view offers both actions. Finished operation records and logs are
+trimmed automatically to the newest 200 (`CHROOTABLE_OPERATION_KEEP`).
+
+`--import NAME ARCHIVE.tar.gz [SIZE_MIB] [persistent|ephemeral] [PROFILE]` turns an
+export back into a workspace. The archive is checked before anything is written:
+path traversal, block devices and non-standard character devices are refused, and it
+must contain a root filesystem. Leave `SIZE_MIB` empty (`""`) to fit capacity to the
+contents with room to work. Import preserves file capabilities and reads the release
+and architecture from the archive; profile and lifecycle are not stored in exports.
+Only import archives you trust: their contents run as root in later sessions.
 
 Exports remain in the protected store and are copied to your chosen destination by
 a child process running as your normal user. The privileged helper opens the
@@ -274,9 +298,9 @@ adds a private network namespace with only loopback. `/sys` is not mounted.
 **This is a tool for trusted development, not a security sandbox for hostile code:**
 it runs as host root and exposes host devices through `/dev`. The opt-in
 `--restricted-dev` session option replaces `/dev` with a minimal tmpfs holding
-only `null`, `zero`, `full`, `random`, `urandom`, `tty`, and a fresh `devpts`
-instance; no host device nodes are exposed, at the cost of tools that expect
-more devices.
+only `null`, `zero`, `full`, `random`, `urandom`, `tty`, a fresh `devpts` instance
+and a private `/dev/shm`; no host device nodes are exposed, at the cost of tools
+that expect more devices. `/proc` and `/run` are mounted as in any other session.
 
 Debian bootstrap uses HTTPS and explicitly requires Release signature verification
 against the installed Debian archive keyring. Chrootables does not depend on cpak's

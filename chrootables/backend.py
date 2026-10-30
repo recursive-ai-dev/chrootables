@@ -9,6 +9,7 @@ from pathlib import Path
 import pwd
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import threading
@@ -24,8 +25,19 @@ EXPORT_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}\.tar\.gz\Z")
 MUTATIONS = {
     "create", "import", "clone", "snapshot", "restore", "drop-snapshot",
     "resize", "mode", "repair", "delete", "export", "setup",
-    "recover-operation", "prune-logs", "delete-export", "archive-sync",
+    "recover-operation", "discard-operation", "prune-logs", "delete-export", "archive-sync",
 }
+# Cancelling is allowed only where stopping abandons staged work. Publication,
+# expansion, repair and package installation change live data and must finish.
+CANCELLABLE_ACTIONS = {"create", "import", "clone", "snapshot", "restore", "resize", "export", "archive-sync"}
+CANCELLABLE_STAGES = {
+    "starting", "allocating", "formatting", "bootstrapping", "importing", "exporting",
+    "copying", "copying-snapshot", "copying-restore", "checking-filesystem", "downloading-archive",
+}
+
+
+class OperationCancelled(RuntimeError):
+    """The user cancelled an operation and it stopped before publishing anything."""
 
 
 def load_capabilities():
@@ -128,10 +140,10 @@ def build_command(action, params):
         return args + ["--setup"], {"CHROOTABLE_AUTO_INSTALL": "1"}
     if action not in MUTATIONS:
         raise ValueError("Unsupported operation.")
-    if action == "recover-operation":
+    if action in ("recover-operation", "discard-operation"):
         if params.get("confirmed") is not True:
             raise ValueError("This operation requires confirmation.")
-        return args + ["--recover-operation", operation_id(params.get("id")), "--yes"], env
+        return args + ["--" + action, operation_id(params.get("id")), "--yes"], env
     if action == "prune-logs":
         if params.get("confirmed") is not True:
             raise ValueError("This operation requires confirmation.")
@@ -165,7 +177,9 @@ def build_command(action, params):
         suite = params.get("suite", "trixie")
         if mode not in ("persistent", "ephemeral") or profile not in PROFILES or suite not in SUITES:
             raise ValueError("Unsupported lifecycle, profile or Debian release.")
-        args += [archive_file(params.get("archive")), size(params.get("size_mib", 2048)), mode, profile]
+        # An empty capacity asks the manager to fit the image to the archive.
+        requested = params.get("size_mib")
+        args += [archive_file(params.get("archive")), "" if requested is None else size(requested), mode, profile]
         env["CHROOTABLE_DEBIAN_SUITE"] = suite
     elif action in ("clone", "snapshot", "restore", "drop-snapshot"):
         args.append(name(params.get("target")))
@@ -245,6 +259,8 @@ try:
                     break
         except (AttributeError, OSError):
             shutil.copyfileobj(archive, output, 1024 * 1024)
+        output.flush()
+        os.fsync(output.fileno())
 except BaseException:
     if created:
         os.unlink(destination)
@@ -301,6 +317,8 @@ class Store:
         self._active_lock = threading.Lock()
         self._active_process = None
         self._active_stage = ""
+        self._active_action = ""
+        self._cancel_requested = False
 
     def environment(self, extra=None):
         result = {
@@ -382,7 +400,7 @@ class Store:
             # Avoid one CLI subprocess per image solely to repeat that probe.
             result = subprocess.run([str(MANAGER), "--list", "--json"],
                                     env=self.environment({"CHROOTABLE_LIST_PROBE_LOCKS": "0"}),
-                                    capture_output=True, text=True, timeout=20)
+                                    capture_output=True, encoding="utf-8", errors="replace", timeout=20)
             if result.returncode:
                 raise PermissionError(result.stderr.strip() or "Cannot read the workspace store.")
             images = json.loads(result.stdout)
@@ -466,6 +484,7 @@ class Store:
                 if not active:
                     status = "interrupted"
             recoverable = (not active and status not in ("completed", "recovered") and stage.startswith("publish-"))
+            discardable = not active and status == "interrupted"
             records.append({
                 "id": op_id,
                 "action": action,
@@ -475,11 +494,23 @@ class Store:
                 "log": str(self.path / "logs" / (op_id + ".log")),
                 "active": active,
                 "recoverable": recoverable,
+                "discardable": discardable,
+                "reclaimable_bytes": self._staged_bytes(state.get("pending", "")) if discardable else 0,
             })
         self._operations_sig = sig
         self._operations_cache = records
         self._operations_has_running = has_running
         return records
+
+    def _staged_bytes(self, relative):
+        """Allocated size of a staged file named by a record; zero when it cannot be read."""
+        if not relative or relative.startswith("/") or ".." in relative.split("/"):
+            return 0
+        try:
+            info = (self.path / relative).lstat()
+        except OSError:
+            return 0
+        return info.st_blocks * 512 if stat.S_ISREG(info.st_mode) else 0
 
     def _scan_archives(self):
         arch_dir = self.path / "archive"
@@ -599,14 +630,19 @@ class Store:
                 for line in read_regular(self.path / "activity.tsv").splitlines()
             ):
                 raise ValueError("Log does not belong to the selected workspace operation.")
-            return "Log: " + target_path + "\n\n" + read_regular(path)
-        result = subprocess.run([str(MANAGER), "--logs", name(target)], env=self.environment(), capture_output=True, text=True, timeout=15)
+            try:
+                return "Log: " + target_path + "\n\n" + read_regular(path)
+            except FileNotFoundError as error:
+                raise RuntimeError("This operation log has been pruned.") from error
+        result = subprocess.run([str(MANAGER), "--logs", name(target)], env=self.environment(), capture_output=True,
+                                encoding="utf-8", errors="replace", timeout=15)
         if result.returncode:
             raise RuntimeError(result.stderr.strip())
         return result.stdout
 
     def doctor(self):
-        result = subprocess.run([str(MANAGER), "--doctor", "--json"], env=self.environment(), capture_output=True, text=True, timeout=15)
+        result = subprocess.run([str(MANAGER), "--doctor", "--json"], env=self.environment(), capture_output=True,
+                                encoding="utf-8", errors="replace", timeout=15)
         try:
             report = json.loads(result.stdout)
         except (ValueError, TypeError) as error:
@@ -650,21 +686,35 @@ class Store:
             stage = self._active_stage
             if process is None or process.poll() is not None:
                 raise RuntimeError("No running operation to cancel.")
-            if stage.startswith("publish-"):
-                raise RuntimeError("Cannot cancel while atomic image publication is in progress.")
-            process.terminate()
+            if self._active_action not in CANCELLABLE_ACTIONS or stage not in CANCELLABLE_STAGES:
+                raise RuntimeError("This step changes live data and cannot be stopped safely. It will finish on its own.")
+            self._cancel_requested = True
+            # The manager's work happens in a subshell and its children, so only
+            # signaling the whole group stops it. Publication ignores the signal.
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError as error:
+                raise RuntimeError("No running operation to cancel.") from error
             return {"cancelled": True, "stage": stage}
 
     def operate(self, action, params, output, progress=None):
+        if action == "import" and params.get("export") is not None:
+            # A retained export is named, not given by path: the caller may be
+            # unable to see inside the root-only store. Resolved here, as root.
+            params = {**params, "archive": str(self.path / "exports" / export_name(params["export"]))}
         args, extra = build_command(action, params)
         operation_id = uuid.uuid4().hex
         env = self.environment({**extra, "CHROOTABLE_OPERATION_ID": operation_id})
         operation_log = self.path / "logs" / (operation_id + ".log")
         # A reader thread drains the child while the main thread tails its operation log.
-        process = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+        # A private process group lets cancellation reach every child at once.
+        process = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   encoding="utf-8", errors="replace", start_new_session=True)
         with self._active_lock:
             self._active_process = process
             self._active_stage = "starting"
+            self._active_action = action
+            self._cancel_requested = False
         archives = []
         def drain():
             for line in process.stdout:
@@ -719,9 +769,16 @@ class Store:
             with self._active_lock:
                 self._active_process = None
                 self._active_stage = ""
+                self._active_action = ""
+                cancelled = self._cancel_requested
+                self._cancel_requested = False
         self._storage_signature = None
         self._operations_sig = None
         self._archives_sig = None
+        # A cancel that arrived during publication loses the race: exit 0 means the
+        # work really finished, so it is reported as finished.
+        if cancelled and process.returncode != 0:
+            raise OperationCancelled(f"{action.replace('-', ' ').capitalize()} was cancelled. Staged files were removed.")
         if process.returncode == 0 and action == "export" and params.get("destination"):
             if len(archives) != 1:
                 raise RuntimeError("Could not identify the completed export archive.")
@@ -759,7 +816,13 @@ def session_command(target, store=DEFAULT_STORE, *, disposable=False, isolated=F
     if read_only and share is None:
         raise ValueError("Choose a shared folder before enabling read-only access.")
     action = "--try" if disposable else "--enter-isolated" if isolated else "--enter"
-    command = ["sudo", "/usr/bin/env", "CHROOTABLE_AUTO_INSTALL=0", "CHROOTABLE_HOME=" + str(store), str(MANAGER), action, target]
+    if not shutil.which("sudo") and shutil.which("pkexec"):
+        # pkexec clears the environment, which sudo's env_reset would have kept.
+        command = ["pkexec", "/usr/bin/env", "TERM=" + os.environ.get("TERM", "xterm-256color"),
+                   "LANG=" + os.environ.get("LANG", "C.UTF-8")]
+    else:
+        command = ["sudo", "/usr/bin/env"]
+    command += ["CHROOTABLE_AUTO_INSTALL=0", "CHROOTABLE_HOME=" + str(store), str(MANAGER), action, target]
     if disposable and isolated:
         command.append("--isolated")
     if restricted_dev:

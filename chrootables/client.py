@@ -1,4 +1,5 @@
 """Asynchronous Qt client for the local stdio helper."""
+from collections import deque
 import json
 import sys
 from PySide6.QtCore import QObject, QProcess, Signal
@@ -98,13 +99,17 @@ class Client(QObject):
         self.callbacks = {}
         self.counter = 0
         self.buffer = b""
+        self._lines = deque()
         self.writable = False
         self.is_ready = False
+        self.requested_writable = False
         self._failed = False
 
     def start(self, writable=False):
         self.stop()
         self.buffer = b""
+        self._lines.clear()
+        self.requested_writable = writable
         self._failed = False
         process = QProcess(self)
         self.process = process
@@ -123,6 +128,7 @@ class Client(QObject):
             return
         self._failed = True
         self.buffer = b""
+        self._lines.clear()
         self.is_ready = self.writable = False
         process = self.process
         callbacks, self.callbacks = self.callbacks, {}
@@ -134,7 +140,12 @@ class Client(QObject):
     def read(self, process):
         if process is not self.process or self._failed:
             return
-        self.buffer += bytes(process.readAllStandardOutput())
+        # Split once per chunk rather than once per line. Pending lines live on the
+        # client because a callback may open a dialog whose event loop re-enters
+        # read(); that nested call must continue them in order.
+        lines = (self.buffer + bytes(process.readAllStandardOutput())).split(b"\n")
+        self.buffer = lines.pop()
+        self._lines.extend(lines)
         pending_id = None
         pending_chunks = []
 
@@ -147,8 +158,8 @@ class Client(QObject):
                 if process is self.process and not self._failed:
                     self.output.emit(identifier, value)
 
-        while process is self.process and not self._failed and b"\n" in self.buffer:
-            line, self.buffer = self.buffer.split(b"\n", 1)
+        while process is self.process and not self._failed and self._lines:
+            line = self._lines.popleft()
             try:
                 message = json.loads(line)
             except (ValueError, UnicodeDecodeError):

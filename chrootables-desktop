@@ -10,4 +10,8 @@ try:
 except ImportError as error:
     print(f"Could not start Chrootables: {error}\nUbuntu/Debian: sudo apt install python3-pyside6.qtwidgets\nThen launch with /usr/bin/python3 ./chrootables-desktop\nFedora: sudo dnf install python3-pyside6\nOr use a virtual environment: python -m pip install -r requirements.txt", file=sys.stderr)
     raise SystemExit(1)
+except RuntimeError as error:
+    # Capabilities are read from the installed manager while the app is imported.
+    print(f"Could not start Chrootables: {error}\nRun chrootable-manager --doctor to check this installation.", file=sys.stderr)
+    raise SystemExit(1)
 raise SystemExit(main())

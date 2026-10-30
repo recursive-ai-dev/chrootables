@@ -58,11 +58,10 @@ items, so each needs a decision, not just code:
 - Storage retention policies and export cleanup previews after validating a
   predictable recovery/retention contract; existing checkpoint deletion remains
   explicit and scoped to the selected snapshot.
-- Operation-specific safe cancellation and resumable bootstraps. Interrupted
-  publication can be recovered now; earlier-stage partials are retained for
-  inspection rather than automatically resumed or deleted.
-- Workspace import/portable backup bundles, with format validation and
-  round-trip recovery tests before exposing imports in the desktop.
+- Resumable bootstraps. Interrupted publication can be recovered, and other
+  interrupted work can be discarded, but neither resumes a partial bootstrap.
+- Portable backup bundles that carry workspace metadata. Imports validate the
+  archive and detect its release, but profile and lifecycle are not in the archive.
 
 ## Phase 4 — Security model (long term)
 

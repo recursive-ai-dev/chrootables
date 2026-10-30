@@ -2,6 +2,8 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -11,7 +13,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock, patch
 
-from chrootables.backend import Store, build_command, name, read_regular, shared_folder, session_command, terminal_command, deliver_export, MANAGER, PROFILES
+from chrootables.backend import OperationCancelled, Store, build_command, name, read_regular, shared_folder, session_command, terminal_command, deliver_export, MANAGER, PROFILES
 from chrootables.broker import serve
 
 
@@ -541,45 +543,193 @@ valid_mirror "https://deb.debian.org/debian" || exit 13
         cache_dir = self.path / "archive/trixie-amd64"
         cache_dir.mkdir(parents=True)
         (cache_dir / "base.tgz").write_bytes(b"cached-root")
+        (cache_dir / "mirror").write_text("https://deb.debian.org/debian\n")
         op_id = "e" * 32
         ops_dir = self.path / "operations"
         ops_dir.mkdir(exist_ok=True)
+        partial = self.path / "images/.copy.ABC123.partial"
+        partial.parent.mkdir(exist_ok=True)
+        partial.write_bytes(b"x" * 8192)
         (ops_dir / f"{op_id}.state").write_text(
-            f"id={op_id}\naction=clone\nname=lab\ntarget=copy\nstatus=running\nstage=publish-image\npid=999999\nupdated_at=2026-10-16T10:00:00\n"
-        )
-        cmd = build_command("import", {
-            "name": "imported", "archive": str(archive),
-            "size_mib": 512, "lifecycle": "persistent", "profile": "minimal",
-        }, manager="/usr/bin/chrootable-manager")
-        self.assertEqual(cmd, ["/usr/bin/chrootable-manager", "--import", "imported", str(archive.resolve()), "512", "persistent", "minimal"])
-        self.assertEqual(build_command("recover-operation", {"operation_id": op_id}, manager="/usr/bin/chrootable-manager"),
-                         ["/usr/bin/chrootable-manager", "--recover-operation", op_id])
-        self.assertEqual(build_command("prune-logs", {"keep": 25}, manager="/usr/bin/chrootable-manager"),
-                         ["/usr/bin/chrootable-manager", "--prune-logs", "25", "--yes"])
-        self.assertEqual(build_command("delete-export", {"filename": archive.name}, manager="/usr/bin/chrootable-manager"),
-                         ["/usr/bin/chrootable-manager", "--delete-export", archive.name, "--yes"])
-        self.assertEqual(build_command("archive-sync", {"suite": "trixie"}, manager="/usr/bin/chrootable-manager"),
-                         ["/usr/bin/chrootable-manager", "--archive-sync", "trixie"])
-        report = self.store.inventory()
+            f"format=1\nid={op_id}\npid=2147483647\nprocess_start=1\nstatus=running\nstage=publish-metadata\n"
+            "action=clone\nname=lab\npending=images/.copy.ABC123.partial\ndestination=images/copy.img\n")
+        manager = str(MANAGER)
+        command, _ = build_command("import", {"name": "imported", "archive": str(archive), "size_mib": 512,
+                                              "lifecycle": "persistent", "profile": "minimal"})
+        self.assertEqual(command, [manager, "--import", "imported", str(archive.resolve()), "512", "persistent", "minimal"])
+        command, _ = build_command("import", {"name": "imported", "archive": str(archive)})
+        self.assertEqual(command, [manager, "--import", "imported", str(archive.resolve()), "", "persistent", "minimal"])
+        for action, argument in (("recover-operation", op_id), ("discard-operation", op_id)):
+            self.assertEqual(build_command(action, {"id": op_id, "confirmed": True})[0],
+                             [manager, "--" + action, argument, "--yes"])
+            with self.assertRaisesRegex(ValueError, "confirmation"):
+                build_command(action, {"id": op_id})
+        self.assertEqual(build_command("prune-logs", {"keep": 25, "confirmed": True})[0],
+                         [manager, "--prune-logs", "25", "--yes"])
+        self.assertEqual(build_command("delete-export", {"filename": archive.name, "confirmed": True})[0],
+                         [manager, "--delete-export", archive.name, "--yes"])
+        self.assertEqual(build_command("archive-sync", {"suite": "trixie"})[0], [manager, "--archive-sync", "trixie"])
+        store = Store(self.path)
+        report = store.inventory()
         self.assertEqual(len(report["operations"]), 1)
-        self.assertTrue(report["operations"][0]["recoverable"])
+        operation = report["operations"][0]
+        self.assertTrue(operation["recoverable"])
+        self.assertTrue(operation["discardable"])
+        self.assertGreaterEqual(operation["reclaimable_bytes"], 4096)
         self.assertEqual(report["exports"][0]["filename"], archive.name)
         self.assertEqual(report["archives"][0]["suite"], "trixie")
-        with self.assertRaisesRegex(RuntimeError, "No operation"):
-            self.store.cancel_operation()
-        proc = Mock()
-        proc.poll.return_value = None
-        self.store._active_process = proc
-        self.store._active_stage = "publish-image"
-        with self.assertRaisesRegex(RuntimeError, "atomic publication"):
-            self.store.cancel_operation()
-        self.store._active_stage = "Copying image"
-        self.assertTrue(self.store.cancel_operation()["cancelled"])
-        proc.terminate.assert_called_once()
-        self.store._active_process = None
         with patch("chrootables.backend.shutil.which", side_effect=lambda name: "/usr/bin/alacritty" if name == "alacritty" else None):
-            self.assertEqual(terminal_command(["/usr/bin/chrootable-manager", "--shell", "lab"]),
-                             ["/usr/bin/alacritty", "-e", "/usr/bin/chrootable-manager", "--shell", "lab"])
+            command = terminal_command("lab", self.path)
+            self.assertEqual(command[:4], ["alacritty", "--hold", "--title", "Chrootables · lab"])
+
+    def test_cancellation_is_limited_to_actions_and_stages_that_can_stop_safely(self):
+        store = Store(self.path)
+        with self.assertRaisesRegex(RuntimeError, "No running operation"):
+            store.cancel_operation()
+        process = Mock()
+        process.poll.return_value = None
+        process.pid = 2147483647
+        store._active_process = process
+        for action, stage in (("clone", "publish-metadata"), ("clone", "publish-prepared"), ("resize", "expanding"),
+                              ("repair", "repairing-filesystem"), ("delete", "deleting"), ("setup", "starting"),
+                              ("restore", "published")):
+            with self.subTest(action=action, stage=stage), patch("chrootables.backend.os.killpg") as killpg:
+                store._active_action, store._active_stage = action, stage
+                with self.assertRaisesRegex(RuntimeError, "cannot be stopped"):
+                    store.cancel_operation()
+                killpg.assert_not_called()
+        with patch("chrootables.backend.os.killpg") as killpg:
+            store._active_action, store._active_stage = "clone", "copying"
+            self.assertTrue(store.cancel_operation()["cancelled"])
+            killpg.assert_called_once_with(process.pid, signal.SIGTERM)
+        with patch("chrootables.backend.os.killpg", side_effect=ProcessLookupError):
+            with self.assertRaisesRegex(RuntimeError, "No running"):
+                store.cancel_operation()
+
+    def manager_wrapper(self, overrides):
+        """A real manager process tree whose privileged commands are replaced."""
+        wrapper = self.path / "wrapper"
+        wrapper.write_text(f"""#!/usr/bin/env bash
+source {shlex.quote(str(MANAGER))}
+require_root() {{ :; }}
+check_prerequisites() {{ :; }}
+{overrides}
+main "$@"
+""")
+        wrapper.chmod(0o755)
+        for directory in ("images", "logs", "exports", "snapshots", "operations"):
+            (self.path / directory).mkdir(exist_ok=True)
+        (self.path / "images/lab.img").write_bytes(b"image")
+        return wrapper
+
+    def run_clone_and_cancel(self, overrides, *, wait_for_stage):
+        wrapper = self.manager_wrapper(overrides)
+        store = Store(self.path)
+        outcome = {}
+        started = threading.Event()
+
+        def progress(stage):
+            if stage == wait_for_stage:
+                started.set()
+
+        def run():
+            try:
+                outcome["code"] = store.operate("clone", {"name": "lab", "target": "copy"}, lambda _: None, progress=progress)
+            except OperationCancelled as error:
+                outcome["cancelled"] = str(error)
+
+        with patch("chrootables.backend.MANAGER", wrapper):
+            worker = threading.Thread(target=run)
+            begin = time.monotonic()
+            worker.start()
+            self.assertTrue(started.wait(10), "operation never reached " + wait_for_stage)
+            cancel = store.cancel_operation()
+            worker.join(15)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(cancel["cancelled"])
+        return outcome, time.monotonic() - begin
+
+    def test_cancel_stops_the_real_process_tree_and_removes_staged_files(self):
+        outcome, elapsed = self.run_clone_and_cancel(
+            'cp() { command sleep 60; }', wait_for_stage="copying")
+        self.assertIn("cancelled", outcome, outcome)
+        self.assertLess(elapsed, 10)
+        self.assertFalse((self.path / "images/copy.img").exists())
+        self.assertEqual(list((self.path / "images").glob(".copy.*")), [])
+        operations = [line for path in (self.path / "operations").glob("*.state") for line in path.read_text().splitlines()]
+        self.assertIn("status=failed", operations)
+        # The child inherits the store path in its environment; none may survive.
+        marker = ("CHROOTABLE_HOME=" + str(self.path)).encode()
+        for entry in Path("/proc").iterdir():
+            if entry.name.isdigit():
+                try:
+                    if (entry / "cmdline").read_bytes().startswith(b"sleep\0"):
+                        self.assertNotIn(marker, (entry / "environ").read_bytes(), entry.name)
+                except OSError:
+                    continue
+
+    def test_cancel_loses_the_race_against_publication_and_reports_success(self):
+        # The desktop saw "copying", but the manager is already past the point of no
+        # return: the signal is ignored and the work really finishes.
+        outcome, _ = self.run_clone_and_cancel(
+            "cp() { protect_from_signals; command sleep 1; }", wait_for_stage="copying")
+        self.assertEqual(outcome.get("code"), 0, outcome)
+        self.assertTrue((self.path / "images/copy.img").exists())
+        self.assertEqual(list((self.path / "images").glob(".copy.*")), [])
+
+    def test_inventory_survives_non_utf8_metadata(self):
+        images = self.path / "images"
+        images.mkdir(exist_ok=True)
+        (images / "latin.img").write_bytes(b"image")
+        (images / "latin.img.meta").write_bytes(b"lifecycle=persistent\norigin=import:caf\xe9.tar.gz\n")
+        report = Store(self.path).inventory()
+        self.assertEqual(report["images"][0]["name"], "latin")
+        self.assertIn("�", report["images"][0]["origin"])
+
+    def test_retained_export_is_resolved_by_name_in_the_broker(self):
+        store = Store(self.path)
+        exports = self.path / "exports"
+        exports.mkdir(exist_ok=True)
+        (exports / "lab-1.tar.gz").write_bytes(b"x")
+        captured = {}
+
+        def fake_popen(args, **_):
+            captured["args"] = args
+            raise OSError("stop here")
+
+        with patch("chrootables.backend.subprocess.Popen", fake_popen), self.assertRaises(OSError):
+            store.operate("import", {"name": "restored", "export": "lab-1.tar.gz"}, lambda _: None)
+        self.assertEqual(captured["args"][2:5], ["restored", str((exports / "lab-1.tar.gz").resolve()), ""])
+        for unsafe in ("../secret.tar.gz", "/etc/x.tar.gz", "a/b.tar.gz", "not-an-archive"):
+            with self.subTest(unsafe=unsafe), self.assertRaises(ValueError):
+                store.operate("import", {"name": "restored", "export": unsafe}, lambda _: None)
+
+    def test_pruned_log_has_a_clear_message(self):
+        logs = self.path / "logs"
+        logs.mkdir(exist_ok=True)
+        path = logs / ("a" * 32 + ".log")
+        (self.path / "activity.tsv").write_text(f"2026-10-30\tclone\tlab\tok\t{path}\n")
+        with self.assertRaisesRegex(RuntimeError, "pruned"):
+            Store(self.path).logs("lab", str(path))
+
+    def test_sessions_fall_back_to_pkexec_only_without_sudo(self):
+        with patch("chrootables.backend.shutil.which", side_effect=lambda tool: "/usr/bin/" + tool):
+            self.assertEqual(session_command("lab", self.path)[0], "sudo")
+        with patch("chrootables.backend.shutil.which", side_effect=lambda tool: None):
+            self.assertEqual(session_command("lab", self.path)[0], "sudo")
+        with patch("chrootables.backend.shutil.which", side_effect=lambda tool: "/usr/bin/pkexec" if tool == "pkexec" else None), \
+                patch.dict(os.environ, {"TERM": "xterm-kitty", "LANG": "fr_FR.UTF-8"}):
+            command = session_command("lab", self.path)
+            self.assertEqual(command[:4], ["pkexec", "/usr/bin/env", "TERM=xterm-kitty", "LANG=fr_FR.UTF-8"])
+            self.assertIn("--enter", command)
+
+    def test_broker_reports_cancellation_with_its_own_code(self):
+        store = Mock()
+        store.operate.side_effect = OperationCancelled("Clone was cancelled.")
+        output = io.StringIO()
+        serve(store, io.StringIO(json.dumps({"id": 1, "action": "clone", "params": {}}) + "\n"), output, writable=True)
+        result = [json.loads(line) for line in output.getvalue().splitlines()][-1]
+        self.assertEqual((result["ok"], result["code"]), (False, "cancelled"))
 
 
 if __name__ == "__main__":

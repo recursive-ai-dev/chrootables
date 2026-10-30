@@ -41,6 +41,17 @@ if [[ $profile == python ]]; then
 fi
 "$manager_path" --exec persistent-test -- /bin/sh -c 'printf original > /persistent-marker'
 "$manager_path" --exec persistent-test --restricted-dev -- /bin/sh -ec 'test -c /dev/null; test -c /dev/urandom; test -c /dev/ptmx; test ! -e /dev/loop-control; test ! -e /dev/sda'
+# /dev/fd and friends resolve through /proc, so a restricted session still needs it.
+"$manager_path" --exec persistent-test --restricted-dev -- /bin/sh -ec 'test -r /proc/self/status; test -d /run; test -d /dev/shm; ls /dev/fd/ >/dev/null'
+
+# A guest resolver link is followed inside the guest. An absolute target must not
+# create a host file, and it must survive the /run tmpfs so DNS configuration works.
+resolver_probe=/run/chrootable-integration-resolver
+# Isolated sessions do not bind the resolver, so its link can be edited there.
+"$manager_path" --exec persistent-test --isolated -- /bin/sh -ec "rm -f /etc/resolv.conf; ln -s $resolver_probe/resolv.conf /etc/resolv.conf"
+"$manager_path" --exec persistent-test -- /bin/sh -ec 'grep -q nameserver /etc/resolv.conf'
+test ! -e "$resolver_probe"
+"$manager_path" --exec persistent-test --isolated -- /bin/sh -ec 'rm -f /etc/resolv.conf; : >/etc/resolv.conf'
 mount -o loop,ro "$CHROOTABLE_HOME/images/persistent-test.img" "$inspect_mount"
 test "$(cat "$inspect_mount/persistent-marker")" = original
 umount "$inspect_mount"
@@ -132,6 +143,36 @@ PY
 archive=$("$manager_path" --export persistent-test)
 tar -tzf "$archive" >"$test_root/archive-files"
 grep -qx './persistent-marker' "$test_root/archive-files"
+
+# Export and import round trip, including file capabilities (not user.* xattrs).
+mount -o loop "$CHROOTABLE_HOME/images/persistent-test.img" "$inspect_mount"
+: >"$inspect_mount/capability-file"
+python3 -c 'import os, sys; os.setxattr(sys.argv[1], "security.capability", bytes.fromhex("0100000200200000000000000000000000000000"))' "$inspect_mount/capability-file"
+umount "$inspect_mount"
+archive=$("$manager_path" --export persistent-test)
+"$manager_path" --import imported-test "$archive"
+test "$("$manager_path" --exec imported-test -- cat /persistent-marker)" = original
+test "$("$manager_path" --exec imported-test -- cat /etc/hostname)" = imported-test
+"$manager_path" --inspect imported-test --json | python3 -c 'import json, sys; item = json.load(sys.stdin); assert item["origin"].startswith("import:"), item; assert item["suite"] == "trixie", item'
+mount -o loop,ro "$CHROOTABLE_HOME/images/imported-test.img" "$inspect_mount"
+python3 -c 'import os, sys; assert os.getxattr(sys.argv[1], "security.capability").hex().startswith("01000002"), "capability lost"' "$inspect_mount/capability-file"
+umount "$inspect_mount"
+"$manager_path" --delete imported-test --yes
+mkdir -p "$test_root/not-a-root/etc"
+printf x >"$test_root/not-a-root/etc/file"
+tar -C "$test_root/not-a-root" -czf "$test_root/not-a-root.tar.gz" .
+if "$manager_path" --import not-a-root "$test_root/not-a-root.tar.gz"; then
+    printf 'An archive without a root filesystem was imported.\n' >&2; exit 1
+fi
+test ! -e "$CHROOTABLE_HOME/images/not-a-root.img"
+
+# Interrupted work can be abandoned, which removes its staged file and unblocks.
+discard_id=$(printf 'd%.0s' {1..32})
+printf partial >"$CHROOTABLE_HOME/images/.discard-test.ABC123.partial"
+printf 'interrupted\n' >"$CHROOTABLE_HOME/logs/$discard_id.log"
+printf 'format=1\nid=%s\npid=2147483647\nprocess_start=1\nstatus=running\nstage=copying\naction=clone\nname=persistent-test\npending=images/.discard-test.ABC123.partial\ndestination=\n' "$discard_id" >"$CHROOTABLE_HOME/operations/$discard_id.state"
+"$manager_path" --discard-operation "$discard_id" --yes
+test ! -e "$CHROOTABLE_HOME/images/.discard-test.ABC123.partial"
 
 "$manager_path" --delete persistent-test --yes
 test ! -e "$CHROOTABLE_HOME/images/persistent-test.img"

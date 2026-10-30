@@ -1,5 +1,6 @@
 """Failure and reconnection coverage for the local helper protocol."""
 import json
+import time
 import os
 from pathlib import Path
 import unittest
@@ -138,3 +139,40 @@ class ClientTests(unittest.TestCase):
         self.assertFalse(callback.call_args.args[0])
         self.assertEqual(self.client.callbacks, {})
         self.assertFalse(self.client.is_ready)
+
+
+class ClientLineHandlingTests(unittest.TestCase):
+    def setUp(self):
+        self.client = Client("/tmp/store")
+        self.process = Mock()
+        self.client.process = self.process
+        self.client.is_ready = True
+
+    def test_nested_read_from_a_callback_keeps_line_order(self):
+        order = []
+        chunks = [b'{"event":"phase","id":1,"text":"first"}\n{"event":"phase","id":1,"text":"second"}\n{"event":"phase","id":1,"text":"thi',
+                  b'rd"}\n']
+
+        def phase(_identifier, text):
+            order.append(text)
+            if text == "first":
+                # A dialog's nested event loop delivers the next chunk here.
+                self.process.readAllStandardOutput.return_value = chunks[1]
+                self.client.read(self.process)
+
+        self.client.phase.connect(phase)
+        self.process.readAllStandardOutput.return_value = chunks[0]
+        self.client.read(self.process)
+        self.assertEqual(order, ["first", "second", "third"])
+        self.assertEqual(self.client.buffer, b"")
+
+    def test_partial_line_waits_for_its_remainder_on_large_bursts(self):
+        seen = []
+        self.client.output.connect(lambda _identifier, text: seen.append(text))
+        message = json.dumps({"event": "output", "id": 1, "text": "x"}).encode() + b"\n"
+        self.process.readAllStandardOutput.return_value = message * 200000 + message[:5]
+        started = time.monotonic()
+        self.client.read(self.process)
+        self.assertLess(time.monotonic() - started, 20)
+        self.assertEqual(self.client.buffer, message[:5])
+        self.assertEqual("".join(seen), "x" * 200000)

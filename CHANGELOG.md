@@ -6,18 +6,25 @@ are retained below as historical records.
 ## v1.2.0 — 2026-10-30
 
 - Add workspace archive import (`--import NAME ARCHIVE.tar.gz [SIZE_MIB] [persistent|ephemeral] [PROFILE]`)
-  in both the CLI and desktop workbench, validating tar archives against path
-  traversal, absolute paths and device/FIFO nodes before extracting into a fresh
-  sparse ext4 image.
-- Surface interrupted staged-publication operations in the desktop Recovery view
-  with a one-click **Recover publication** action (`--recover-operation ID --yes`).
-- Add safe operation cancellation (`Cancel` in the desktop task panel and broker
-  `cancel` action) that terminates in-flight bootstraps/copies while refusing to
-  interrupt atomic `publish-image` / `publish-metadata` commits.
+  in the CLI, TUI and desktop workbench. Archives are checked for path traversal,
+  absolute paths, block devices and non-standard character devices before
+  extraction. Capacity is checked against the contents up front, or fitted to the
+  archive when omitted. File capabilities survive the round trip, and the archive's
+  own release and architecture are recorded.
+- Surface all interrupted operations in the desktop Recovery view, with **Recover
+  publication** and **Discard**. New `--discard-operation ID --yes` removes staged
+  files of abandoned work and sets aside damaged records, so neither can block a
+  workspace permanently.
+- Add operation cancellation (`Cancel` in the desktop task panel) that signals the
+  whole process group, removes staged files and reports "cancelled". Cancelling is
+  refused while live data is changing: publication, expansion, repair, deletion and
+  package installation. Those steps also ignore Ctrl+C and SIGTERM on the command line.
 - Add store retention maintenance: `--prune-logs [KEEP_COUNT] --yes`,
   `--delete-export FILENAME --yes`, retained export re-import/deletion in the
-  desktop Recovery view, and automatic tail compaction of `activity.tsv` when
-  the journal exceeds `CHROOTABLE_ACTIVITY_MAX_BYTES`.
+  desktop Recovery view, automatic tail compaction of `activity.tsv` when the
+  journal exceeds `CHROOTABLE_ACTIVITY_MAX_BYTES`, and automatic trimming of finished
+  operation records and logs (`CHROOTABLE_OPERATION_KEEP`, default 200). Unfinished
+  operations are always kept.
 - Add desktop offline archive cache status and **Sync offline archive** action
   (`--archive-sync SUITE`) in Host Health.
 - Support sub-GiB (`512–1048576 MiB`) capacity selection in the desktop Create
@@ -32,6 +39,23 @@ are retained below as historical records.
   `wezterm`, `foot`, `xfce4-terminal`, `mate-terminal`, `tilix`), and add SGR
   dim/strikethrough, `CSI b` (`REP`), `Ctrl+Arrow` navigation, and scrollback
   search (`Ctrl+Shift+F`) plus scrollback clearing in the embedded terminal.
+- Fix the embedded terminal: sessions now own the pty as their controlling terminal,
+  so `sudo` can authenticate and Ctrl+C and window resizes reach the guest. Tab and
+  Shift+Tab reach the shell and the pane starts focused. Add function keys, Ctrl
+  symbols, application cursor keys, DEC line drawing, status replies, insert mode,
+  autowrap control and colon-form colors. Shrinking the window keeps the prompt.
+  "Close session" can no longer hang on a root-owned or signal-ignoring session.
+- Fix restricted-device sessions, which had no `/proc` or `/run`, and add `/dev/shm`.
+- Resolve the guest `/etc/resolv.conf` inside the guest so an absolute symlink cannot
+  create a host file, and mount it after `/run` so DNS keeps working. Refuse guest
+  symlinks at `/proc`, `/dev` and `/run`.
+- Give guest daemons up to 5 seconds to stop at session end instead of 50 ms.
+- Fix re-import of retained exports from a root-only store, a reconnect failure after
+  cancelling the administrator prompt, an inventory failure on non-UTF-8 metadata,
+  export counts that merged similarly named workspaces, and a race between offline
+  archive sync and workspace creation. Flush exports before publishing them.
+- Open sessions with `pkexec` on hosts without `sudo`.
+- Add import and interrupted-operation handling to the terminal menu.
 
 ## v1.1.0 — 2026-10-27
 

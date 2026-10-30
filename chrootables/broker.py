@@ -11,7 +11,7 @@ import threading
 
 # Works when invoked as an absolute script by pkexec with a clean environment.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from chrootables.backend import Store, MUTATIONS
+from chrootables.backend import Store, MUTATIONS, OperationCancelled
 
 
 def serve(store, input_stream=sys.stdin, output_stream=sys.stdout, *, writable=False):
@@ -59,8 +59,9 @@ def serve(store, input_stream=sys.stdin, output_stream=sys.stdout, *, writable=F
                 raise ValueError("Unsupported desktop request.")
             send({"id": identifier, "event": "result", "ok": True, "data": data})
         except Exception as error:
-            send({"id": identifier, "event": "result", "ok": False, "error": str(error),
-                  "code": "permission_required" if isinstance(error, PermissionError) else "operation_failed"})
+            code = ("permission_required" if isinstance(error, PermissionError) else
+                    "cancelled" if isinstance(error, OperationCancelled) else "operation_failed")
+            send({"id": identifier, "event": "result", "ok": False, "error": str(error), "code": code})
 
     send({"event": "ready", "writable": writable})
     with ThreadPoolExecutor(max_workers=4) as pool:
