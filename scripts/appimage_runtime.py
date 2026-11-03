@@ -212,9 +212,11 @@ def extract_licenses(stream, destination):
     """Keep upstream notices, license texts, and third-party attribution records."""
     with tarfile.open(fileobj=stream, mode="r:*") as archive:
         for member in archive:
-            basename = PurePosixPath(member.name).name.lower()
+            parts = PurePosixPath(member.name).parts
+            basename = parts[-1].lower() if parts else ""
+            in_license_directory = any(part.lower() in {"license", "licenses"} for part in parts[:-1])
             if not member.isfile() or not ("license" in basename or "copying" in basename
-                                           or basename == "qt_attribution.json"):
+                                           or basename == "qt_attribution.json" or in_license_directory):
                 continue
             if member.size > 2 * 1024 * 1024:
                 raise ValueError("Unexpectedly large third-party license text.")

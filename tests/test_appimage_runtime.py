@@ -118,6 +118,15 @@ class RuntimeInputsTests(unittest.TestCase):
         files = {path.relative_to(destination).as_posix() for path in destination.rglob("*") if path.is_file()}
         self.assertEqual(files, {"bin/python3.13", "lib/python3.13/os.py", "lib/python3.13/LICENSE.txt"})
 
+    def test_license_directories_preserve_lgpl_text_and_attributions(self):
+        entries = [(name, b"notice", "file") for name in (
+            "component/LICENSES/LGPL-3.0-only.txt", "component/COPYING", "component/LICENSE.third-party.txt",
+            "component/src/qt_attribution.json", "component/src/implementation.c")]
+        destination = self.root / "notices"
+        runtime.extract_licenses(self.python_tar(entries), destination)
+        files = {path.relative_to(destination).as_posix() for path in destination.rglob("*") if path.is_file()}
+        self.assertEqual(files, {entry[0] for entry in entries[:-1]})
+
     def test_wheel_selection_is_bounded_to_used_modules_and_plugins(self):
         for name in ("PySide6/QtCore.abi3.so", "PySide6/Qt/plugins/platforms/libqxcb.so",
                      "PySide6/Qt/plugins/platforms/libqwayland.so", "PySide6/Qt/plugins/imageformats/libqsvg.so",
