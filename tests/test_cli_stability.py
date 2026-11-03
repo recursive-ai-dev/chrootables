@@ -315,7 +315,7 @@ doctor json
         self.assertEqual(report["storage"]["total_bytes"], 10737418240)
 
     def test_doctor_handles_missing_store_and_escapes_unusual_paths(self):
-        unusual = self.store / 'future "store"\nfolder'
+        unusual = self.store / 'future "store" folder'
         result = self.bash('''
 STORE_DIR=$1
 REQUIRED_COMMANDS=(bash)

@@ -366,7 +366,7 @@ import_image imported "$1" 2048 persistent python
         archive = self.write_archive()
         # Report a 700 MiB member without having to write one.
         result = self.bash(self.IMPORT_STUBS + """
-tar() { printf -- '-rw-r--r-- 0/0 %s 2026-10-30 12:00 ./big\\n' 734003200; }
+tar() { if [[ $1 == --numeric-owner ]]; then printf -- '-rw-r--r-- 0/0 %s 2026-10-30 12:00 ./big\\n' 734003200; else command tar "$@"; fi; }
 gzip() { :; }
 run_worker() { :; }
 import_image tooSmall "$1" 512 persistent minimal
@@ -374,14 +374,16 @@ import_image tooSmall "$1" 512 persistent minimal
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("needs at least", result.stderr)
         self.assertFalse((self.store / "images/tooSmall.img").exists())
-        self.assertFalse((self.store / "operations" / (OPERATION_ID + ".state")).exists())
+        self.assertEqual(self.state()["status"], "failed")
+        self.assertEqual(list((self.store / "images").glob(".*.partial*")), [])
 
     def test_import_without_a_size_fits_the_archive_with_headroom(self):
         archive = self.write_archive()
         result = self.bash(self.IMPORT_STUBS + """
-tar() { printf -- '-rw-r--r-- 0/0 %s 2026-10-30 12:00 ./big\\n' 5368709120; }
+tar() { if [[ $1 == --numeric-owner ]]; then printf -- '-rw-r--r-- 0/0 %s 2026-10-30 12:00 ./big\\n' 5368709120; else command tar "$@"; fi; }
 gzip() { :; }
 run_worker() { :; }
+preflight_free_space() { printf '%s\\n' "$1" >>"$STORE_DIR/free-space-requests"; }
 required=$(required_capacity_mib 5368709120 1)
 import_image fitted "$1" "" persistent minimal
 printf '%s\\n' "$required"
@@ -390,6 +392,240 @@ printf '%s\\n' "$required"
         required = int(result.stdout.split()[-1])
         size = int(re.search(r"size_mib=(\d+)", (self.store / "images/fitted.img.meta").read_text()).group(1))
         self.assertEqual(size, required + required // 4)
+        self.assertEqual([int(value) for value in (self.store / "free-space-requests").read_text().splitlines()],
+                         [archive.stat().st_size, size * 1048576])
+
+
+    def test_import_extracts_the_validated_snapshot_when_the_source_changes(self):
+        for index, replacement in enumerate((False, True)):
+            with self.subTest(replacement=replacement):
+                archive = self.write_archive(name=f"source{index}.tar.gz", payload=b"validated data\n")
+                result = self.bash(self.IMPORT_STUBS + """
+SOURCE_ARCHIVE=$1
+REPLACE=$2
+mkfs.ext4() {
+    if [[ $REPLACE == True ]]; then rm -f -- "$SOURCE_ARCHIVE"; fi
+    printf 'corrupted after validation' >"$SOURCE_ARCHIVE"
+}
+run_worker() {
+    [[ $5 != "$SOURCE_ARCHIVE" && -f $5 && ! -L $5 ]] || return 70
+    tar -xOzf "$5" ./etc/debian_version >"$STORE_DIR/extracted"
+}
+import_image "$3" "$1" 512 persistent minimal
+""", archive, replacement, f"import{index}", identifier=f"{index + 1:032x}")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((self.store / "extracted").read_bytes(), b"validated data\n")
+                self.assertEqual(archive.read_bytes(), b"corrupted after validation")
+                self.assertEqual(list((self.store / "images").glob(".*.partial*")), [])
+
+    def test_import_does_not_follow_a_substituted_archive_symlink_or_fifo(self):
+        for index, kind in enumerate(("symlink", "fifo", "directory")):
+            with self.subTest(kind=kind):
+                archive = self.write_archive(name=f"source{index}.tar.gz")
+                target = self.store / "private-data"
+                target.write_text("must not be read")
+                result = self.bash(self.IMPORT_STUBS + """
+SOURCE_ARCHIVE=$1
+KIND=$2
+TARGET=$3
+tar() {
+    if [[ $1 == --create ]]; then
+        rm -f -- "$SOURCE_ARCHIVE"
+        if [[ $KIND == symlink ]]; then ln -s "$TARGET" "$SOURCE_ARCHIVE"
+        elif [[ $KIND == fifo ]]; then mkfifo "$SOURCE_ARCHIVE"
+        else mkdir "$SOURCE_ARCHIVE"; mkfifo "$SOURCE_ARCHIVE/child"; fi
+    fi
+    command tar "$@"
+}
+run_worker() { printf 'unexpected extraction' >"$STORE_DIR/extracted"; }
+import_image "$4" "$1" 512 persistent minimal
+""", archive, kind, target, f"import{index}", identifier=f"{index + 1:032x}")
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertIn("unsafe file type", result.stderr)
+                self.assertFalse((self.store / "extracted").exists())
+                self.assertEqual(target.read_text(), "must not be read")
+                self.assertEqual(list((self.store / "images").glob(".*.partial*")), [])
+
+
+    def test_import_copy_failure_cleans_both_staged_files(self):
+        archive = self.write_archive()
+        result = self.bash(self.IMPORT_STUBS + """
+tar() {
+    command tar "$@" || return
+    [[ $1 != --create ]] || return 23
+}
+run_worker() { printf 'unexpected extraction' >"$STORE_DIR/extracted"; }
+import_image failed "$1" 512 persistent minimal
+""", archive)
+        self.assertEqual(result.returncode, 23, result.stderr)
+        self.assertFalse((self.store / "extracted").exists())
+        self.assertEqual(list((self.store / "images").glob(".*.partial*")), [])
+        self.assertEqual(self.state()["status"], "failed")
+        self.assertTrue(archive.exists())
+
+    def test_invalid_import_copy_is_cleaned_after_validation_failure(self):
+        archive = self.store / "exports/invalid.tar.gz"
+        archive.write_bytes(b"not compressed")
+        result = self.bash(self.IMPORT_STUBS + 'import_image invalid "$1" 512 persistent minimal', archive)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("valid gzip", result.stderr)
+        self.assertEqual(list((self.store / "images").glob(".*.partial*")), [])
+        self.assertEqual(self.state()["status"], "failed")
+        self.assertEqual(archive.read_bytes(), b"not compressed")
+
+    def test_interrupted_import_snapshot_is_retained_then_discarded(self):
+        archive = self.write_archive()
+        result = self.bash(self.IMPORT_STUBS + """
+validate_tar_archive() { kill -KILL "$BASHPID"; }
+import_image interrupted "$1" 512 persistent minimal
+""", archive)
+        self.assertNotEqual(result.returncode, 0)
+        pending = self.store / self.state()["pending"]
+        sidecar = Path(str(pending) + ".archive")
+        self.assertEqual((sidecar / archive.name).read_bytes(), archive.read_bytes())
+        discarded = self.bash('assert_offline() { :; }; discard_operation "$1"', OPERATION_ID)
+        self.assertEqual(discarded.returncode, 0, discarded.stderr)
+        self.assertFalse(pending.exists())
+        self.assertFalse(sidecar.exists())
+        self.assertTrue(archive.exists())
+
+    def import_worker(self, archive, work):
+        work.mkdir()
+        return self.bash("""
+require_root() { :; }
+mount() { :; }
+worker_cleanup() { :; }
+worker_main import unused "$2" imported "$1"
+""", archive, work)
+
+    def rootfs_members(self):
+        members = [self.member(path, tarfile.DIRTYPE, mode=0o755)
+                   for path in ("etc", "usr", "usr/bin")]
+        members.append(self.member("usr/bin/env", size=1, mode=0o755))
+        return members
+
+    def test_import_replaces_fifo_and_hardlinked_hostname_without_opening_them(self):
+        for kind in (tarfile.FIFOTYPE, tarfile.LNKTYPE):
+            with self.subTest(kind=kind):
+                members = self.rootfs_members()
+                members += [self.member("etc/precious", size=7),
+                            self.member("etc/hostname", kind, linkname="etc/precious" if kind == tarfile.LNKTYPE else "")]
+                archive = self.write_tar(*members)
+                work = self.store / ("worker" + kind.decode())
+                result = self.import_worker(archive, work)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                hostname = work / "root/etc/hostname"
+                self.assertTrue(hostname.is_file())
+                self.assertEqual(hostname.read_text(), "imported\n")
+                self.assertEqual(hostname.stat().st_mode & 0o777, 0o644)
+                self.assertEqual((work / "root/etc/precious").read_bytes(), b"x" * 7)
+
+
+    def test_import_hostname_directory_fails_cleanly_and_symlink_is_preserved(self):
+        for index, kind in enumerate((tarfile.DIRTYPE, tarfile.SYMTYPE)):
+            with self.subTest(kind=kind):
+                members = self.rootfs_members()
+                members += [self.member("etc/precious", size=7),
+                            self.member("etc/hostname", kind, mode=0o755, linkname="precious")]
+                work = self.store / f"hostname{index}"
+                result = self.import_worker(self.write_tar(*members), work)
+                self.assertEqual(result.returncode == 0, kind == tarfile.SYMTYPE, result.stderr)
+                hostname = work / "root/etc/hostname"
+                self.assertEqual(hostname.is_symlink(), kind == tarfile.SYMTYPE)
+                self.assertEqual((work / "root/etc/precious").read_bytes(), b"x" * 7)
+                self.assertEqual(list((work / "root/etc").glob(".hostname.*")), [])
+
+    def test_import_requires_an_executable_resolved_inside_the_guest(self):
+        for index, (target, valid) in enumerate((("/missing", False), ("/bin/real-env", True),
+                                                ("../../bin/real-env", True), ("env", False), (str(MANAGER), False))):
+            with self.subTest(target=target):
+                members = self.rootfs_members()[:-1]
+                members += [self.member("bin", tarfile.DIRTYPE, mode=0o755),
+                            self.member("bin/real-env", size=1, mode=0o755),
+                            self.member("usr/bin/env", tarfile.SYMTYPE, linkname=target)]
+                result = self.import_worker(self.write_tar(*members), self.store / f"links{index}")
+                self.assertEqual(result.returncode == 0, valid, result.stderr)
+        members = self.rootfs_members()
+        members[-1].mode = 0o644
+        result = self.import_worker(self.write_tar(*members), self.store / "nonexecutable")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not executable", result.stderr)
+        members = self.rootfs_members()[:-1] + [self.member("usr/bin/env", tarfile.FIFOTYPE)]
+        result = self.import_worker(self.write_tar(*members), self.store / "fifo-executable")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not executable", result.stderr)
+
+
+    def test_import_executable_links_cannot_truncate_newlines_to_a_valid_target(self):
+        for index, target in enumerate(("real\nmissing", "real\n", "real\rmissing", "/bin/real-env\n")):
+            with self.subTest(target=target):
+                members = self.rootfs_members()[:-1]
+                members += [self.member("usr/bin/real", size=1, mode=0o755),
+                            self.member("bin", tarfile.DIRTYPE, mode=0o755),
+                            self.member("bin/real-env", size=1, mode=0o755),
+                            self.member("usr/bin/env", tarfile.SYMTYPE, linkname=target)]
+                result = self.import_worker(self.write_tar(*members), self.store / f"newline{index}")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("cannot contain line breaks", result.stderr)
+
+    def test_snapshot_paths_reject_writable_workspace_directories(self):
+        snapshot_dir = self.store / "snapshots/lab"
+        snapshot = snapshot_dir / "saved.img"
+        snapshot.write_bytes(b"saved data")
+        snapshot_dir.chmod(0o777)
+        for command in ('snapshot_path lab saved', 'restore_image lab saved',
+                        'drop_snapshot lab saved',
+                        'publication_paths_valid snapshots/lab/.saved.ABC123.partial snapshots/lab/saved.img',
+                        'staged_path_valid snapshots/lab/.saved.ABC123.partial'):
+            with self.subTest(command=command):
+                result = self.bash(command)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertIn("not writable", result.stderr)
+                self.assertEqual(snapshot.read_bytes(), b"saved data")
+                self.assertEqual(self.image.read_bytes(), b"original image")
+        report = json.loads(self.bash('doctor json').stdout)
+        checks = {check["id"]: check for check in report["checks"]}
+        self.assertEqual(checks["store:snapshots/lab"]["status"], "error")
+        snapshot_dir.chmod(0o700)
+        self.assertEqual(self.bash('snapshot_path lab saved').returncode, 0)
+
+    def test_snapshot_paths_reject_foreign_directory_ownership(self):
+        result = self.bash("""
+stat() {
+    if [[ $* == *snapshots/lab ]]; then printf '%s 700\\n' "$((EUID + 1))"
+    else command stat "$@"; fi
+}
+snapshot_path lab saved
+""")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("owned by UID", result.stderr)
+
+    def test_store_path_normalization_rejects_protocol_controls(self):
+        for separator in ("\t", "\r", "\n"):
+            path = self.store / ("unsafe" + separator + "store")
+            for function in ("init_store", "check_readable_store", "doctor json"):
+                with self.subTest(separator=repr(separator), function=function):
+                    result = self.bash('STORE_DIR=$1; configure_paths; ' + function, path)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(path.exists())
+                    if function == "doctor json":
+                        checks = {check["id"]: check for check in json.loads(result.stdout)["checks"]}
+                        self.assertEqual(checks["store-path"]["status"], "error")
+        # The original spelling contains no controls, but an ancestor link does.
+        target = self.store / "unsafe\nancestor"
+        target.mkdir()
+        alias = self.store / "alias"
+        alias.symlink_to(target, target_is_directory=True)
+        result = self.bash('STORE_DIR=$1; init_store', alias / "child")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((target / "child").exists())
+
+    def test_read_only_store_paths_are_canonical_without_creating_directories(self):
+        path = self.store / "missing" / ".." / "normalized"
+        result = self.bash('STORE_DIR=$1; check_readable_store; printf "%s" "$STORE_DIR"', path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, str(self.store / "normalized"))
+        self.assertFalse((self.store / "normalized").exists())
 
     def test_validate_tar_archive_rejects_traversal_and_device_nodes(self):
         for member, message in (
@@ -778,12 +1014,29 @@ discard_operation "$1"
         self.assertNotEqual(self.bash('lock_image "$IMAGE_DIR/lab.img" descriptor').returncode, 0)
         listed = self.bash("list_operations json")
         self.assertEqual(listed.returncode, 0, listed.stderr)
-        self.assertEqual(json.loads(listed.stdout), [])
+        invalid = json.loads(listed.stdout)[0]
+        self.assertEqual((invalid["id"], invalid["status"], invalid["discardable"], invalid["recoverable"]),
+                         (OPERATION_ID, "invalid", True, False))
         result = self.bash('discard_operation "$1"', OPERATION_ID, identifier="c3" * 16)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(record.exists())
         self.assertEqual(Path(str(record) + ".invalid").read_text(), "garbage line\n")
         self.assertEqual(self.bash('lock_image "$IMAGE_DIR/lab.img" descriptor').returncode, 0)
+
+    def test_invalid_operation_filenames_remain_visible_without_unsafe_discard(self):
+        record = self.store / "operations" / 'bad"id.state'
+        record.write_text("garbage\n")
+        listed = self.bash("list_operations json")
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        entry = json.loads(listed.stdout)[0]
+        self.assertEqual(entry["id"], 'bad"id')
+        self.assertIn("Administrator repair", listed.stderr)
+        self.assertNotIn("--discard-operation", listed.stderr)
+        self.assertEqual(entry["status"], "invalid")
+        self.assertFalse(entry["discardable"])
+        self.assertFalse(entry["recoverable"])
+        self.assertIn('bad"id', self.bash("list_operations text").stdout)
+        self.assertNotEqual(self.bash('lock_image "$IMAGE_DIR/lab.img" descriptor').returncode, 0)
 
     def test_list_operations_reports_what_can_be_done(self):
         self.write_record(identifier="d4" * 16, stage="publish-metadata", pending="images/.x.ABC123.partial", destination="images/lab.img")

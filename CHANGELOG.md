@@ -1,7 +1,23 @@
 # Changelog
 
-The current release is numbered `1.2.1`. Earlier development release numbers
+The current release is numbered `1.2.2`. Earlier development release numbers
 are retained below as historical records.
+
+## v1.2.2 — 2026-11-03
+
+- Import from a private staged archive so changes to the original cannot bypass
+  validation. Handle special hostname files safely and resolve required guest
+  executables within the guest root before publishing an image.
+- Validate nested snapshot-directory ownership and permissions. Include damaged
+  operation records in CLI recovery listings. Reject store paths with control
+  delimiters and normalize backend paths consistently with the CLI.
+- Save desktop exports through a flushed temporary file and atomic no-overwrite
+  publication, preserving existing destination files and normal-user ownership.
+- Reject oversized desktop requests locally without disconnecting unrelated work.
+- Bound terminal combining-character storage and queued PTY input, recover from
+  cancelled escape strings, and advertise the embedded terminal's own TERM value.
+- Bound checksum-sidecar reads, restore executable permissions on identical
+  AppImage rebuilds, and reject timestamps beyond distribution-format limits.
 
 ## v1.2.1 — 2026-10-30
 

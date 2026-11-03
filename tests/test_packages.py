@@ -139,6 +139,49 @@ class SharedPackagingTests(unittest.TestCase):
             self.assertEqual(outside.read_bytes(), b"other file")
             self.assertTrue(destination.is_symlink())
 
+    def test_oversized_checksum_is_rejected_without_reading_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "stage").mkdir()
+            staged = root / "stage/application.rpm"
+            staged.write_bytes(b"new package")
+            destination = root / staged.name
+            checksum = destination.with_suffix(".rpm.sha256")
+            with checksum.open("wb") as stream:
+                stream.truncate(1024 ** 4)
+            original_open = Path.open
+
+            def bounded_open(path, *args, **kwargs):
+                if path == checksum:
+                    self.fail("Oversized sidecar must not be read")
+                return original_open(path, *args, **kwargs)
+
+            with patch.object(Path, "open", bounded_open):
+                with self.assertRaisesRegex(ValueError, "--force"):
+                    support.publish_artifact(staged, destination)
+            self.assertFalse(destination.exists())
+            self.assertEqual(checksum.stat().st_size, 1024 ** 4)
+            support.publish_artifact(staged, destination, force=True)
+            self.assertEqual(destination.read_bytes(), b"new package")
+            self.assertLess(checksum.stat().st_size, 256)
+
+    def test_identical_publication_restores_executable_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "stage").mkdir()
+            staged = root / "stage/application.AppImage"
+            staged.write_bytes(b"package")
+            destination = root / staged.name
+            support.publish_artifact(staged, destination, executable=True)
+            checksum = destination.with_suffix(".AppImage.sha256")
+            expected = checksum.read_bytes()
+            destination.chmod(0o644)
+            staged.write_bytes(b"package")
+            support.publish_artifact(staged, destination, executable=True)
+            self.assertEqual(destination.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(destination.read_bytes(), b"package")
+            self.assertEqual(checksum.read_bytes(), expected)
+
     def test_publication_flushes_contents_before_rename_and_directory_after(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -200,6 +243,7 @@ class SharedPackagingTests(unittest.TestCase):
                     (("--revision", "../unsafe"), str(support.DEFAULT_EPOCH), "--revision"),
                     ((), "invalid", "SOURCE_DATE_EPOCH"),
                     ((), "9" * 50, "SOURCE_DATE_EPOCH"),
+                    ((), "4294967296", "SOURCE_DATE_EPOCH"),
                 ):
                     result = subprocess.run(
                         ["/usr/bin/python3", str(ROOT / f"scripts/build-{kind}.py"),
@@ -209,6 +253,11 @@ class SharedPackagingTests(unittest.TestCase):
                     self.assertIn(expected, result.stderr)
                     self.assertNotIn("Traceback", result.stderr)
                     self.assertFalse(output.exists())
+
+    def test_distribution_timestamp_boundaries(self):
+        for value in ("0", "4294967295"):
+            with self.subTest(value=value), patch.dict(os.environ, SOURCE_DATE_EPOCH=value):
+                self.assertEqual(support.build_metadata("1")[1], int(value))
 
     def test_appimage_requires_an_explicit_runtime_before_running_tools(self):
         with tempfile.TemporaryDirectory() as directory:

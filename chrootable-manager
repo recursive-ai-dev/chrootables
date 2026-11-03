@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 
 APP_NAME="Chrootable Manager"
-APP_VERSION=1.2.1
+APP_VERSION=1.2.2
 SCRIPT_PATH=${BASH_SOURCE[0]}
 STORE_DIR=${CHROOTABLE_HOME:-/var/lib/chrootable-manager}
 DEBIAN_SUITE=${CHROOTABLE_DEBIAN_SUITE:-stable}
@@ -272,13 +272,18 @@ store_directory_check() {
         printf 'Store directory must be owned by UID %s and not writable by group/others: %s' "$expected_owner" "$directory"; return 1;
     }
 }
+normalize_store_path() {
+    local resolved
+    [[ $STORE_DIR == /* && $STORE_DIR != / && $STORE_DIR != *[$'\t\r\n']* ]] || { fail "CHROOTABLE_HOME must be an absolute directory other than /, without tabs or line breaks."; return 1; }
+    [[ ! -L $STORE_DIR ]] || { fail "The store must not be a symlink: $STORE_DIR"; return 1; }
+    IFS= read -r -d '' resolved < <(readlink -mz -- "$STORE_DIR") || return
+    [[ $resolved != / && $resolved != *[$'\t\r\n']* ]] || { fail "The resolved store cannot be / or contain tabs or line breaks."; return 1; }
+    STORE_DIR=$resolved
+    configure_paths
+}
 init_store() {
     local directory issue
-    [[ $STORE_DIR == /* && $STORE_DIR != / ]] || { fail "CHROOTABLE_HOME must be an absolute directory other than /."; return 1; }
-    [[ ! -L $STORE_DIR ]] || { fail "The store must not be a symlink: $STORE_DIR"; return 1; }
-    STORE_DIR=$(readlink -m -- "$STORE_DIR") || return
-    [[ $STORE_DIR != / ]] || { fail "The store cannot be /."; return 1; }
-    configure_paths
+    normalize_store_path || return
     for directory in "$STORE_DIR" "$IMAGE_DIR" "$LOG_DIR" "$EXPORT_DIR" "$SNAPSHOT_DIR" "$OPERATIONS_DIR" "$ARCHIVE_DIR"; do
         issue=$(store_directory_check "$directory" "$EUID") || { fail "$issue"; return 1; }
     done
@@ -287,6 +292,7 @@ init_store() {
     done
 }
 check_readable_store() {
+    normalize_store_path || return
     [[ ! -e $STORE_DIR || ( -r $STORE_DIR && -x $STORE_DIR ) ]] || { fail "Store is not readable. Run with sudo to view $STORE_DIR"; return 1; }
 }
 
@@ -432,7 +438,10 @@ finish_operation() {
         OP_STATUS=interrupted
         write_operation_state || true
     else
-        if [[ -n ${PENDING:-} ]]; then rm -f -- "$PENDING" "$PENDING.meta" || true; fi
+        if [[ -n ${PENDING:-} ]]; then
+            rm -f -- "$PENDING" "$PENDING.meta" || true
+            rm -rf --one-file-system -- "$PENDING.archive" || true
+        fi
         OP_PENDING=; OP_DESTINATION=
         if (( status == 0 )); then OP_STATUS=completed; OP_STAGE=completed
         else OP_STATUS=failed; OP_STAGE=failed; fi
@@ -498,7 +507,7 @@ publication_paths_valid() {
             folder=${destination#snapshots/}; folder=${folder%%/*}
             base=${destination##*/}; base=${base%.img}
             valid_name "$folder" && valid_name "$base" || return
-            [[ $destination == "snapshots/$folder/$base.img" && ! -L $SNAPSHOT_DIR/$folder ]] || return 1 ;;
+            [[ $destination == "snapshots/$folder/$base.img" ]] && snapshot_directory_check "$folder" || return 1 ;;
         *) return 1 ;;
     esac
     [[ ! -L $STORE_DIR/$pending && ! -L $STORE_DIR/$pending.meta &&
@@ -573,7 +582,8 @@ staged_path_valid() {
         snapshots/*/*)
             folder=${path#snapshots/}; folder=${folder%%/*}
             [[ $path == "snapshots/$folder/$base" ]] && valid_name "$folder" &&
-                [[ ! -L $SNAPSHOT_DIR/$folder && $base =~ ^\.[A-Za-z0-9][A-Za-z0-9._-]{0,63}\.[A-Za-z0-9]{6}\.partial$ ]] ;;
+                snapshot_directory_check "$folder" &&
+                [[ $base =~ ^\.[A-Za-z0-9][A-Za-z0-9._-]{0,63}\.[A-Za-z0-9]{6}\.partial$ ]] ;;
         archive/*)
             [[ ${path%/*} == archive && $base =~ ^\.[a-z0-9][a-z0-9.-]{0,31}-[a-z0-9]+\.[A-Za-z0-9]{6}$ ]] ;;
         *) return 1 ;;
@@ -630,6 +640,7 @@ discard_operation() (
         else
             if [[ -e $pending ]]; then assert_offline "$pending" || return; fi
             rm -f -- "$pending" "$pending.meta" || return
+            rm -rf --one-file-system -- "$pending.archive" || return
         fi
     fi
     OP_ID=$identifier; OP_PID=$BASHPID; OP_PROCESS_START=$(process_start_time "$OP_PID") || return
@@ -641,16 +652,27 @@ discard_operation() (
     info "Discarded interrupted ${state[action]} $identifier and removed its staged files."
 )
 list_operations() {
-    local record comma= status active recoverable discardable
+    local record comma= status active recoverable discardable identifier
     local -A state=()
     [[ ${1:-text} != json ]] || printf '['
     for record in "$OPERATIONS_DIR/"*.state; do
         [[ -f $record && ! -L $record ]] || continue
-        read_operation_state "$record" state || { info "Invalid operation record: $record. Remove it with --discard-operation."; continue; }
-        active=false; operation_is_alive state && active=true
+        active=false
+        if read_operation_state "$record" state; then
+            operation_is_alive state && active=true
+        else
+            identifier=${record##*/}; identifier=${identifier%.state}
+            if valid_operation_id "$identifier"; then
+                info "Invalid operation record: $record. Inspect it and set it aside with --discard-operation $identifier --yes."
+            else
+                info "Invalid operation record filename: $record. Administrator repair is required before the store can be used."
+            fi
+            state=([id]="$identifier" [action]=unknown [name]=store [status]=invalid [stage]=invalid-record)
+        fi
         status=${state[status]}
         [[ $status != running || $active == true ]] || status=interrupted
         recoverable=false; discardable=false
+        if [[ $status == invalid ]] && valid_operation_id "${state[id]}"; then discardable=true; fi
         if [[ $active == false && $status == interrupted ]]; then
             discardable=true
             [[ ${state[stage]} != publish-* ]] || recoverable=true
@@ -1072,12 +1094,32 @@ validate_tar_archive() {
     IMPORT_REQUIRED_MIB=$(required_capacity_mib "$payload" "$entries")
 }
 import_image() (
-    local name=$1 archive=$2 size=${3:-} lifecycle=${4:-persistent} profile=${5:-minimal} image descriptor arch
+    local name=$1 archive=$2 size=${3:-} lifecycle=${4:-persistent} profile=${5:-minimal} image descriptor arch source_name source_parent
     unused_image "$name" || return
     valid_lifecycle "$lifecycle" || { fail "Lifecycle must be persistent or ephemeral."; return 1; }
     valid_profile "$profile" || { fail "Unknown profile: $profile. See --profiles."; return 1; }
     [[ -z $size ]] || valid_size_mib "$size" || { fail "Size must be a whole number from 512 to 1048576 MiB."; return 1; }
     canonicalize_archive_file "$archive" archive || return
+    source_name=${archive##*/}; source_parent=${archive%/*}
+    image="$IMAGE_DIR/$name.img"
+    lock_image "$image" descriptor || return
+    unused_image "$name" || return
+    preflight_free_space "$(stat -c%s -- "$archive")" || return
+    begin_operation import "$name" || return
+    PENDING=$(mktemp "$IMAGE_DIR/.$name.XXXXXX.partial") || return
+    OP_PENDING=${PENDING#"$STORE_DIR/"}; operation_stage copying-archive || return
+    # A pathname (or an open descriptor) into the user's directory is mutable.
+    # Snapshot on the store filesystem, then validate and extract only this copy.
+    # Do not follow a substituted symlink or read a substituted FIFO/device.
+    mkdir -m 0700 -- "$PENDING.archive" || return
+    # Nonrecursive tar copies a substituted special node as a node, without
+    # opening it, and a substituted directory without descending into it.
+    # A private destination makes the resulting regular file immutable to users.
+    { tar --create --no-recursion --file=- --directory="${source_parent:-/}" -- "$source_name" |
+        tar --extract --no-same-owner --no-same-permissions --file=- --directory="$PENDING.archive"; } >>"$OP_LOG" 2>&1 || return
+    archive="$PENDING.archive/$source_name"
+    [[ -f $archive && ! -L $archive ]] || { fail "Archive changed to an unsafe file type while copying."; return 1; }
+    operation_stage validating-archive || return
     validate_tar_archive "$archive" || return
     if [[ -n $size ]]; then
         (( size >= IMPORT_REQUIRED_MIB )) || { fail "This archive needs at least $IMPORT_REQUIRED_MIB MiB of capacity; $size MiB was requested."; return 1; }
@@ -1090,23 +1132,18 @@ import_image() (
         (( size <= 1048576 )) || size=1048576
     fi
     (( size >= IMPORT_REQUIRED_MIB )) || { fail "This archive needs $IMPORT_REQUIRED_MIB MiB, more than the 1048576 MiB limit."; return 1; }
-    image="$IMAGE_DIR/$name.img"
-    lock_image "$image" descriptor || return
-    unused_image "$name" || return
     preflight_free_space "$((size * 1048576))" || return
-    begin_operation import "$name" || return
-    PENDING=$(mktemp "$IMAGE_DIR/.$name.XXXXXX.partial") || return
-    OP_PENDING=${PENDING#"$STORE_DIR/"}; operation_stage allocating || return
+    operation_stage allocating || return
     make_workdir || return
     arch=$(dpkg --print-architecture) || return
-    info "Importing $name from ${archive##*/} / $profile / $size MiB. Log: $OP_LOG"
+    info "Importing $name from $source_name / $profile / $size MiB. Log: $OP_LOG"
     allocate_image "$PENDING" "$size" || return
     operation_stage formatting || return
     mkfs.ext4 -F -b 4096 -I 256 -i 16384 -m 5 -L "${name:0:16}" "$PENDING" >>"$OP_LOG" 2>&1 || return
     operation_stage importing || return
     run_worker import "$PENDING" "$WORK" "$name" "$archive" >>"$OP_LOG" 2>&1 || return
     # The archive's own release and architecture are recorded when it names them.
-    local key value suite=$DEBIAN_SUITE origin=${archive##*/}
+    local key value suite=$DEBIAN_SUITE origin=$source_name
     if [[ -f $WORK/import.info ]]; then
         while IFS='=' read -r key value; do
             case $key in
@@ -1116,9 +1153,10 @@ import_image() (
         done <"$WORK/import.info"
     fi
     write_metadata "$PENDING" "$lifecycle" "$suite" "$arch" "$size" "$(timestamp)" never "$profile" "import:$origin" || return
+    rm -rf --one-file-system -- "$PENDING.archive" || return
     publish_image "$PENDING" "$image" || return
     PENDING=
-    info "Imported '$name' from '${archive##*/}'."
+    info "Imported '$name' from '$source_name'."
 )
 # Remove logs and terminal records beyond the newest KEEP. Anything still running,
 # or stopped partway, stays: its record is the only map to its staged files.
@@ -1206,9 +1244,13 @@ delete_image() (
     info "Deleted '$(basename "$image" .img)'. Snapshots and exports were retained."
 )
 
+snapshot_directory_check() {
+    local issue
+    issue=$(store_directory_check "$SNAPSHOT_DIR/$1" "$EUID") || { fail "$issue"; return 1; }
+}
 snapshot_path() {
     valid_name "$1" && valid_name "$2" || { fail "Invalid image name or snapshot label."; return 1; }
-    [[ ! -L $SNAPSHOT_DIR/$1 ]] || { fail "Snapshot directories must not be symlinks."; return 1; }
+    snapshot_directory_check "$1" || return
     printf '%s/%s/%s.img\n' "$SNAPSHOT_DIR" "$1" "$2"
 }
 # Caller holds the image lock throughout snapshot/restore, including copies.
@@ -1357,7 +1399,8 @@ guest_resolve() {
         esac
         if [[ -L $root$current/$part ]]; then
             (( ++hops <= 40 )) || { fail "Too many symbolic links resolving guest path: $2"; return 1; }
-            link=$(readlink -- "$root$current/$part") || return
+            IFS= read -r -d '' link < <(readlink -z -- "$root$current/$part") || return
+            [[ $link != *[$'\r\n']* ]] || { fail "Guest symbolic link targets cannot contain line breaks."; return 1; }
             [[ $link != /* ]] || current=
             IFS='/' read -r -a linked <<<"$link"
             pending=("${linked[@]}" "${pending[@]}")
@@ -1545,10 +1588,18 @@ worker_main() (
             mount -o loop "$image" "$WORKER_ROOT" || return
             # Extraction otherwise restores only user.* xattrs, losing file capabilities.
             tar --numeric-owner --acls --xattrs --xattrs-include='*' --no-overwrite-dir -p -C "$WORKER_ROOT" -xzf "$archive" || return
-            # Sessions exec /usr/bin/env inside the image, so it must exist.
-            [[ -L $WORKER_ROOT/usr/bin/env || -f $WORKER_ROOT/usr/bin/env ]] || { fail "Archive is not a Linux root filesystem: /usr/bin/env is missing."; return 1; }
+            # Resolve executable links as the guest does, never through host paths.
+            local executable hostname_file
+            executable=$(guest_resolve "$WORKER_ROOT" /usr/bin/env) || return
+            [[ -f $executable && -x $executable && ! -L $executable ]] || { fail "Archive is not a Linux root filesystem: /usr/bin/env is missing or not executable."; return 1; }
             if [[ -d $WORKER_ROOT/etc && ! -L $WORKER_ROOT/etc && ! -L $WORKER_ROOT/etc/hostname ]]; then
-                printf '%s\n' "$name" >"$WORKER_ROOT/etc/hostname" || return
+                # Atomic replacement cannot block on a FIFO, open a device, or
+                # overwrite another guest file through an archive hard link.
+                hostname_file=$(mktemp "$WORKER_ROOT/etc/.hostname.XXXXXX") || return
+                if ! printf '%s\n' "$name" >"$hostname_file" || ! chmod 0644 "$hostname_file" ||
+                    ! mv -T -- "$hostname_file" "$WORKER_ROOT/etc/hostname"; then
+                    rm -f -- "$hostname_file"; return 1
+                fi
             fi
             record_import_details "$work" || return
             ;;
@@ -1912,10 +1963,8 @@ doctor() {
     else
         doctor_check loop-control warning '/dev/loop-control is unavailable; image mounts may be blocked.' 'Check the loop kernel module and host/container device access.'
     fi
-    if [[ $STORE_DIR != /* || $STORE_DIR == / ]]; then
-        doctor_check store-path error 'The store must be an absolute directory other than /.' 'Set CHROOTABLE_HOME to a dedicated directory.'
-    elif [[ -L $STORE_DIR ]]; then
-        doctor_check store-path error 'The workspace store is a symbolic link.' 'Choose the real store directory instead of a symlink.'
+    if ! normalize_store_path 2>/dev/null; then
+        doctor_check store-path error 'The store must resolve to an absolute directory other than /, without tabs, line breaks, or a final symbolic link.' 'Set CHROOTABLE_HOME to a dedicated directory.'
     elif [[ -e $STORE_DIR && ! -d $STORE_DIR ]]; then
         doctor_check store-path error 'The workspace store exists but is not a directory.' 'Choose a dedicated directory for the workspace store.'
     elif [[ -d $STORE_DIR ]]; then
@@ -1938,6 +1987,14 @@ doctor() {
                 doctor_check "store:$probe" error "$issue" 'Use a real root-owned directory without group/other write access before performing administrator operations.'
             fi
         done
+        if [[ -d $SNAPSHOT_DIR && ! -L $SNAPSHOT_DIR && -r $SNAPSHOT_DIR && -x $SNAPSHOT_DIR ]]; then
+            for probe in "$SNAPSHOT_DIR/"*; do
+                [[ -e $probe || -L $probe ]] || continue
+                if ! issue=$(store_directory_check "$probe" 0); then
+                    doctor_check "store:snapshots/${probe##*/}" error "$issue" 'Use a real root-owned snapshot directory without group/other write access.'
+                fi
+            done
+        fi
         if [[ -d $OPERATIONS_DIR && ! -L $OPERATIONS_DIR && -r $OPERATIONS_DIR && -x $OPERATIONS_DIR ]]; then
             for record in "$OPERATIONS_DIR/"*.state; do
                 [[ -f $record && ! -L $record ]] || continue

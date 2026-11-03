@@ -5,6 +5,8 @@ import sys
 from PySide6.QtCore import QObject, QProcess, Signal
 from .backend import ROOT
 
+MAX_REQUEST_BYTES = 65536
+
 
 def valid_result(action, data):
     """Check fields consumed by the desktop before invoking its callbacks."""
@@ -235,6 +237,9 @@ class Client(QObject):
             payload = (json.dumps({"id": identifier, "action": action, "params": params}) + "\n").encode()
         except (TypeError, ValueError) as error:
             callback(False, BackendError("Invalid request: " + str(error)))
+            return -1
+        if len(payload) > MAX_REQUEST_BYTES:
+            callback(False, BackendError("Request too large. Use shorter request parameters."))
             return -1
 
         def checked(ok, data):

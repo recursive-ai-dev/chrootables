@@ -4,10 +4,10 @@ A native Linux desktop workbench for Debian image environments. Create a workspa
 open a terminal, experiment in a disposable session, and return to a saved recovery
 point. The Qt desktop and the Bash terminal interface use the same image store.
 
-## Install version 1.2.1
+## Install version 1.2.2
 
 Download packages and SHA256 checksums from the
-[1.2.1 release](https://github.com/recursive-ai-dev/chrootables/releases/tag/v1.2.1).
+[1.2.2 release](https://github.com/recursive-ai-dev/chrootables/releases/tag/v1.2.2).
 The native packages install Python/Qt and workspace prerequisites through your
 host package manager. Launch the desktop as your normal user; workspace changes
 request administrator access when needed.
@@ -15,7 +15,7 @@ request administrator access when needed.
 ### Ubuntu / Debian
 
 ```bash
-sudo apt install ./chrootables_1.2.1-1_all.deb
+sudo apt install ./chrootables_1.2.2-1_all.deb
 chrootables-desktop
 ```
 
@@ -28,7 +28,7 @@ application-menu entry and manual pages.
 ### Fedora
 
 ```bash
-sudo dnf install ./chrootables-1.2.1-1.noarch.rpm
+sudo dnf install ./chrootables-1.2.2-1.noarch.rpm
 chrootables-desktop
 ```
 
@@ -38,8 +38,8 @@ the tested RPM target; compatibility with RHEL derivatives is not yet verified.
 ### AppImage · x86_64
 
 ```bash
-chmod +x Chrootables-1.2.1-1-x86_64.AppImage
-./Chrootables-1.2.1-1-x86_64.AppImage
+chmod +x Chrootables-1.2.2-1-x86_64.AppImage
+./Chrootables-1.2.2-1-x86_64.AppImage
 ```
 
 This is a **host-runtime AppImage**: it requires `/usr/bin/python3` 3.10+ and
@@ -53,7 +53,7 @@ Each artifact has a `.sha256` sidecar. Verify it in the download directory, for
 example:
 
 ```bash
-sha256sum -c chrootables_1.2.1-1_all.deb.sha256
+sha256sum -c chrootables_1.2.2-1_all.deb.sha256
 ```
 
 Removing a native package leaves `/var/lib/chrootable-manager` intact. Installed
@@ -243,17 +243,23 @@ desktop's Recovery view offers both actions. Finished operation records and logs
 trimmed automatically to the newest 200 (`CHROOTABLE_OPERATION_KEEP`).
 
 `--import NAME ARCHIVE.tar.gz [SIZE_MIB] [persistent|ephemeral] [PROFILE]` turns an
-export back into a workspace. The archive is checked before anything is written:
+export back into a workspace. A private copy of the compressed archive is staged
+in the store, then checked before the image is formatted or extracted:
 path traversal, block devices and non-standard character devices are refused, and it
 must contain a root filesystem. Leave `SIZE_MIB` empty (`""`) to fit capacity to the
 contents with room to work. Import preserves file capabilities and reads the release
 and architecture from the archive; profile and lifecycle are not stored in exports.
 Only import archives you trust: their contents run as root in later sessions.
+Allow space for both the compressed archive copy and the new image. Imports stopped
+abruptly can retain staging files; discard removes both files.
 
 Exports remain in the protected store and are copied to your chosen destination by
 a child process running as your normal user. The privileged helper opens the
 source; the user process creates the destination. The destination is never written
-with administrator privileges.
+with administrator privileges. A complete, flushed file is published atomically
+without overwriting an existing destination. Abrupt termination can leave a hidden
+`.chrootables-export-*` temporary file in the destination directory; it can be
+removed after the export process has stopped.
 
 ## Images and trust model
 
@@ -272,7 +278,8 @@ activity.tsv  completed operation history
 Use a different store with `./chrootables-desktop --store /srv/chrootables`, or set
 `CHROOTABLE_HOME` for the CLI. The store must be owned by root for mutations and
 must not be writable by other users. The same ownership and permission rules apply
-to every managed subdirectory, including the offline archive cache. Images are
+to every managed subdirectory, including nested snapshot directories and the
+offline archive cache. Store paths cannot contain tabs or line breaks. Images are
 fixed-capacity ext4 files backed by **sparse host files**. Creation,
 expansion and copying check available host space conservatively, but do not
 reserve the entire image capacity; monitor host free space as workspaces grow.

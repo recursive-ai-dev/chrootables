@@ -35,6 +35,7 @@ CANCELLABLE_ACTIONS = {"create", "import", "clone", "snapshot", "restore", "resi
 CANCELLABLE_STAGES = {
     "starting", "allocating", "formatting", "bootstrapping", "importing", "exporting",
     "copying", "copying-snapshot", "copying-restore", "downloading-archive",
+    "copying-archive", "validating-archive",
 }
 CANCEL_RESEND_SECONDS = 1.0
 
@@ -305,12 +306,24 @@ def deliver_export(archive, destination):
     if uid == 0:
         raise ValueError("Desktop exports need the invoking user's identity.")
     account = pwd.getpwuid(uid)
-    source = os.open(archive, os.O_RDONLY | os.O_NOFOLLOW)
-    script = '''import os, shutil, sys
+    source = os.open(archive, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    script = '''import ctypes, errno, os, shutil, sys, uuid
 source, destination = int(sys.argv[1]), sys.argv[2]
+parent, filename = os.path.split(destination)
+directory = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+temporary = ".chrootables-export-" + uuid.uuid4().hex
 created = False
 try:
-    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    # Refuse an existing name before copying; the no-replace publication below
+    # still protects against a destination created while the copy is running.
+    try:
+        os.stat(filename, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), destination)
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                 0o600, dir_fd=directory)
     created = True
     with os.fdopen(fd, "wb") as output, os.fdopen(source, "rb") as archive:
         try:
@@ -321,12 +334,35 @@ try:
             shutil.copyfileobj(archive, output, 1024 * 1024)
         output.flush()
         os.fsync(output.fileno())
-except BaseException:
-    if created:
-        os.unlink(destination)
-    raise
+    # Linux's no-replace rename also works on removable filesystems without
+    # hard links. Older libc/kernel combinations can use a no-replace link.
+    rename = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
+    renamed = False
+    if rename is not None:
+        rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+                           ctypes.c_char_p, ctypes.c_uint]
+        rename.restype = ctypes.c_int
+        if rename(directory, os.fsencode(temporary), directory, os.fsencode(filename), 1) == 0:
+            renamed = True
+        elif ctypes.get_errno() not in (errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP):
+            code = ctypes.get_errno()
+            raise OSError(code, os.strerror(code), destination)
+    if not renamed:
+        os.link(temporary, filename, src_dir_fd=directory, dst_dir_fd=directory,
+                follow_symlinks=False)
+        os.unlink(temporary, dir_fd=directory)
+    created = False
+    os.fsync(directory)
+finally:
+    try:
+        if created:
+            os.unlink(temporary, dir_fd=directory)
+    finally:
+        os.close(directory)
 '''
     try:
+        if not stat.S_ISREG(os.fstat(source).st_mode):
+            raise ValueError("Export source must be a regular file.")
         options = ({"user": uid, "group": account.pw_gid,
                     "extra_groups": os.getgrouplist(account.pw_name, account.pw_gid)}
                    if os.geteuid() == 0 else {})
@@ -387,9 +423,18 @@ def _process_alive(pid, expected_start):
 
 class Store:
     def __init__(self, path=DEFAULT_STORE):
-        self.path = Path(path)
-        if not self.path.is_absolute() or self.path == Path("/"):
+        path = Path(path)
+        if any(character in str(path) for character in "\x00\t\r\n"):
+            raise ValueError("Store paths cannot contain control separators.")
+        if not path.is_absolute():
             raise ValueError("Store must be an absolute directory other than /.")
+        if path.is_symlink():
+            raise ValueError("Store directories must not be symlinks.")
+        self.path = path.resolve()
+        if self.path == Path("/"):
+            raise ValueError("Store must be an absolute directory other than /.")
+        if any(character in str(self.path) for character in "\x00\t\r\n"):
+            raise ValueError("Store paths cannot contain control separators.")
         self._images_sig = None
         self._images_cache = []
         self._snap_meta_cache = {}
@@ -610,14 +655,32 @@ class Store:
         return records
 
     def _staged_bytes(self, relative):
-        """Allocated size of a staged file named by a record; zero when it cannot be read."""
+        """Allocated staged image and private import copy; never follow sidecar links."""
         if not relative or relative.startswith("/") or ".." in relative.split("/"):
             return 0
+        pending = self.path / relative
+        total = 0
         try:
-            info = (self.path / relative).lstat()
+            info = pending.lstat()
+            if stat.S_ISREG(info.st_mode):
+                total += info.st_blocks * 512
         except OSError:
-            return 0
-        return info.st_blocks * 512 if stat.S_ISREG(info.st_mode) else 0
+            pass
+        try:
+            sidecar = Path(str(pending) + ".archive")
+            info = sidecar.lstat()
+            if not stat.S_ISDIR(info.st_mode):
+                return total
+            total += info.st_blocks * 512
+            # CLI copies precisely one nonrecursive archive entry into this folder.
+            with os.scandir(sidecar) as entries:
+                for entry in entries:
+                    info = entry.stat(follow_symlinks=False)
+                    if stat.S_ISREG(info.st_mode):
+                        total += info.st_blocks * 512
+        except OSError:
+            pass
+        return total
 
     def _scan_archives(self):
         arch_dir = self.path / "archive"

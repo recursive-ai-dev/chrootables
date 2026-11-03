@@ -42,6 +42,10 @@ def build_metadata(revision):
         raise ValueError("SOURCE_DATE_EPOCH must be a nonnegative integer timestamp.")
     try:
         epoch = int(value)
+        # SquashFS and RPM metadata store timestamps as unsigned 32-bit values.
+        # Reject unsupported values before any format creates staging/output.
+        if epoch > 0xffffffff:
+            raise ValueError("timestamp exceeds the distribution format limit")
         date = datetime.fromtimestamp(epoch, timezone.utc)
     except (OverflowError, OSError, ValueError) as error:
         raise ValueError("SOURCE_DATE_EPOCH is outside the supported timestamp range.") from error
@@ -179,8 +183,13 @@ def publish_artifact(staged, destination, *, force=False, executable=False):
                 continue
             if not stat.S_ISREG(info.st_mode):
                 raise ValueError(f"Refusing to replace a non-regular output: {path}")
-            matches = (file_digest(path) == digest if path == destination
-                       else path.read_bytes() == content.encode("ascii"))
+            if path == destination:
+                matches = file_digest(path) == digest
+            elif info.st_size != len(content):
+                matches = False
+            else:
+                with path.open("rb") as stream:
+                    matches = stream.read(len(content) + 1) == content.encode("ascii")
             if not matches and not force:
                 raise ValueError(f"{path} already exists with different contents; use --force to replace it.")
         # A successful rename alone does not make the package contents durable.
@@ -192,6 +201,12 @@ def publish_artifact(staged, destination, *, force=False, executable=False):
             os.replace(staged, destination)
         if force or not checksum.exists():
             os.replace(staged_checksum, checksum)
+        # An identical rebuild must also repair accidental permission changes.
+        for path, mode in ((destination, 0o755 if executable else 0o644), (checksum, 0o644)):
+            if stat.S_IMODE(path.stat().st_mode) != mode:
+                with path.open("rb") as stream:
+                    os.fchmod(stream.fileno(), mode)
+                    os.fsync(stream.fileno())
         os.fsync(descriptor)
     finally:
         os.close(descriptor)

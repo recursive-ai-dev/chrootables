@@ -20,13 +20,17 @@ import unicodedata
 from PySide6.QtCore import QObject, QSocketNotifier, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter
 from PySide6.QtWidgets import (
-    QApplication, QDialog, QHBoxLayout, QLineEdit, QMessageBox, QPushButton,
+    QApplication, QDialog, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton,
     QVBoxLayout, QWidget,
 )
 
 DEFAULT_ROWS = 24
 DEFAULT_COLUMNS = 80
 DEFAULT_SCROLLBACK = 2000
+# Keep both retained output and input bounded even when a guest emits endless
+# combining marks or requests replies without reading from its terminal.
+MAX_CELL_CODEPOINTS = 32
+MAX_PENDING_INPUT_BYTES = 1024 * 1024
 # Closing escalates from SIGTERM to a pty hangup, then stops waiting. A session
 # run through sudo may be unsignalable from here, and must not pin its window.
 TERMINATE_GRACE_MS = 3000
@@ -210,7 +214,8 @@ class VtScreen:
                 column -= 1
             if column >= 0:
                 text, style = self.lines[row][column]
-                self.lines[row][column] = (text + character, style)
+                if len(text) < MAX_CELL_CODEPOINTS:
+                    self.lines[row][column] = (text + character, style)
             return
         if self._charsets[self._shift] == "0":
             character = DEC_SPECIAL_GRAPHICS.get(ord(character), character)
@@ -533,6 +538,13 @@ class VtScreen:
 
     def feed(self, text):
         for character in text:
+            # CAN/SUB abort an incomplete control sequence in every state,
+            # including strings and a pending string terminator.
+            if character in ("\x18", "\x1a"):
+                self._state = _GROUND
+                self._params = ""
+                self._charset_target = None
+                continue
             state = self._state
             if state == _GROUND:
                 if character == "\x1b":
@@ -584,8 +596,6 @@ class VtScreen:
             elif state in (_CSI, _CSI_IGNORE):
                 if character == "\x1b":
                     self._state = _ESC
-                elif character in ("\x18", "\x1a"):
-                    self._state = _GROUND
                 elif "@" <= character <= "~":
                     self._state = _GROUND
                     if state == _CSI:
@@ -606,8 +616,6 @@ class VtScreen:
             elif state == _STRING:
                 if character == "\x1b":
                     self._state = _STRING_ESC
-                elif character in "\x18\x1a":
-                    self._state = _GROUND
             elif state == _STRING_ESC:
                 self._state = _GROUND if character == "\\" else _STRING
             elif state == _CHARSET:
@@ -712,6 +720,7 @@ class PtyProcess(QObject):
 
     output = Signal(str)
     finished = Signal(int)
+    input_rejected = Signal()
 
     def __init__(self, argv, env=None, parent=None,
                  rows=DEFAULT_ROWS, columns=DEFAULT_COLUMNS):
@@ -721,7 +730,9 @@ class PtyProcess(QObject):
             self._set_window_size(slave, rows, columns)
             os.set_blocking(self.master, False)
             environment = dict(os.environ)
-            environment.setdefault("TERM", "xterm-256color")
+            # Advertise this pane's emulation, not its launching terminal's.
+            # An explicit caller-supplied environment can still override it.
+            environment["TERM"] = "xterm-256color"
             if env:
                 environment.update(env)
             # sudo, Ctrl+C and SIGWINCH all need the pty to be the session's
@@ -792,11 +803,21 @@ class PtyProcess(QObject):
 
     def write(self, payload):
         if self.master is None:
-            return
+            return False
+        # Reject the whole write: a partial bracketed paste could leave the
+        # guest interpreting later keystrokes as pasted data (or vice versa).
+        available = MAX_PENDING_INPUT_BYTES - len(self._pending_input)
+        if len(payload) > available:
+            self.input_rejected.emit()
+            return False
         if isinstance(payload, str):
             payload = payload.encode("utf-8")
+        if len(payload) > available:
+            self.input_rejected.emit()
+            return False
         self._pending_input.extend(payload)
         self._flush_input()
+        return True
 
     def _flush_input(self):
         """Drain queued input without blocking the UI on a busy or stopped guest."""
@@ -1235,6 +1256,14 @@ class TerminalWindow(QDialog):
         self.process.finished.connect(self._session_finished)
         self.pane.attach(self.process)
         layout.addWidget(self.pane, 1)
+        self.input_notice = QLabel(
+            "Input was not sent because the session's input queue is full. "
+            "Wait for the session to respond, then retry."
+        )
+        self.input_notice.setWordWrap(True)
+        self.input_notice.hide()
+        self.process.input_rejected.connect(self.input_notice.show)
+        layout.addWidget(self.input_notice)
         buttons = QHBoxLayout()
         if external is not None:
             external_button = QPushButton("Open in external terminal")

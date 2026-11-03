@@ -227,6 +227,36 @@ class StoreTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             Store(alias).inventory()
 
+    def test_store_rejects_record_separators_and_normalized_root(self):
+        for value in ("/tmp/..", "relative", "/", "/tmp/store\x00", "/tmp/store\t",
+                      "/tmp/store\r", "/tmp/store\n"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                Store(value)
+        unusual = self.path / "newline\nparent"
+        unusual.mkdir()
+        alias = self.path / "parent-alias"
+        alias.symlink_to(unusual, target_is_directory=True)
+        with self.assertRaises(ValueError):
+            Store(alias / "store")
+
+    def test_normalized_store_preserves_export_and_log_identity(self):
+        (self.path / "redundant").mkdir()
+        store = Store(self.path / "redundant" / "..")
+        self.assertEqual(store.path, self.path)
+        self.assertEqual(store.environment()["CHROOTABLE_HOME"], str(self.path))
+        archive = self.path / "exports/lab.tar.gz"
+        process = Mock(stdout=io.StringIO(str(archive) + "\n"), returncode=0)
+        process.poll.return_value = 0
+        with patch("chrootables.backend.subprocess.Popen", return_value=process), \
+                patch("chrootables.backend.deliver_export") as deliver:
+            self.assertEqual(store.operate("export", {"name": "lab", "destination": "/tmp/saved.tar.gz"},
+                                          lambda _: None), 0)
+        deliver.assert_called_once_with(archive, "/tmp/saved.tar.gz")
+        log = self.path / "logs/lab.log"
+        log.write_text("operation output")
+        (self.path / "activity.tsv").write_text(f"now\texport\tlab\tok\t{log}\n")
+        self.assertIn("operation output", store.logs("lab", str(log)))
+
     def test_safe_bounded_log_reads(self):
         log = self.path / "test.log"
         log.write_text("0123456789")
@@ -485,6 +515,46 @@ assert store.inventory()['images'][0]['status'] == 'ready'
         self.assertEqual(target.read_bytes(), b"archive payload")
 
     @unittest.skipIf(os.getuid() == 0, "Tests the user-side export writer")
+    def test_existing_export_destination_is_rejected_before_staging_or_copying(self):
+        source = self.path / "source.tar.gz"
+        source.write_bytes(b"original archive")
+        target = self.path / "saved.tar.gz"
+        real_run = subprocess.run
+        def reject_staging_and_copy(argv, **kwargs):
+            argv = list(argv)
+            injected = (
+                "original_open = os.open\n"
+                "def checked_open(path, *args, **kwargs):\n"
+                "    assert not str(path).startswith('.chrootables-export-'), 'unexpected staging'\n"
+                "    return original_open(path, *args, **kwargs)\n"
+                "def unexpected_copy(*args, **kwargs):\n"
+                "    raise AssertionError('unexpected copy')\n"
+                "os.open = checked_open\n"
+                "os.copy_file_range = unexpected_copy\n"
+                "shutil.copyfileobj = unexpected_copy\n")
+            argv[4] = argv[4].replace("source, destination =", injected + "source, destination =", 1)
+            return real_run(argv, **kwargs)
+        for kind in ("file", "symlink", "dangling-symlink", "directory"):
+            with self.subTest(kind=kind):
+                if kind == "file":
+                    target.write_bytes(b"existing")
+                elif kind == "directory":
+                    target.mkdir()
+                else:
+                    target.symlink_to(source if kind == "symlink" else self.path / "missing")
+                original = target.lstat()
+                with patch("chrootables.backend.subprocess.run", side_effect=reject_staging_and_copy):
+                    with self.assertRaisesRegex(RuntimeError, "File exists"):
+                        deliver_export(source, target)
+                self.assertEqual(target.lstat(), original)
+                self.assertEqual(source.read_bytes(), b"original archive")
+                self.assertEqual(list(self.path.glob(".chrootables-export-*")), [])
+                if kind == "directory":
+                    target.rmdir()
+                else:
+                    target.unlink()
+
+    @unittest.skipIf(os.getuid() == 0, "Tests the user-side export writer")
     def test_failed_export_copy_removes_partial_destination_and_retains_source(self):
         source = self.path / "source.tar.gz"
         source.write_bytes(b"original archive")
@@ -508,6 +578,91 @@ assert store.inventory()['images'][0]['status'] == 'ready'
                         deliver_export(source, target)
                 self.assertFalse(target.exists())
                 self.assertEqual(source.read_bytes(), b"original archive")
+                self.assertEqual(list(self.path.glob(".chrootables-export-*")), [])
+
+    @unittest.skipIf(os.getuid() == 0, "Tests the user-side export writer")
+    def test_export_publication_is_atomic_on_both_publication_routes(self):
+        source = self.path / "source.tar.gz"
+        source.write_bytes(b"complete archive")
+        target = self.path / "saved.tar.gz"
+        real_run = subprocess.run
+        for fallback in (False, True):
+            for competitor in (False, True):
+                with self.subTest(fallback=fallback, competitor=competitor):
+                    def inject_copy_observer(argv, **kwargs):
+                        injected = (
+                            "original_copy = os.copy_file_range\n"
+                            "def observe_copy(*args):\n"
+                            "    assert not os.path.exists(sys.argv[2]), 'partial destination visible'\n"
+                            "    return original_copy(*args)\n"
+                            "os.copy_file_range = observe_copy\n")
+                        if fallback:
+                            injected += "ctypes.CDLL = lambda *args, **kwargs: object()\n"
+                        argv = list(argv)
+                        argv[4] = argv[4].replace("source, destination =", injected + "source, destination =", 1)
+                        if competitor:
+                            argv[4] = argv[4].replace(
+                                "    rename = getattr", "    with open(destination, 'xb') as other:\n"
+                                "        other.write(b'competitor')\n    rename = getattr", 1)
+                        return real_run(argv, **kwargs)
+                    with patch("chrootables.backend.subprocess.run", side_effect=inject_copy_observer):
+                        if competitor:
+                            with self.assertRaisesRegex(RuntimeError, "saving the chosen copy failed"):
+                                deliver_export(source, target)
+                        else:
+                            deliver_export(source, target)
+                    self.assertEqual(target.read_bytes(), b"competitor" if competitor else b"complete archive")
+                    self.assertEqual(list(self.path.glob(".chrootables-export-*")), [])
+                    target.unlink()
+
+    @unittest.skipIf(os.getuid() == 0, "Tests the user-side export writer")
+    def test_export_abrupt_writer_exit_never_exposes_partial_final_archive(self):
+        source = self.path / "source.tar.gz"
+        source.write_bytes(b"archive payload")
+        target = self.path / "saved.tar.gz"
+        real_run = subprocess.run
+        def interrupt(argv, **kwargs):
+            argv = list(argv)
+            injected = ("def interrupted_copy(source, destination, size):\n"
+                        "    os.write(destination, b'partial')\n"
+                        "    os._exit(17)\n"
+                        "os.copy_file_range = interrupted_copy\n")
+            argv[4] = argv[4].replace("source, destination =", injected + "source, destination =", 1)
+            return real_run(argv, **kwargs)
+        with patch("chrootables.backend.subprocess.run", side_effect=interrupt):
+            with self.assertRaises(RuntimeError):
+                deliver_export(source, target)
+        self.assertFalse(target.exists())
+        self.assertEqual(source.read_bytes(), b"archive payload")
+        # Uncatchable death may leave a recognizable staging file, never a final archive.
+        self.assertEqual(len(list(self.path.glob(".chrootables-export-*"))), 1)
+
+    @unittest.skipIf(os.getuid() == 0, "Tests the user-side export writer")
+    def test_export_rejects_nonregular_source_without_blocking(self):
+        source = self.path / "source.tar.gz"
+        os.mkfifo(source)
+        with self.assertRaisesRegex(ValueError, "regular file"):
+            deliver_export(source, self.path / "saved.tar.gz")
+
+    @unittest.skipIf(os.getuid() == 0, "Tests the user-side export writer")
+    def test_export_flush_failure_does_not_publish_unsynced_bytes(self):
+        source = self.path / "source.tar.gz"
+        source.write_bytes(b"archive payload")
+        target = self.path / "saved.tar.gz"
+        real_run = subprocess.run
+        def fail_flush(argv, **kwargs):
+            argv = list(argv)
+            injected = ("def failed_sync(fd):\n"
+                        "    raise OSError(5, 'I/O error')\n"
+                        "os.fsync = failed_sync\n")
+            argv[4] = argv[4].replace("source, destination =", injected + "source, destination =", 1)
+            return real_run(argv, **kwargs)
+        with patch("chrootables.backend.subprocess.run", side_effect=fail_flush):
+            with self.assertRaisesRegex(RuntimeError, "I/O error"):
+                deliver_export(source, target)
+        self.assertFalse(target.exists())
+        self.assertEqual(list(self.path.glob(".chrootables-export-*")), [])
+        self.assertEqual(source.read_bytes(), b"archive payload")
 
     def test_inventory_failure_does_not_publish_a_new_cache_signature(self):
         image = self.image()
@@ -790,6 +945,27 @@ valid_mirror "https://deb.debian.org/debian" || exit 13
             command = terminal_command("lab", self.path)
             self.assertEqual(command[:4], ["alacritty", "--hold", "--title", "Chrootables · lab"])
 
+
+    def test_import_reclaimable_size_counts_private_snapshot_without_following_links(self):
+        store = Store(self.path)
+        pending = self.path / "images/.copy.ABC123.partial"
+        pending.parent.mkdir(exist_ok=True)
+        pending.touch()
+        sidecar = Path(str(pending) + ".archive")
+        sidecar.mkdir()
+        archive = sidecar / "source.tar.gz"
+        archive.write_bytes(b"x" * 8192)
+        outside = self.path / "outside"
+        outside.write_bytes(b"x" * 16384)
+        (sidecar / "link").symlink_to(outside)
+        expected = sum(path.stat().st_blocks * 512 for path in (pending, sidecar, archive))
+        self.assertEqual(store._staged_bytes("images/.copy.ABC123.partial"), expected)
+        archive.unlink()
+        (sidecar / "link").unlink()
+        sidecar.rmdir()
+        sidecar.symlink_to(self.path, target_is_directory=True)
+        self.assertEqual(store._staged_bytes("images/.copy.ABC123.partial"), pending.stat().st_blocks * 512)
+
     def test_cancellation_is_limited_to_actions_and_stages_that_can_stop_safely(self):
         store = Store(self.path)
         with self.assertRaisesRegex(RuntimeError, "No running operation"):
@@ -811,6 +987,11 @@ valid_mirror "https://deb.debian.org/debian" || exit 13
             store._active_action, store._active_stage = "clone", "copying"
             self.assertTrue(store.cancel_operation()["cancelled"])
             killpg.assert_called_once_with(process.pid, signal.SIGTERM)
+        for stage in ("copying-archive", "validating-archive"):
+            with self.subTest(stage=stage), patch("chrootables.backend.os.killpg") as killpg:
+                store._active_action, store._active_stage = "import", stage
+                self.assertTrue(store.cancel_operation()["cancelled"])
+                killpg.assert_called_once_with(process.pid, signal.SIGTERM)
         with patch("chrootables.backend.os.killpg", side_effect=ProcessLookupError):
             with self.assertRaisesRegex(RuntimeError, "No running"):
                 store.cancel_operation()

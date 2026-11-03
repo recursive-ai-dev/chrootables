@@ -1,6 +1,7 @@
 """Terminal emulation, key mapping, and pty round-trip tests. No root required."""
 import os
 from pathlib import Path
+import random
 import shutil
 import sys
 import tempfile
@@ -17,6 +18,7 @@ from PySide6.QtTest import QTest
 
 from chrootables.terminal import (
     BOLD, DIM, STRIKE, UNDERLINE,
+    MAX_CELL_CODEPOINTS, MAX_PENDING_INPUT_BYTES,
     QT_KEY_BACKSPACE, QT_KEY_DELETE, QT_KEY_DOWN, QT_KEY_END,
     QT_KEY_ENTER, QT_KEY_HOME, QT_KEY_LEFT, QT_KEY_PAGEUP, QT_KEY_RIGHT,
     QT_KEY_TAB, QT_KEY_UP, PtyProcess, TerminalPane, TerminalWindow, VtScreen,
@@ -35,6 +37,61 @@ def pump(application, condition, timeout=5.0):
 
 
 class VtScreenTests(unittest.TestCase):
+    def test_combining_stream_is_bounded_and_chunk_independent(self):
+        payload = "a" + "\u0301" * 100000 + "b\u0327\u0301"
+        whole = VtScreen(2, 20)
+        whole.feed(payload)
+        chunks = VtScreen(2, 20)
+        for start in range(0, len(payload), 733):
+            chunks.feed(payload[start:start + 733])
+        self.assertEqual(whole.lines, chunks.lines)
+        self.assertEqual(whole.lines[0][0][0], "a" + "\u0301" * (MAX_CELL_CODEPOINTS - 1))
+        self.assertEqual(whole.lines[0][1][0], "b\u0327\u0301")
+        self.assertEqual((whole.row, whole.column), (0, 2))
+
+    def test_combining_limit_preserves_wide_cells_and_continued_output(self):
+        screen = VtScreen(2, 20)
+        screen.feed("界" + "\u0301" * 1000 + "X")
+        self.assertEqual(len(screen.lines[0][0][0]), MAX_CELL_CODEPOINTS)
+        self.assertEqual(screen.lines[0][1][0], "")
+        self.assertEqual(screen.lines[0][2][0], "X")
+
+    def test_can_and_sub_abort_every_incomplete_control_state(self):
+        prefixes = ("\x1b", "\x1b[31", "\x1b[" + "9" * 300,
+                    "\x1b]title", "\x1b]title\x1b", "\x1bPdata",
+                    "\x1bPdata\x1b", "\x1b(")
+        for prefix in prefixes:
+            for cancel in ("\x18", "\x1a"):
+                payload = "before" + prefix + cancel + "after"
+                for split in range(len(payload) + 1):
+                    with self.subTest(prefix=prefix, cancel=cancel, split=split):
+                        screen = VtScreen(2, 20)
+                        screen.feed(payload[:split])
+                        screen.feed(payload[split:])
+                        self.assertEqual(screen.plain().splitlines()[0], "beforeafter")
+
+    def test_adversarial_control_stream_is_independent_of_chunk_boundaries(self):
+        randomizer = random.Random(20261103)
+        tokens = ("abc", "界", "\u0301" * 70, "\r\n", "\x1b[31m", "\x1b[0m",
+                  "\x1b]unfinished\x18", "\x1bPdata\x1b\x1a", "\x1b[2J",
+                  "\x1b[6n", "\x1b[999999999999999999999999999999C",
+                  "\x1b[38;2;5:1;0;0m", "\x1b[?1049h", "\x1b[?1049l")
+        payload = "".join(randomizer.choice(tokens) for _ in range(2000))
+        whole, chunked = VtScreen(6, 20), VtScreen(6, 20)
+        whole.feed(payload)
+        position = 0
+        while position < len(payload):
+            end = position + randomizer.randint(1, 97)
+            chunked.feed(payload[position:end])
+            position = end
+        self.assertEqual(chunked.lines, whole.lines)
+        self.assertEqual(chunked.history, whole.history)
+        self.assertEqual(chunked.responses, whole.responses)
+        self.assertEqual((chunked.row, chunked.column), (whole.row, whole.column))
+        for line in list(chunked.history) + chunked.lines:
+            self.assertEqual(len(line), 20)
+            self.assertTrue(all(len(text) <= MAX_CELL_CODEPOINTS for text, _ in line))
+
     def test_plain_text_cursor_and_wrap(self):
         screen = VtScreen(4, 10)
         screen.feed("hello")
@@ -654,6 +711,62 @@ class PtyProcessTests(unittest.TestCase):
             self.assertFalse(process._write_notifier.isEnabled())
         process._readable()  # No slave: close the mock session's descriptor.
         process._reaper.stop()
+
+    def test_input_queue_rejects_whole_writes_and_recovers_after_drain(self):
+        child = Mock()
+        child.poll.return_value = None
+        with patch("chrootables.terminal.subprocess.Popen", return_value=child):
+            process = PtyProcess(["fake-child"])
+        rejected = []
+        process.input_rejected.connect(lambda: rejected.append(True))
+        try:
+            with patch("chrootables.terminal.os.write", side_effect=BlockingIOError()):
+                self.assertTrue(process.write(b"a" * (MAX_PENDING_INPUT_BYTES - 1)))
+                pending = bytes(process._pending_input)
+                self.assertFalse(process.write(b"\x1b[200~paste\x1b[201~"))
+                self.assertFalse(process.write("é"))  # One character, two bytes.
+                self.assertEqual(process._pending_input, pending)
+                self.assertTrue(process.write(b"b"))
+                self.assertEqual(len(process._pending_input), MAX_PENDING_INPUT_BYTES)
+                self.assertFalse(process.write(b"c" * MAX_PENDING_INPUT_BYTES))
+                pane = TerminalPane()
+                pane.attach(process)
+                pane._on_output("\x1b[6n" * 10000)
+                self.assertEqual(len(process._pending_input), MAX_PENDING_INPUT_BYTES)
+                self.assertEqual(pane.screen.responses, [])
+            self.assertEqual(len(rejected), 4)
+            with patch("chrootables.terminal.os.write", side_effect=lambda fd, data: len(data)):
+                while process._pending_input:
+                    process._flush_input()
+                self.assertTrue(process.write(b"retry"))
+            self.assertFalse(process._pending_input)
+            self.assertFalse(process._write_notifier.isEnabled())
+        finally:
+            process._readable()
+            process._reaper.stop()
+
+    def test_input_queue_rejection_is_visible_in_terminal_window(self):
+        window = TerminalWindow(["/bin/sleep", "30"], "session")
+        window.show()
+        try:
+            self.assertTrue(window.input_notice.isHidden())
+            self.assertFalse(window.process.write(b"x" * (MAX_PENDING_INPUT_BYTES + 1)))
+            self.assertFalse(window.input_notice.isHidden())
+            self.assertIn("not sent", window.input_notice.text())
+            self.assertFalse(window.process._pending_input)
+        finally:
+            window.close()
+            self.assertTrue(pump(self.app, lambda: window.process._finished))
+
+    def test_embedded_term_replaces_parent_but_honors_explicit_override(self):
+        for explicit, expected in ((None, "xterm-256color"), ({"TERM": "vt100"}, "vt100")):
+            with self.subTest(explicit=explicit):
+                with patch.dict(os.environ, {"TERM": "dumb"}):
+                    process = PtyProcess(["/bin/sh", "-c", 'printf "%s" "$TERM"'], env=explicit)
+                output = []
+                process.output.connect(output.append)
+                self.assertTrue(pump(self.app, lambda: process._finished))
+                self.assertEqual("".join(output), expected)
 
     def test_large_paste_does_not_block_gui_when_guest_stops_reading(self):
         process = PtyProcess(["/bin/sh", "-c", "printf READY; sleep 30"])

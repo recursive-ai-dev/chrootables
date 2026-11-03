@@ -1,9 +1,9 @@
 # Chrootables Roadmap
 
-Status as of 2026-10-30. v1.2.1 hardens interrupted publication, resize signal
-protection, store permissions and import-capacity arithmetic; improves helper
-backpressure, log streaming and terminal correctness; and isolates store favorites.
-The completed 1.2.1 audit is tracked in `TODO.md`. v1.2.0 added validated workspace
+Status as of 2026-11-03. v1.2.2 hardens archive import, nested snapshot paths,
+atomic export delivery, helper request framing and terminal resource limits.
+The current audit is tracked in `TODO.md`; the completed 1.2.1 audit is preserved
+in `docs/TODO-1.2.1-ARCHIVE.md`. v1.2.0 added validated workspace
 archive import
 (`--import`), desktop interrupted-publication recovery, safe operation
 cancellation, log/export retention management and journal compaction, desktop

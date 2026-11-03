@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication
-from chrootables.client import Client, valid_result
+from chrootables.client import Client, valid_result, MAX_REQUEST_BYTES
 
 
 class ClientTests(unittest.TestCase):
@@ -184,6 +184,28 @@ class ClientTests(unittest.TestCase):
         self.assertFalse(callback.call_args.args[0])
         self.assertEqual(self.client.callbacks, {})
         self.assertFalse(self.client.is_ready)
+
+    def test_oversized_request_preserves_connection_and_other_requests(self):
+        pending, oversized = Mock(), Mock()
+        identifier = self.client.request("logs", {"name": "lab"}, pending)
+        self.process.write.reset_mock()
+        self.assertEqual(self.client.request("logs", {"name": "é" * MAX_REQUEST_BYTES}, oversized), -1)
+        oversized.assert_called_once()
+        self.assertFalse(oversized.call_args.args[0])
+        self.assertIn("too large", str(oversized.call_args.args[1]))
+        self.process.write.assert_not_called()
+        self.assertTrue(self.client.is_ready)
+        self.assertEqual(list(self.client.callbacks), [identifier])
+        self.read({"event": "result", "id": identifier, "ok": True, "data": "still connected"})
+        pending.assert_called_once_with(True, "still connected")
+
+    def test_request_byte_limit_includes_envelope_and_newline(self):
+        callback = Mock()
+        base = len((json.dumps({"id": 1, "action": "logs", "params": {"name": ""}}) + "\n").encode())
+        identifier = self.client.request("logs", {"name": "x" * (MAX_REQUEST_BYTES - base)}, callback)
+        self.assertGreater(identifier, 0)
+        self.assertEqual(len(self.process.write.call_args.args[0]), MAX_REQUEST_BYTES)
+        self.assertEqual(self.client.request("logs", {"name": "x" * (MAX_REQUEST_BYTES - base + 1)}, Mock()), -1)
 
 
 class ClientLineHandlingTests(unittest.TestCase):
