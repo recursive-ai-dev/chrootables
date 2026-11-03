@@ -8,6 +8,8 @@ are used under the GNU Lesser General Public License, version 3. License texts
 and third-party attribution records are in this directory. Chrootables itself
 remains under its Apache-2.0 license.
 
+This software is based in part on the work of the Independent JPEG Group.
+
 The matching Chrootables-VERSION-runtime-sources.tar.gz release asset contains
 the unchanged Qt Base, SVG, Wayland, PySide/Shiboken, CPython and ICU source archives,
 plus the Python Build Standalone build scripts and dependency license texts. It is offered

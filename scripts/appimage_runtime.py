@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import posixpath
 import shutil
 import stat
 import tarfile
@@ -211,19 +212,57 @@ def extract_wheel(stream, destination):
 def extract_licenses(stream, destination):
     """Keep upstream notices, license texts, and third-party attribution records."""
     with tarfile.open(fileobj=stream, mode="r:*") as archive:
-        for member in archive:
-            parts = PurePosixPath(member.name).parts
-            basename = parts[-1].lower() if parts else ""
-            in_license_directory = any(part.lower() in {"license", "licenses"} for part in parts[:-1])
-            if not member.isfile() or not ("license" in basename or "copying" in basename
-                                           or basename == "qt_attribution.json" or in_license_directory):
-                continue
-            if member.size > 2 * 1024 * 1024:
-                raise ValueError("Unexpectedly large third-party license text.")
+        extracted, references = set(), set()
+        total = 0
+
+        def copy_notice(member):
+            nonlocal total
+            if not member.isfile() or member.size > 2 * 1024 * 1024:
+                raise ValueError("Unexpected third-party notice type or size.")
+            total += member.size
+            if total > 32 * 1024 * 1024:
+                raise ValueError("Third-party notices exceed the size limit.")
             target = safe_path(destination, member.name)
             target.parent.mkdir(parents=True, exist_ok=True)
             with archive.extractfile(member) as source, target.open("xb") as output:
                 shutil.copyfileobj(source, output)
+            extracted.add(member.name)
+
+        for member in archive:
+            parts = PurePosixPath(member.name).parts
+            basename = parts[-1].lower() if parts else ""
+            in_license_directory = any(part.lower() in {"license", "licenses"} for part in parts[:-1])
+            if not member.isfile() or not (any(term in basename for term in
+                                              ("license", "licence", "copying", "copyright", "notice"))
+                                           or basename == "qt_attribution.json" or in_license_directory):
+                continue
+            copy_notice(member)
+            if basename == "qt_attribution.json":
+                # Qt's upstream records contain literal newlines inside some
+                # copyright strings. Preserve the original text and parse only
+                # references, without accepting paths outside this source tree.
+                data = json.loads((destination / member.name).read_text(encoding="utf-8"), strict=False)
+                for item in data if isinstance(data, list) else [data]:
+                    if not isinstance(item, dict):
+                        raise ValueError("Invalid Qt attribution record.")
+                    for key in ("LicenseFile", "LicenseFiles", "CopyrightFile", "CopyrightFiles"):
+                        values = item.get(key, [])
+                        values = [values] if isinstance(values, str) else values
+                        if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+                            raise ValueError("Invalid Qt attribution file references.")
+                        for value in values:
+                            reference = posixpath.normpath(posixpath.join(posixpath.dirname(member.name), value))
+                            safe_path(destination, reference)
+                            if PurePosixPath(reference).parts[0] != parts[0]:
+                                raise ValueError("Qt attribution reference escapes its source tree.")
+                            references.add(reference)
+        members = {member.name: member for member in archive.getmembers()}
+        if references - members.keys():
+            raise ValueError("Qt attribution references missing source files: " + ", ".join(sorted(references - members.keys())))
+        # Read any nonstandard names (MIT.txt, PSF-3.7.0.txt, source-header
+        # copyright notices) in archive order, avoiding repeated decompression.
+        for member in sorted((members[name] for name in references - extracted), key=lambda item: item.offset_data):
+            copy_notice(member)
 
 
 def stage_runtime(stage, cache, architecture):

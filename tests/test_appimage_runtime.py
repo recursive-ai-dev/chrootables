@@ -121,11 +121,21 @@ class RuntimeInputsTests(unittest.TestCase):
     def test_license_directories_preserve_lgpl_text_and_attributions(self):
         entries = [(name, b"notice", "file") for name in (
             "component/LICENSES/LGPL-3.0-only.txt", "component/COPYING", "component/LICENSE.third-party.txt",
-            "component/src/qt_attribution.json", "component/src/implementation.c")]
+            "component/src/COPYRIGHT.txt", "component/src/TERMS.txt", "component/src/CREDITS.txt")]
+        entries += [("component/src/qt_attribution.json",
+                     json.dumps({"LicenseFile": "TERMS.txt", "CopyrightFile": "CREDITS.txt"}).encode(), "file"),
+                    ("component/src/implementation.c", b"code", "file")]
         destination = self.root / "notices"
         runtime.extract_licenses(self.python_tar(entries), destination)
         files = {path.relative_to(destination).as_posix() for path in destination.rglob("*") if path.is_file()}
         self.assertEqual(files, {entry[0] for entry in entries[:-1]})
+
+    def test_attribution_references_cannot_escape_or_silently_go_missing(self):
+        for index, reference in enumerate(("../../../outside", "/outside", "missing.txt")):
+            record = json.dumps({"LicenseFile": reference}).encode()
+            with self.subTest(reference=reference), self.assertRaises(ValueError):
+                runtime.extract_licenses(self.python_tar([("component/qt_attribution.json", record, "file")]),
+                                         self.root / f"notices{index}")
 
     def test_wheel_selection_is_bounded_to_used_modules_and_plugins(self):
         for name in ("PySide6/QtCore.abi3.so", "PySide6/Qt/plugins/platforms/libqxcb.so",

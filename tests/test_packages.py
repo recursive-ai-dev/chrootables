@@ -394,6 +394,19 @@ class AppImagePackageTests(ArtifactTests, unittest.TestCase):
                 self.assertEqual((stage / "LICENSE").read_bytes(), (ROOT / "LICENSE").read_bytes())
             bundled = stage / "usr/lib/chrootables/runtime/bin/python3"
             self.assertTrue(os.access(bundled, os.X_OK))
+            notices = stage / "usr/share/doc/chrootables/third-party"
+            for relative in (
+                "qtbase-everywhere-src-6.11.2/LICENSES/LGPL-3.0-only.txt",
+                "qtbase-everywhere-src-6.11.2/LICENSES/GPL-3.0-only.txt",
+                "qtbase-everywhere-src-6.11.2/src/3rdparty/libjpeg/COPYRIGHT.txt",
+                "qtbase-everywhere-src-6.11.2/src/3rdparty/pcre2/LICENCE.md",
+                "qtbase-everywhere-src-6.11.2/src/3rdparty/wayland/protocols/appmenu/LGPL-2.1-or-later.txt",
+                "qtwayland-everywhere-src-6.11.2/src/3rdparty/protocol/ivi/MIT.txt",
+                "pyside-setup-everywhere-src-6.11.2/sources/shiboken6/libshiboken/bufferprocs_py37.h",
+                "pyside-setup-everywhere-src-6.11.2/sources/shiboken6/shibokenmodule/files.dir/shibokensupport/signature/PSF-3.7.0.txt",
+            ):
+                self.assertTrue((notices / relative).is_file(), relative)
+            self.assertIn("Independent JPEG Group", (notices / "NOTICE.txt").read_text())
             source, = root.glob("*-runtime-sources.tar.gz")
             with tarfile.open(source) as archive:
                 sources = set(archive.getnames())
