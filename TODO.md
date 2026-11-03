@@ -2,43 +2,43 @@
 
 Baseline: `e704e57` / v1.2.2. Previous sprint archived in `docs/TODO-1.2.2-ARCHIVE.md`.
 
-Eight meaningful follow-up improvements were identified from actual remaining limitations; no extra findings are invented to reach twelve. Scope preserves Linux architecture and prioritizes security, lifecycle, distribution portability and measured efficiency.
+Nine meaningful follow-up improvements were identified from actual remaining limitations; no extra findings are invented to reach twelve. Scope preserves Linux architecture and prioritizes security, lifecycle, distribution portability and measured efficiency.
 
 ## REL-01 — Guest APT sources and offline archives
 
 - Priority / severity: **P1 / High**
-- Status: **IN_PROGRESS**
+- Status: **VERIFIED**
 - Affected components: CLI guest bootstrap, APT and archive cache.
 - Problem / evidence: Official-mirror creation omits security updates; cache index identity depends on sources.
 - Implementation: Configure signed main/updates/security sources for supported official Debian suites and retain exact sources in offline archives; keep custom mirrors compatible.
 - Acceptance: Guest apt sources include security; fresh and offline installs use matching signed indices.
 - Required tests: Source selection, supported suite aliases, custom mirrors, legacy/new cache and real privileged integration.
 - Dependencies: None
-- Verification evidence: 110 CLI tests passed, including sources, aliases, security upgrades and legacy caches. Real minimal/cached-Python integration running.
+- Verification evidence: 110 CLI tests passed. Real minimal and cached Python integration passed on x86_64 with signed sources, certificates, security upgrades, and network-disabled cached creation.
 
 ## REL-07 — Offline cache trust validation
 
 - Priority / severity: **P1 / High**
-- Status: **IN_PROGRESS**
+- Status: **VERIFIED**
 - Affected components: CLI offline cache validation and publication.
 - Problem / evidence: archive_has_profile accepts base.tgz/mirror by size without validating nested cache ownership, permissions or file types; offline debootstrap executes that cached base as root.
 - Implementation: Validate consumed cache trees before reuse, reject unsafe writable/foreign-owned/symlink/special entries, and publish safe owner/mode metadata.
 - Acceptance: Unsafe caches fail closed before extraction or guest command execution; generated and safe legacy caches remain usable.
 - Required tests: Nested directory/file permissions and ownership, links, FIFOs, missing/incomplete records and real cached creation.
 - Dependencies: REL-01
-- Verification evidence: 110 CLI tests passed, including recursive owner/mode/link/FIFO and failed-scan rejection. Real cache publication/consumption integration running.
+- Verification evidence: 110 CLI tests passed, including recursive owner/mode/link/FIFO and failed-scan rejection. Real cache publication/consumption integration passed with safe metadata.
 
 ## REL-08 — Host/guest temporary directory boundary
 
 - Priority / severity: **P1 / High**
-- Status: **IN_PROGRESS**
+- Status: **VERIFIED**
 - Affected components: CLI chroot execution, integration harness.
 - Problem / evidence: A real integration run with host TMPDIR on SSD failed ca-certificates configuration because that absolute host path does not exist inside the guest.
 - Implementation: Normalize temporary-directory environment at the chroot boundary while retaining explicit operation settings; let the test harness place large images on an appropriate host filesystem.
 - Acceptance: Host TMPDIR may point outside /tmp without breaking guest bootstrap, APT, cached creation or interactive commands.
 - Required tests: Guest environment regression tests and real minimal/offline Python integration with an external TMPDIR.
 - Dependencies: REL-01
-- Verification evidence: 110 CLI tests and12 session/shared-folder tests passed; poisoned environment and real mktemp regression covered. SSD-backed privileged integration rerun pending.
+- Verification evidence: 110 CLI tests and 12 session/shared-folder tests passed. Poisoned environment and real mktemp regressions passed; both privileged integrations passed with host TMPDIR on SSD outside /tmp.
 
 ## REL-02 — User export lifecycle
 
@@ -86,7 +86,19 @@ Eight meaningful follow-up improvements were identified from actual remaining li
 - Acceptance: Original source mutation cannot change staged validation bytes; special files fail without blocking; reflink avoids duplicate allocation when supported.
 - Required tests: File replacement, FIFO/device/directory races, fallback, allocation and measured reflink/copy behavior.
 - Dependencies: None
-- Verification evidence: 110 CLI tests passed, including source replacement/special files/copy failure/Perl startup isolation. Real XFS128MiB benchmark: tar median0.37515s vs reflink0.02531s; checksum, shared extents and mutation isolation checked.
+- Verification evidence: 110 CLI tests passed, including source replacement/special files/copy failure/Perl startup isolation. Real XFS 128 MiB benchmark: tar median 0.37515 s vs reflink 0.02531 s; checksum, shared extents and mutation isolation checked.
+
+## REL-09 — Portable extraction isolation and cleanup
+
+- Priority / severity: **P2 / Medium**
+- Status: **IN_PROGRESS**
+- Affected components: AppImage launch and portable verification harness.
+- Problem / evidence: A real root portable check left a root-owned upstream extraction directory in shared /tmp; the next unprivileged launch of the same artifact failed with permission denied before reaching Python.
+- Implementation: Isolate extraction temporary directories and clean owned fixtures deterministically; retain interrupted runtimes and detached terminal handoffs with explicit cleanup guidance; suppress privileged bytecode writes; retain safe permissions and cover supported launch paths.
+- Acceptance: Root verification cannot block a subsequent normal-user launch; invocations never use another user's extraction cache.
+- Required tests: Repeated/overlapping launches, signal handling, detached authentication/handoff, cleanup and real root-to-normal-user startup.
+- Dependencies: REL-03
+- Verification evidence: pending.
 
 ## REL-06 — Release preparation and verification
 
@@ -97,5 +109,5 @@ Eight meaningful follow-up improvements were identified from actual remaining li
 - Implementation: Prepare 1.3.0 with full regression, independent review, supported artifacts, checksums/provenance and release publication.
 - Acceptance: All feasible tasks verified; final CI and downloaded release assets pass; limitations documented precisely.
 - Required tests: Full local suite, native CI, reproducible builds and post-publication checksum verification.
-- Dependencies: REL-01 through REL-05, REL-07, REL-08
+- Dependencies: REL-01 through REL-05, REL-07, REL-08, REL-09
 - Verification evidence: pending.

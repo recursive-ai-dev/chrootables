@@ -5,10 +5,12 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -311,6 +313,163 @@ class SharedPackagingTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
 
 
+class AppImageLauncherTests(unittest.TestCase):
+    def fixture(self, root):
+        launcher = root / "AppRun"
+        launcher.write_text(APPIMAGE.APPRUN)
+        launcher.chmod(0o755)
+        image = root / "fake image"
+        image.write_text('''#!/usr/bin/python3
+import os, pathlib, shutil, sys
+assert sys.argv[1:] == ["--appimage-extract"]
+if os.environ.get("EXTRACT_STATUS"):
+    raise SystemExit(int(os.environ["EXTRACT_STATUS"]))
+stage = pathlib.Path("squashfs-root")
+(stage / "usr/bin").mkdir(parents=True)
+shutil.copy(os.environ["APPRUN_TEMPLATE"], stage / "AppRun")
+shutil.copy(os.environ["DESKTOP_TEMPLATE"], stage / "usr/bin/chrootables-desktop")
+''')
+        image.chmod(0o755)
+        desktop = root / "desktop"
+        desktop.write_text('''#!/usr/bin/python3
+import json, os, pathlib, sys, time
+work = pathlib.Path(__file__).resolve().parents[3]
+print(json.dumps({"work":str(work), "session":os.environ.get("CHROOTABLE_APPIMAGE_SESSION_DIR"), "marker":os.environ.get("CHROOTABLE_APPIMAGE_EXTRACTED"), "args":sys.argv[1:]}), flush=True)
+if os.environ.get("WAIT_TEST"):
+    pathlib.Path(os.environ["READY_PATH"]).write_text(str(work))
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if os.environ.get("GATE_PATH") and pathlib.Path(os.environ["GATE_PATH"]).exists():
+            break
+        time.sleep(0.01)
+if os.environ.get("OUTSIDE_TARGET"):
+    (work / "outside").symlink_to(os.environ["OUTSIDE_TARGET"])
+if os.environ.get("DETACHED_TEST"):
+    pathlib.Path(os.environ["CHROOTABLE_APPIMAGE_SESSION_DIR"], ".retain-runtime").touch()
+raise SystemExit(int(os.environ.get("DESKTOP_STATUS", "0")))
+''')
+        desktop.chmod(0o755)
+        environment = {**os.environ, "APPIMAGE": str(image), "TMPDIR": str(root),
+                       "APPRUN_TEMPLATE": str(launcher), "DESKTOP_TEMPLATE": str(desktop)}
+        for key in ("CHROOTABLE_APPIMAGE_EXTRACTED", "APPIMAGE_EXTRACT_AND_RUN", "DESKTOP_STATUS",
+                    "EXTRACT_STATUS", "WAIT_TEST", "READY_PATH", "GATE_PATH", "OUTSIDE_TARGET", "DETACHED_TEST"):
+            environment.pop(key, None)
+        return launcher, environment
+
+    def test_repeated_launches_are_private_forward_arguments_and_clean_after_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            launcher, environment = self.fixture(root)
+            unrelated = root / "unrelated"
+            unrelated.write_text("keep")
+            paths = []
+            for temporary_path in (str(root), root.name):
+                result = subprocess.run([str(launcher), "--store", "directory with spaces"],
+                                        env={**environment, "TMPDIR": temporary_path}, cwd=root.parent,
+                                        capture_output=True, text=True, check=True, timeout=10)
+                data = json.loads(result.stdout)
+                paths.append(data["work"])
+                self.assertEqual(data["marker"], "1")
+                self.assertEqual(data["session"], data["work"])
+                self.assertEqual(data["args"], ["--store", "directory with spaces"])
+                self.assertFalse(Path(data["work"]).exists())
+            self.assertNotEqual(*paths)
+            self.assertEqual(unrelated.read_text(), "keep")
+            self.assertFalse(list(root.glob("chrootables-appimage.*")))
+
+    def test_overlapping_launches_cannot_remove_each_others_runtime_or_symlink_targets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            launcher, environment = self.fixture(root)
+            outside = root / "keep"
+            outside.mkdir()
+            (outside / "sentinel").write_text("untouched")
+            gate = root / "gate"
+            ready = [root / f"ready{index}" for index in range(2)]
+            processes = [subprocess.Popen([str(launcher)],
+                         env={**environment, "WAIT_TEST": "1", "READY_PATH": str(path),
+                              "GATE_PATH": str(gate), "OUTSIDE_TARGET": str(outside)},
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for path in ready]
+            try:
+                deadline = time.monotonic() + 5
+                while not all(path.exists() for path in ready) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(all(path.exists() for path in ready))
+                paths = [Path(path.read_text()) for path in ready]
+                self.assertNotEqual(*paths)
+                self.assertTrue(all((path / "squashfs-root/AppRun").exists() for path in paths))
+                gate.touch()
+                for process in processes:
+                    _, stderr = process.communicate(timeout=5)
+                    self.assertEqual(process.returncode, 0, stderr)
+                self.assertTrue(all(not path.exists() for path in paths))
+                self.assertEqual((outside / "sentinel").read_text(), "untouched")
+            finally:
+                for process in processes:
+                    if process.poll() is None:
+                        process.kill()
+                        process.communicate(timeout=5)
+
+    def test_failed_extraction_cleans_only_its_own_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            launcher, environment = self.fixture(root)
+            sentinel = root / "chrootables-appimage.keep"
+            sentinel.mkdir()
+            result = subprocess.run([str(launcher)], env={**environment, "EXTRACT_STATUS": "19"},
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 19)
+            self.assertEqual(list(root.glob("chrootables-appimage.*")), [sentinel])
+
+    def test_abnormal_frontend_exit_retains_runtime_for_disconnected_helper(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            launcher, environment = self.fixture(root)
+            result = subprocess.run([str(launcher)], env={**environment, "DESKTOP_STATUS": "7"},
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 7)
+            work = Path(json.loads(result.stdout)["work"])
+            self.assertTrue((work / "squashfs-root/AppRun").is_file())
+            self.assertIn(str(work), result.stderr)
+            self.assertIn("administrator helper has finished", result.stderr)
+            self.assertEqual(work.stat().st_mode & 0o777, 0o700)
+
+    def test_signals_reach_child_preserve_status_and_retain_runtime(self):
+        for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            with self.subTest(signal=number), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                launcher, environment = self.fixture(root)
+                ready = root / "ready"
+                process = subprocess.Popen([str(launcher)], env={**environment, "WAIT_TEST": "1", "READY_PATH": str(ready)},
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                try:
+                    deadline = time.monotonic() + 5
+                    while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue(ready.exists(), "Extracted frontend did not start.")
+                    process.send_signal(number)
+                    stdout, stderr = process.communicate(timeout=5)
+                    self.assertEqual(process.returncode, 128 + number, stderr)
+                    work = Path(json.loads(stdout)["work"])
+                    self.assertTrue((work / "squashfs-root/AppRun").exists())
+                    self.assertIn(str(work), stderr)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.communicate(timeout=5)
+
+    def test_detached_terminal_marker_preserves_runtime_after_successful_gui_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            launcher, environment = self.fixture(root)
+            result = subprocess.run([str(launcher)], env={**environment, "DETACHED_TEST": "1"},
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0)
+            work = Path(json.loads(result.stdout)["work"])
+            self.assertTrue((work / "squashfs-root/AppRun").exists())
+            self.assertIn("for a detached terminal session", result.stderr)
+
+
 class ArtifactTests:
     kind = None
     pattern = None
@@ -384,7 +543,7 @@ class AppImagePackageTests(ArtifactTests, unittest.TestCase):
             package, = root.glob(self.pattern)
             self.assertEqual(package.stat().st_mode & 0o777, 0o755)
             environment = {**os.environ, "QT_QPA_PLATFORM": "offscreen",
-                           "APPIMAGE_EXTRACT_AND_RUN": "1"}
+                           "APPIMAGE_EXTRACT_AND_RUN": "1", "TMPDIR": str(root)}
             version = subprocess.check_output([str(package), "--version"],
                                               env=environment, text=True, timeout=30).strip()
             self.assertEqual(version, support.upstream_version())
@@ -413,7 +572,7 @@ class AppImagePackageTests(ArtifactTests, unittest.TestCase):
                 self.assertIn("Python-3.13.18.tar.xz", sources)
                 self.assertIn("qtbase-everywhere-src-6.11.2.tar.xz", sources)
                 self.assertIn("icu4c-73_2-src.tgz", sources)
-            subprocess.run([str(bundled), "-I", str(ROOT / "scripts/check-portable.py"), str(stage)],
+            subprocess.run([str(bundled), "-I", "-B", str(ROOT / "scripts/check-portable.py"), str(stage)],
                            env=environment, check=True, capture_output=True, timeout=45)
             subprocess.run(["/usr/bin/python3", str(ROOT / "scripts/check-installed.py"),
                             "--prefix", str(stage / "usr")], check=True, capture_output=True, timeout=45)

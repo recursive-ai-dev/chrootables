@@ -140,12 +140,14 @@ class RuntimeInputsTests(unittest.TestCase):
     def test_wheel_selection_is_bounded_to_used_modules_and_plugins(self):
         for name in ("PySide6/QtCore.abi3.so", "PySide6/Qt/plugins/platforms/libqxcb.so",
                      "PySide6/Qt/plugins/platforms/libqwayland.so", "PySide6/Qt/plugins/imageformats/libqsvg.so",
+                     "PySide6/Qt/plugins/wayland-decoration-client/libbradient.so",
                      "PySide6/Qt/lib/libQt6DBus.so.6", "PySide6/Qt/lib/libicuuc.so.73"):
             self.assertTrue(runtime.wheel_member(name), name)
         for name in ("PySide6/Qt/plugins", "PySide6/Qt/plugins/", "PySide6/Qt/plugins/platforms/",
                      "PySide6/designer", "PySide6/QtQml.abi3.so", "PySide6/Qt/plugins/imageformats/libqpdf.so",
                      "PySide6/Qt/plugins/platforminputcontexts/libqtvirtualkeyboardplugin.so",
-                     "PySide6/Qt/plugins/platformthemes/libqgtk3.so"):
+                     "PySide6/Qt/plugins/platformthemes/libqgtk3.so",
+                     "PySide6/Qt/plugins/wayland-decoration-client/libadwaita.so"):
             self.assertFalse(runtime.wheel_member(name), name)
         stream = io.BytesIO()
         with zipfile.ZipFile(stream, "w") as archive:

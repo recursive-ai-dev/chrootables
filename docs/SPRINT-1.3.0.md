@@ -4,7 +4,7 @@ Audit date: 2026-11-03. Baseline: `e704e57` / v1.2.2.
 
 ## Scope and architecture
 
-Eight evidence-backed follow-up improvements are tracked in TODO.md; the prior
+Nine evidence-backed follow-up improvements are tracked in TODO.md; the prior
 sprint is archived in TODO-1.2.2-ARCHIVE.md. CLI/store ownership, the bounded
 privileged broker, Python backend and Qt presentation boundaries are preserved.
 
@@ -33,7 +33,13 @@ privileged operations.
 
 Independent reviews caught and corrected unsafe nested cache entries, optional Qt
 plugins with unbundled dependencies, malformed wheel paths and insufficient
-host-runtime masking. The portable test masks host Python executables, PySide and
+host-runtime masking. A headless Wayland run also exposed a missing client window
+decoration plugin and shared temporary extraction interference after root testing.
+Review of the corrective launcher caught detached terminals waiting for
+authentication after GUI exit; a narrowly scoped retention marker prevents
+removing their runtime before the command starts. Privileged helper and export
+interpreter launches disable bytecode writes so root-owned caches cannot prevent
+the invoking user from removing a completed runtime. The portable test masks host Python executables, PySide and
 Qt libraries inside a private mount namespace. It checks dependency resolution,
 privileged-helper invocation, normal-user export and actual offscreen/Xvfb startup.
 
@@ -52,9 +58,21 @@ about whole-application speed; filesystem, cache and system load affect results.
 
 ## Verification and release gates
 
-Final regression, native architecture CI, artifact reproducibility and publication
-checks are in progress. Completed checks and exact release evidence will be
-recorded here before closing REL-06.
+- 110 CLI tests, 72 backend tests and 12 session/shared-folder tests passed.
+- Real privileged minimal and offline Python integrations passed on x86_64,
+  including security upgrades, cache publication/consumption, network-disabled
+  creation, namespace/mount behavior, snapshots, restore/recovery, shared folders,
+  expansion/repair, export/import and durable operation records. Host TMPDIR was
+  on SSD outside /tmp; both fixture directories and loop mounts were cleaned.
+- Final runtime input tests cover bounded/malformed archives, cache links/FIFOs,
+  digest/size corruption and missing/escaping attribution references.
+- Independent binary audit checked all 275 selected notices byte-for-byte against
+  pinned archives, all 58 unique attribution targets (84 references), LGPL/GPL
+  texts, IJG acknowledgment and all seven source archive SHA-256/size pairs.
+- DEB and RPM rebuilt identically across output paths and umasks 022/077; extracted
+  CLI, diagnostics, helper and desktop smoke checks passed.
+- Full frozen-source regression, final AppImages, native architecture CI and
+  publication checks remain in progress; exact evidence will close REL-06.
 
 ## Remaining platform limits
 
@@ -66,3 +84,7 @@ claimed. Guests run as trusted host-root environments, not security sandboxes.
 Offline caches require refresh to receive future security fixes. Filesystems
 without anonymous staging can retain a recognizable hidden export staging file
 following SIGKILL or a crash; final destination publication remains atomic.
+Private AppImage runtimes are retained after abnormal termination or detached
+terminal handoff; remove them only after operations, helpers and sessions finish.
+Explicit upstream extract-and-run mode needs a private TMPDIR to avoid sharing
+content-named extraction paths across users.

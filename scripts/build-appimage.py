@@ -17,10 +17,65 @@ APPRUN = '''#!/bin/bash
 set -eu
 APPDIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # Root helpers cannot reliably read a user's FUSE mount. Re-execute through the
-# runtime's extraction path before starting Python or authenticating with polkit.
+# extraction path before starting Python or authenticating with polkit. A private
+# directory also avoids the runtime's shared, content-named extraction cache.
 if [[ -n "${APPIMAGE:-}" && -z "${CHROOTABLE_APPIMAGE_EXTRACTED:-}" && -z "${APPIMAGE_EXTRACT_AND_RUN:-}" ]]; then
+    work="$(mktemp -d "${TMPDIR:-/tmp}/chrootables-appimage.XXXXXXXX")"
+    work="$(readlink -f -- "$work")"
+    child=
+    preserve=0
+    retain_reason='after an abnormal exit'
+    signal_status=0
+    cleanup() {
+        if [[ $preserve == 0 ]]; then
+            rm -rf --one-file-system -- "$work"
+        else
+            printf '%s\\n' "Chrootables retained its private runtime $retain_reason: $work" >&2
+            printf '%s\\n' 'Remove it only after any detached terminal, workspace operation or administrator helper has finished.' >&2
+        fi
+    }
+    forward_signal() {
+        preserve=1
+        signal_status=$2
+        [[ -z $child ]] || kill -"$1" "$child" 2>/dev/null || :
+    }
+    trap cleanup EXIT
+    trap 'forward_signal TERM 143' TERM
+    # Background children may inherit SIGINT ignored; use TERM for delivery but
+    # preserve the interrupt exit status of this launcher.
+    trap 'forward_signal TERM 130' INT
+    trap 'forward_signal HUP 129' HUP
+    (cd -- "$work" && exec "$APPIMAGE" --appimage-extract >/dev/null) &
+    child=$!
+    status=0
+    while :; do
+        wait "$child" && status=0 || status=$?
+        kill -0 "$child" 2>/dev/null || break
+    done
+    child=
+    [[ $signal_status == 0 ]] || exit "$signal_status"
+    [[ $status == 0 ]] || exit "$status"
     export CHROOTABLE_APPIMAGE_EXTRACTED=1
-    exec "$APPIMAGE" --appimage-extract-and-run "$@"
+    export CHROOTABLE_APPIMAGE_SESSION_DIR="$work"
+    # A normal GUI close waits for operations and stops its helper. Preserve the
+    # files after crashes/signals so a disconnected helper can still finish.
+    preserve=1
+    "$work/squashfs-root/AppRun" "$@" &
+    child=$!
+    while :; do
+        wait "$child" && status=0 || status=$?
+        kill -0 "$child" 2>/dev/null || break
+    done
+    child=
+    [[ $signal_status == 0 ]] || exit "$signal_status"
+    if [[ $status == 0 ]]; then
+        if [[ -e $work/.retain-runtime ]]; then
+            retain_reason='for a detached terminal session'
+        else
+            preserve=0
+        fi
+    fi
+    exit "$status"
 fi
 exec "$APPDIR/usr/bin/chrootables-desktop" "$@"
 '''
@@ -108,7 +163,7 @@ def build(output, revision="1", force=False, appimagetool=None, runtime_file=Non
         work = Path(temporary)
         stage = stage_appimage(work / "AppDir", epoch, None if host_runtime else runtime_cache, machine)
         staged = work / package.name
-        environment = {**os.environ, "ARCH": machine,
+        environment = {**os.environ, "ARCH": machine, "TMPDIR": str(work),
                        "APPIMAGE_EXTRACT_AND_RUN": "1", "NO_APPSTREAM": "1", "TZ": "UTC"}
         # appimagetool adds timestamp options of its own when this variable is
         # set, conflicting with some bundled mksquashfs versions. Set both times

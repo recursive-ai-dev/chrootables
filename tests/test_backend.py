@@ -515,7 +515,7 @@ assert store.inventory()['images'][0]['status'] == 'ready'
         self.assertEqual(run.call_args.kwargs["user"], 2000)
         self.assertEqual(run.call_args.kwargs["group"], 2100)
         self.assertEqual(run.call_args.kwargs["extra_groups"], [2100, 2200, 2300])
-        self.assertEqual(run.call_args.args[0][:4], [sys.executable, "-I", "-S", "-c"])
+        self.assertEqual(run.call_args.args[0][:5], [sys.executable, "-I", "-S", "-B", "-c"])
 
     @unittest.skipIf(os.getuid() == 0, "Tests the user-side export writer")
     def test_export_delivers_and_refuses_overwrite(self):
@@ -546,7 +546,7 @@ assert store.inventory()['images'][0]['status'] == 'ready'
                 "os.open = checked_open\n"
                 "os.copy_file_range = unexpected_copy\n"
                 "shutil.copyfileobj = unexpected_copy\n")
-            argv[4] = argv[4].replace("source, destination =", injected + "source, destination =", 1)
+            argv[5] = argv[5].replace("source, destination =", injected + "source, destination =", 1)
             return real_run(argv, **kwargs)
         for kind in ("file", "symlink", "dangling-symlink", "directory"):
             with self.subTest(kind=kind):
@@ -585,7 +585,7 @@ assert store.inventory()['images'][0]['status'] == 'ready'
                                 "os.copy_file_range = unsupported_copy\n"
                                 "shutil.copyfileobj = failed_copy\n")
                     argv = list(argv)
-                    argv[4] = argv[4].replace("source, destination =", injected + "source, destination =", 1)
+                    argv[5] = argv[5].replace("source, destination =", injected + "source, destination =", 1)
                     return real_run(argv, **kwargs)
                 with patch("chrootables.backend.subprocess.run", side_effect=inject_copy_failure):
                     with self.assertRaisesRegex(RuntimeError, "saving the chosen copy failed"):
@@ -624,7 +624,7 @@ assert store.inventory()['images'][0]['status'] == 'ready'
                         if route == "named-link":
                             injected += "ctypes.CDLL = lambda *args, **kwargs: object()\n"
                         argv = list(argv)
-                        argv[4] = argv[4].replace("source, destination =", injected + "source, destination =", 1)
+                        argv[5] = argv[5].replace("source, destination =", injected + "source, destination =", 1)
                         return real_run(argv, **kwargs)
                     notices = []
                     with patch("chrootables.backend.subprocess.run", side_effect=inject_copy_observer):
@@ -661,7 +661,7 @@ assert store.inventory()['images'][0]['status'] == 'ready'
                                 "os.copy_file_range = interrupted_copy\n")
                     if named:
                         injected += NAMED_EXPORT_STAGING
-                    argv[4] = argv[4].replace("source, destination =", injected + "source, destination =", 1)
+                    argv[5] = argv[5].replace("source, destination =", injected + "source, destination =", 1)
                     return real_run(argv, **kwargs)
                 with patch("chrootables.backend.subprocess.run", side_effect=interrupt):
                     with self.assertRaises(RuntimeError) as error:
@@ -699,7 +699,7 @@ assert store.inventory()['images'][0]['status'] == 'ready'
                         injected += NAMED_EXPORT_STAGING
                         injected += "ctypes.CDLL = lambda *args, **kwargs: object()\n"
                     argv = list(argv)
-                    argv[4] = argv[4].replace("source, destination =", injected + "source, destination =", 1)
+                    argv[5] = argv[5].replace("source, destination =", injected + "source, destination =", 1)
                     return real_run(argv, **kwargs)
                 with patch("chrootables.backend.subprocess.run", side_effect=fail_publication):
                     with self.assertRaisesRegex(RuntimeError, "link publication denied"):
@@ -726,7 +726,7 @@ assert store.inventory()['images'][0]['status'] == 'ready'
                         "    return original_open(path, flags, *args, **kwargs)\n"
                         "os.open = checked_open\n")
                     argv = list(argv)
-                    argv[4] = argv[4].replace("source, destination =", injected + "source, destination =", 1)
+                    argv[5] = argv[5].replace("source, destination =", injected + "source, destination =", 1)
                     return real_run(argv, **kwargs)
                 with patch("chrootables.backend.subprocess.run", side_effect=fail_creation):
                     with self.assertRaisesRegex(RuntimeError, "injected creation failure"):
@@ -746,7 +746,7 @@ assert store.inventory()['images'][0]['status'] == 'ready'
             injected = ("def failed_sync(fd):\n"
                         "    raise OSError(5, 'I/O error')\n"
                         "os.fsync = failed_sync\n")
-            argv[4] = argv[4].replace("source, destination =", injected + "source, destination =", 1)
+            argv[5] = argv[5].replace("source, destination =", injected + "source, destination =", 1)
             return real_run(argv, **kwargs)
         with patch("chrootables.backend.subprocess.run", side_effect=fail_flush):
             with self.assertRaisesRegex(RuntimeError, "I/O error"):

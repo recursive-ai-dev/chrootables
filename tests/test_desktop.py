@@ -3,6 +3,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import tempfile
 import unittest
 import sys
+import json
+import shutil
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 from PySide6.QtWidgets import QApplication, QDialog
@@ -372,6 +375,63 @@ class DesktopTests(unittest.TestCase):
             external()
             self.assertEqual(command.call_args.args[0], "python-playground")
 
+    def test_external_terminal_retains_its_appimage_runtime_before_detaching(self):
+        self.enable_shared_folder_controls()
+        session = Path(self.directory.name) / "runtime session"
+        application = session / "squashfs-root/usr/lib/chrootables"
+        application.mkdir(parents=True)
+        alias = Path(self.directory.name) / "runtime alias"
+        alias.symlink_to(session, target_is_directory=True)
+        marker = session / ".retain-runtime"
+
+        def detached(*args):
+            self.assertTrue(marker.is_file(), "The runtime must be retained before authentication can start.")
+            self.assertEqual(marker.stat().st_mode & 0o777, 0o600)
+            return True, 123
+
+        with patch("chrootables.app.ROOT", application), \
+                patch.dict(os.environ, {"CHROOTABLE_APPIMAGE_SESSION_DIR": str(alias)}), \
+                patch("chrootables.app.TerminalWindow") as window, \
+                patch("chrootables.app.terminal_command", return_value=["terminal"]), \
+                patch("chrootables.app.QProcess.startDetached", side_effect=detached) as start:
+            self.window.open_terminal()
+            external = window.call_args.kwargs["external"]
+            external()
+            external()
+            self.assertEqual(start.call_count, 2)
+
+    def test_external_terminal_ignores_an_unrelated_inherited_runtime_directory(self):
+        self.enable_shared_folder_controls()
+        unrelated = Path(self.directory.name) / "unrelated"
+        unrelated.mkdir()
+        with patch.dict(os.environ, {"CHROOTABLE_APPIMAGE_SESSION_DIR": str(unrelated)}), \
+                patch("chrootables.app.TerminalWindow") as window, \
+                patch("chrootables.app.terminal_command", return_value=["terminal"]), \
+                patch("chrootables.app.QProcess.startDetached", return_value=(True, 123)) as start:
+            self.window.open_terminal()
+            window.call_args.kwargs["external"]()
+            start.assert_called_once()
+        self.assertEqual(list(unrelated.iterdir()), [])
+
+    def test_external_terminal_refuses_unsafe_runtime_retention_marker(self):
+        self.enable_shared_folder_controls()
+        session = Path(self.directory.name) / "runtime session"
+        application = session / "squashfs-root/usr/lib/chrootables"
+        application.mkdir(parents=True)
+        outside = Path(self.directory.name) / "untouched"
+        outside.write_text("keep")
+        (session / ".retain-runtime").symlink_to(outside)
+        with patch("chrootables.app.ROOT", application), \
+                patch.dict(os.environ, {"CHROOTABLE_APPIMAGE_SESSION_DIR": str(session)}), \
+                patch("chrootables.app.TerminalWindow") as window, \
+                patch("chrootables.app.terminal_command", return_value=["terminal"]), \
+                patch("chrootables.app.QProcess.startDetached") as start:
+            self.window.open_terminal()
+            with self.assertRaisesRegex(RuntimeError, "Could not preserve the AppImage runtime"):
+                window.call_args.kwargs["external"]()
+            start.assert_not_called()
+        self.assertEqual(outside.read_text(), "keep")
+
     def test_terminal_launch_failure_is_reported_without_registering_window(self):
         self.enable_shared_folder_controls()
         with patch("chrootables.app.TerminalWindow", side_effect=OSError("missing sudo")), \
@@ -508,18 +568,38 @@ class DesktopTests(unittest.TestCase):
                 self.window.changeEvent(event)
                 self.assertEqual(refresh.call_count, 2)
 
-    def test_client_starts_broker_in_isolated_no_site_mode(self):
+    def test_client_starts_broker_without_site_hooks_or_bytecode_writes(self):
         from PySide6.QtCore import QProcess
         with patch.object(QProcess, "start") as mock_start:
             self.window.client.start(writable=False)
             prog, args = mock_start.call_args[0]
             self.assertEqual(prog, sys.executable)
-            self.assertEqual(args[:2], ["-I", "-S"])
+            self.assertEqual(args[:3], ["-I", "-S", "-B"])
             self.window.client.start(writable=True)
             prog, args = mock_start.call_args[0]
             self.assertEqual(prog, "pkexec")
-            self.assertEqual(args[:3], [sys.executable, "-I", "-S"])
+            self.assertEqual(args[:4], [sys.executable, "-I", "-S", "-B"])
             self.assertEqual(args[-1], "--writable")
+
+    def test_client_broker_imports_leave_an_extracted_application_clean(self):
+        from PySide6.QtCore import QProcess
+        source = Path(__file__).resolve().parents[1]
+        application = Path(self.directory.name) / "extracted application"
+        shutil.copytree(source / "chrootables", application / "chrootables",
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        shutil.copy2(source / "chrootable-manager", application / "chrootable-manager")
+        with patch("chrootables.client.ROOT", application), \
+                patch.object(self.window.client, "store", str(Path(self.directory.name) / "empty store")), \
+                patch.object(QProcess, "start") as start:
+            self.window.client.start(writable=False)
+            program, args = start.call_args.args
+        result = subprocess.run([program, *args], input='{"id":1,"action":"inventory"}\n',
+                                capture_output=True, text=True, timeout=15, check=True)
+        reply = json.loads(result.stdout.splitlines()[-1])
+        self.assertTrue(reply["ok"], reply)
+        self.assertEqual(reply["data"]["images"], [])
+        self.assertEqual(list(application.rglob("__pycache__")), [])
+        self.assertEqual(list(application.rglob("*.pyc")), [])
 
     def test_workspace_actions_keep_target_while_dialog_processes_refresh(self):
         images = list(self.window.data["images"])

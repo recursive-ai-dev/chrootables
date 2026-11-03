@@ -187,6 +187,8 @@ def wheel_member(name):
             return parts[-1] in {"libcomposeplatforminputcontextplugin.so", "libibusplatforminputcontextplugin.so"}
         if parts[3] == "platformthemes":
             return parts[-1] == "libqxdgdesktopportal.so"
+        if parts[3] == "wayland-decoration-client":
+            return parts[-1] == "libbradient.so"
         return parts[3] in {"wayland-graphics-integration-client", "wayland-shell-integration"}
     return False
 

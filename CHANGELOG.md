@@ -8,6 +8,10 @@ are retained below as historical records.
 - Bundle pinned CPython and PySide6/Qt in the default AppImage, with runtime
   licenses, provenance, replacement instructions and matching source archives.
   Preserve an explicitly selected host-runtime build variant.
+- Isolate normal AppImage extraction per launch, clean successful exits and retain
+  interrupted or detached-session runtimes with explicit guidance. Suppress
+  privileged bytecode writes. Verify Wayland client decorations and headless
+  rendering alongside offscreen and X11.
 - Add native ARM64 test, Debian installation, AppImage and privileged integration
   coverage, alongside the existing x86_64 targets.
 - Configure signed Debian updates/security sources for official mirrors and

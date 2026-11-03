@@ -144,7 +144,9 @@ class Client(QObject):
         self._failed = False
         process = QProcess(self)
         self.process = process
-        args = ["-I", "-S", str(ROOT / "chrootables" / "broker.py"), "--store", self.store]
+        # Privileged imports must not leave root-owned bytecode in a user's
+        # extracted AppImage, which would prevent normal runtime cleanup.
+        args = ["-I", "-S", "-B", str(ROOT / "chrootables" / "broker.py"), "--store", self.store]
         if writable:
             program, args = "pkexec", [sys.executable, *args, "--writable"]
         else:

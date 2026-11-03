@@ -6,7 +6,9 @@ from datetime import datetime
 from functools import lru_cache
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
+import stat
 import sys
 import time
 
@@ -1727,6 +1729,22 @@ class Window(QMainWindow):
 
         def open_external():
             external = terminal_command(target, self.store, **keyword)
+            # A detached terminal can outlive the GUI, including while sudo is
+            # waiting for authentication. Keep this launch's extracted manager.
+            runtime_session = os.environ.get("CHROOTABLE_APPIMAGE_SESSION_DIR")
+            if runtime_session:
+                try:
+                    runtime_path = Path(runtime_session).resolve()
+                    if ROOT == runtime_path / "squashfs-root/usr/lib/chrootables":
+                        descriptor = os.open(runtime_path / ".retain-runtime",
+                                             os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+                        try:
+                            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                                raise OSError("The runtime retention marker is not a regular file.")
+                        finally:
+                            os.close(descriptor)
+                except OSError as error:
+                    raise RuntimeError("Could not preserve the AppImage runtime for an external terminal: " + str(error)) from error
             started, _ = QProcess.startDetached(external[0], external[1:])
             if not started:
                 raise RuntimeError("Could not start the terminal.")

@@ -385,7 +385,7 @@ finally:
         options = ({"user": uid, "group": account.pw_gid,
                     "extra_groups": os.getgrouplist(account.pw_name, account.pw_gid)}
                    if os.geteuid() == 0 else {})
-        result = subprocess.run([sys.executable, "-I", "-S", "-c", script, str(source), str(target)],
+        result = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", script, str(source), str(target)],
                                 pass_fds=(source,), capture_output=True, text=True, **options)
         if result.returncode:
             detail = result.stderr.strip() or (

@@ -37,7 +37,7 @@ def check(prefix):
         report = run(manager, "--doctor", "--json")
         if report.returncode not in (0, 1) or json.loads(report.stdout)["schema_version"] != 1:
             raise RuntimeError("Installed host diagnostics failed.")
-        broker = run(interpreter, "-I", "-S", application / "chrootables/broker.py",
+        broker = run(interpreter, "-I", "-S", "-B", application / "chrootables/broker.py",
                      "--store", store,
                      input='{"id":1,"action":"inventory"}\n{"id":2,"action":"doctor"}\n', check=True)
         messages = [json.loads(line) for line in broker.stdout.splitlines()]

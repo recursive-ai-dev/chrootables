@@ -47,7 +47,7 @@ host Python or PySide6. ARM64 hosts use the `aarch64` artifact. Linux glibc and
 normal desktop graphics libraries are still required (glibc 2.34+ on x86_64,
 2.39+ on ARM64). Debian 13, Ubuntu 26.04 and Fedora provide suitable runtimes.
 The `--host-runtime` build variant uses distribution Python/Qt instead and has a
-distinct filename.
+distinct `-host-runtime.AppImage` filename; both architectures have compatibility artifacts.
 
 On a minimal Ubuntu/Debian desktop, install graphics dependencies with:
 
@@ -61,7 +61,17 @@ sudo apt install libgl1 libegl1 libfontconfig1 libfreetype6 libglib2.0-0t64 \
 
 Workspace operations require the Linux prerequisites described below. The launcher
 extracts before administrator authentication so the helper can access its bundled
-interpreter outside a user-only FUSE mount. Use `--demo` for a read-only tour.
+interpreter outside a user-only FUSE mount. Normal launches use a private extraction
+and remove it after a successful exit without external-terminal handoff. An
+abnormal exit or detached terminal retains that directory, with its path reported,
+so the terminal or a surviving helper can finish safely. Remove retained
+files only after its operations and sessions have ended. Use `--demo` for a read-only tour.
+
+If FUSE is unavailable, use `--appimage-extract` in a directory you own and run
+`squashfs-root/AppRun`. Keep that directory while the application or its operations
+are running. If you choose the upstream `--appimage-extract-and-run` mode instead,
+set `TMPDIR` to a private directory: the upstream runtime otherwise shares a
+content-based extraction path across users.
 Runtime licenses, provenance and replacement instructions ship inside the AppImage;
 the matching `runtime-sources.tar.gz` release asset contains upstream source inputs.
 

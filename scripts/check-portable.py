@@ -13,9 +13,9 @@ def check(stage, *, export=False):
     application = stage / "usr/lib/chrootables"
     runtime = application / "runtime"
     if not Path(sys.executable).resolve().is_relative_to(runtime.resolve()):
-        raise RuntimeError("Run this checker with the bundled runtime/bin/python3 -I.")
-    if not sys.flags.isolated:
-        raise RuntimeError("The bundled runtime must run in isolated mode.")
+        raise RuntimeError("Run this checker with the bundled runtime/bin/python3 -I -B.")
+    if not sys.flags.isolated or not sys.flags.dont_write_bytecode:
+        raise RuntimeError("The bundled runtime must run in isolated mode without bytecode writes (-I -B).")
     import PySide6
     from PySide6 import QtCore, QtGui, QtWidgets
     for module in (PySide6, QtCore, QtGui, QtWidgets):
@@ -36,7 +36,7 @@ def check(stage, *, export=False):
         marker = work / "injected"
         injected.write_text(f"open({str(marker)!r}, 'w').write('unsafe')\n")
         environment = {**os.environ, "PYTHONPATH": str(work), "PYTHONHOME": str(work)}
-        result = subprocess.run([sys.executable, "-I", "-S", str(application / "chrootables/broker.py"),
+        result = subprocess.run([sys.executable, "-I", "-S", "-B", str(application / "chrootables/broker.py"),
                                  "--store", str(work / "store")], env=environment,
                                 input='{"id":1,"action":"inventory"}\n', capture_output=True,
                                 text=True, check=True, timeout=30)
@@ -60,6 +60,10 @@ def check(stage, *, export=False):
                 raise RuntimeError("Bundled export writer did not preserve data.")
             if list(target.glob(".chrootables-export-*")):
                 raise RuntimeError("Bundled export writer leaked a staged file.")
+    cache = next((path for path in stage.rglob("*")
+                  if path.name == "__pycache__" or path.suffix == ".pyc"), None)
+    if cache is not None:
+        raise RuntimeError(f"Bundled helper/export wrote bytecode into the distribution: {cache}")
     extra = ", export" if export else ""
     print(f"Bundled Python {sys.version.split()[0]}, Qt {PySide6.__version__}: isolation, dependencies, helper{extra} passed.")
 
