@@ -172,13 +172,13 @@ Findings follow traced execution paths, with security and data integrity first, 
 ## SPR-14 — Release verification/documentation
 
 - Priority / severity: **P2 / Medium**
-- Status: **IN_PROGRESS**
+- Status: **VERIFIED**
 - Problem / evidence: The next release needs updated metadata, complete regression evidence and distribution artifacts from the changed source.
 - Implementation: Prepare 1.2.2, run regression/privileged integration, independent diff review, build reproducibly, checksum, commit/push main and publish with gh.
 - Acceptance: Release contains verified DEB/RPM/x86_64 AppImage and checksums; limitations and exact commit are recorded.
 - Required tests: Full check suite, package smoke/reproducibility, root integration and remote release asset verification.
 - Dependencies: SPR-01 through SPR-13, SPR-15, SPR-16
-- Verification evidence: all local checks passed: 343 tests, both privileged integration profiles, independent audit, reproducible DEB/RPM/AppImage builds, SHA-256 and extracted/direct startup checks. Awaiting commit push, version-tag CI and publication.
+- Verification evidence: all local checks passed: 343 tests, both privileged integration profiles, independent audit, reproducible DEB/RPM/AppImage builds, SHA-256 and extracted/direct startup checks. Release commit `7ad336042a7a15007646655b11eb4937723028ed` pushed to main; all four [tag CI jobs](https://github.com/recursive-ai-dev/chrootables/actions/runs/41713867116) passed. [v1.2.2](https://github.com/recursive-ai-dev/chrootables/releases/tag/v1.2.2) published with eight assets, downloaded again and matched byte-for-byte against local verified files.
 
 ## Baseline verification
 
@@ -189,4 +189,5 @@ Initial local check: 191 discovered tests, 2 import errors because system PySide
 343 tests passed with no skips. Both privileged integration profiles passed.
 Syntax checks, demos, benchmark budgets, three-format reproducibility and package
 startup passed. See `docs/SPRINT-1.2.2.md` for measurements and environment.
-Release delivery remains IN_PROGRESS until remote artifacts are verified.
+All 16 improvements are VERIFIED. No blocked or incomplete sprint tasks remain.
+Release artifacts and checksums were independently downloaded and verified after publication.

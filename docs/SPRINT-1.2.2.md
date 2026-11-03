@@ -84,4 +84,12 @@ source files are preserved on failure.
   SOURCE_DATE_EPOCH=1793059200; AppImage tool/runtime use repository hash pins.
 - Three independent review passes plus final diff/whitespace and secret-pattern
   inspection completed. No known critical regressions remain.
-- Publication is pending final tag CI; its result is recorded after publication.
+- [Final tag CI](https://github.com/recursive-ai-dev/chrootables/actions/runs/41713867116) passed Fedora, Debian, AppImage and privileged
+  minimal/Python integration on commit `7ad336042a7a15007646655b11eb4937723028ed`.
+  Native CI also passed installation, upgrade and removal checks.
+- [Release v1.2.2](https://github.com/recursive-ai-dev/chrootables/releases/tag/v1.2.2) is published with eight expected assets.
+  All assets were downloaded again; binary SHA-256 verification passed and every
+  downloaded file matched its local verified original byte-for-byte.
+- All 16 sprint improvements are VERIFIED, with no blocked or incomplete tasks.
+  A subsequent documentation-only commit records this publication evidence; the
+  release tag identifies the tested application source and distributed artifacts.
