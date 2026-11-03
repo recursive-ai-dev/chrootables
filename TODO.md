@@ -103,14 +103,14 @@ Nine meaningful follow-up improvements were identified from actual remaining lim
 ## REL-06 — Release preparation and verification
 
 - Priority / severity: **P2 / Medium**
-- Status: **IN_PROGRESS**
+- Status: **VERIFIED**
 - Affected components: Version metadata, docs, artifacts and GitHub release.
 - Problem / evidence: New mitigation work needs final release evidence beyond 1.2.2.
 - Implementation: Prepare 1.3.0 with full regression, independent review, supported artifacts, checksums/provenance and release publication.
 - Acceptance: All feasible tasks verified; final CI and downloaded release assets pass; limitations documented precisely.
 - Required tests: Full local suite, native CI, reproducible builds and post-publication checksum verification.
 - Dependencies: REL-01 through REL-05, REL-07, REL-08, REL-09
-- Verification evidence: 388 local tests passed with zero skips; all seven native CI jobs passed on 3e99b6d (run 41719520388). Local reproducibility and final portable startup checks passed. Tag publication and downloaded-release verification pending.
+- Verification evidence: 388 local tests passed with zero skips. All seven exact-tag CI jobs passed (run 41720548404) on be038d6. Release v1.3.0 is public/latest with 16 expected assets; every asset was downloaded and matched the verified original, and all checksum files passed. Nine engineering improvements are VERIFIED; ENV-01 remains an external local-cleanup blocker.
 
 ## ENV-01 — Remove obsolete root-owned verification fixture
 

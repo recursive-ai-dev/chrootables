@@ -82,7 +82,7 @@ about whole-application speed; filesystem, cache and system load affect results.
   Weston/pixman Wayland rendering with client decorations.
 - [Release-validation CI](https://github.com/recursive-ai-dev/chrootables/actions/runs/41719520388) passed all seven jobs on `3e99b6d`: native x86_64/ARM64
   tests, installation/upgrade/removal, privileged integration and both AppImage
-  variants. Final tag/publication evidence will be recorded after completion.
+  variants. Final tag/publication evidence is recorded below.
 - Local DEB, RPM, bundled/compatibility x86_64 AppImages and runtime source bundle
   reproduced byte-for-byte across directories and umasks 022/077. The release RPM
   is selected from Fedora CI, where that exact package passed installation tests;
@@ -114,3 +114,33 @@ An obsolete root-owned extraction from an earlier verification run remains at
 expired before cleanup. This is ENV-01 in TODO.md, isolated from the release and
 repository. The corrected harness and final default launches clean their own
 paths. No credentials or authentication bypass were used.
+
+## Publication verification
+
+- [Exact-tag CI](https://github.com/recursive-ai-dev/chrootables/actions/runs/41720548404)
+  passed all seven jobs on `be038d6db2123fabeb518ba882acbdc2ab45f17b`.
+  This tag adds only audit/TODO documentation to the locally tested application
+  source `3e99b6d1be22bd80eb082a8ab4a12838d28015a9`.
+- [Release v1.3.0](https://github.com/recursive-ai-dev/chrootables/releases/tag/v1.3.0)
+  was published on 2026-11-03 and verified as the latest public release. It has
+  exactly 16 expected assets. Every asset was downloaded after publication and
+  matched the verified original byte-for-byte; SHA256SUMS and all seven individual
+  checksum sidecars passed. The x86_64 CI AppImages match local builds, and the
+  architecture-independent DEB matches both native CI architectures exactly.
+- Nine engineering improvements are VERIFIED. ENV-01 remains blocked solely by
+  expired local sudo authentication; it does not affect any release artifact.
+- A subsequent documentation-only commit records this publication evidence;
+  the release tag continues to identify the tested source and distributed payload.
+
+| Artifact | Bytes | Execution validation |
+| --- | ---: | --- |
+| chrootables_1.3.0-1_all.deb | 104852 | Debian trixie, native x86_64 and ARM64 |
+| chrootables-1.3.0-1.noarch.rpm | 113525 | Fedora, native x86_64 |
+| Chrootables-1.3.0-1-x86_64.AppImage | 59271672 | Ubuntu 26.04 local/native CI; no-host GUI/helper/export |
+| Chrootables-1.3.0-1-aarch64.AppImage | 53611016 | Ubuntu 26.04 native ARM64 CI; no-host GUI/helper/export |
+| Chrootables-1.3.0-1-x86_64-host-runtime.AppImage | 1059320 | Local and native x86_64 CI |
+| Chrootables-1.3.0-1-aarch64-host-runtime.AppImage | 1051144 | Native ARM64 CI |
+| Chrootables-1.3.0-runtime-sources.tar.gz | 120703170 | All pinned source hashes/licenses; identical across architectures |
+
+Each binary/source archive has a checksum sidecar. BUILDINFO.txt and SHA256SUMS
+complete the 16-asset release. No Windows/macOS or physical GPU validation is claimed.
