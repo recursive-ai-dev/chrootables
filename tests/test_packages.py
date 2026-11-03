@@ -1,4 +1,4 @@
-"""Release artifact contracts shared by DEB, RPM and the host-runtime AppImage."""
+"""Release artifact contracts shared by DEB, RPM and portable AppImages."""
 import gzip
 import importlib.util
 import json
@@ -28,6 +28,7 @@ APPIMAGE = module("build_appimage", "build-appimage.py")
 PACKAGES = module("build_packages", "build-packages.py")
 APPIMAGETOOL = os.environ.get("APPIMAGETOOL") or shutil.which("appimagetool")
 RUNTIME = os.environ.get("APPIMAGE_RUNTIME_FILE")
+PORTABLE_RUNTIME = os.environ.get("CHROOTABLE_APPIMAGE_RUNTIME")
 RPM_TOOLS = all(shutil.which(name) for name in ("rpmbuild", "rpm", "rpm2cpio", "cpio"))
 
 
@@ -271,6 +272,29 @@ class SharedPackagingTests(unittest.TestCase):
             self.assertIn("pinned runtime is required", result.stderr)
             self.assertFalse(output.exists())
 
+    def test_bundled_appimage_requires_pinned_python_qt_before_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "runtime"
+            runtime.write_bytes(b"test runtime")
+            environment = {**os.environ, "APPIMAGETOOL": "/bin/true", "APPIMAGE_RUNTIME_FILE": str(runtime)}
+            environment.pop("CHROOTABLE_APPIMAGE_RUNTIME", None)
+            output = root / "output"
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "scripts/build-appimage.py"), "--output", str(output)],
+                env=environment, text=True, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Python/Qt runtime cache is required", result.stderr)
+            self.assertFalse(output.exists())
+
+    def test_explicit_host_runtime_retains_version_checks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stage = APPIMAGE.stage_appimage(Path(directory) / "AppDir", support.DEFAULT_EPOCH)
+            launcher = (stage / "AppRun").read_text()
+            self.assertIn("sys.version_info < (3, 10)", launcher)
+            self.assertIn("PySide6.__version_info__ < (6, 8)", launcher)
+            self.assertFalse((stage / "usr/lib/chrootables/runtime").exists())
+
     def test_format_selection_defaults_and_conflicting_options(self):
         choices = (([], ("deb", "rpm")), (["--all"], ("deb", "rpm", "appimage")),
                    (["--appimage-only"], ("appimage",)), (["--rpm-only"], ("rpm",)),
@@ -306,6 +330,10 @@ class ArtifactTests:
             first, = (root / "first").glob(self.pattern)
             second, = (root / "second with spaces").glob(self.pattern)
             self.assertEqual(first.read_bytes(), second.read_bytes())
+            if self.kind == "appimage":
+                first_source, = (root / "first").glob("*-runtime-sources.tar.gz")
+                second_source, = (root / "second with spaces").glob("*-runtime-sources.tar.gz")
+                self.assertEqual(support.file_digest(first_source), support.file_digest(second_source))
             checksum = first.with_suffix(first.suffix + ".sha256")
             previous_checksum = checksum.read_bytes()
             first.write_bytes(b"previous artifact")
@@ -343,7 +371,8 @@ class RpmPackageTests(ArtifactTests, unittest.TestCase):
                             "--prefix", str(stage / "usr")], check=True, capture_output=True, timeout=45)
 
 
-@unittest.skipUnless(APPIMAGETOOL and RUNTIME, "requires APPIMAGETOOL and APPIMAGE_RUNTIME_FILE")
+@unittest.skipUnless(APPIMAGETOOL and RUNTIME and PORTABLE_RUNTIME,
+                     "requires APPIMAGETOOL, APPIMAGE_RUNTIME_FILE and CHROOTABLE_APPIMAGE_RUNTIME")
 class AppImagePackageTests(ArtifactTests, unittest.TestCase):
     kind = "appimage"
     pattern = "*.AppImage"
@@ -363,6 +392,16 @@ class AppImagePackageTests(ArtifactTests, unittest.TestCase):
             stage = root / "squashfs-root"
             if (ROOT / "LICENSE").exists():
                 self.assertEqual((stage / "LICENSE").read_bytes(), (ROOT / "LICENSE").read_bytes())
+            bundled = stage / "usr/lib/chrootables/runtime/bin/python3"
+            self.assertTrue(os.access(bundled, os.X_OK))
+            source, = root.glob("*-runtime-sources.tar.gz")
+            with tarfile.open(source) as archive:
+                sources = set(archive.getnames())
+                self.assertIn("Python-3.13.18.tar.xz", sources)
+                self.assertIn("qtbase-everywhere-src-6.11.2.tar.xz", sources)
+                self.assertIn("icu4c-73_2-src.tgz", sources)
+            subprocess.run([str(bundled), "-I", str(ROOT / "scripts/check-portable.py"), str(stage)],
+                           env=environment, check=True, capture_output=True, timeout=45)
             subprocess.run(["/usr/bin/python3", str(ROOT / "scripts/check-installed.py"),
                             "--prefix", str(stage / "usr")], check=True, capture_output=True, timeout=45)
             screenshot = root / "runtime-demo.png"

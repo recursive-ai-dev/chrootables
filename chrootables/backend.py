@@ -14,6 +14,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -297,7 +298,7 @@ def _probe_lock_status(lock_path):
         os.close(fd)
 
 
-def deliver_export(archive, destination):
+def deliver_export(archive, destination, output=None):
     """Open the archive as root; create the user's destination after dropping privileges."""
     target = Path(destination)
     if not target.is_absolute():
@@ -313,6 +314,7 @@ parent, filename = os.path.split(destination)
 directory = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
 temporary = ".chrootables-export-" + uuid.uuid4().hex
 created = False
+anonymous = False
 try:
     # Refuse an existing name before copying; the no-replace publication below
     # still protects against a destination created while the copy is running.
@@ -322,9 +324,19 @@ try:
         pass
     else:
         raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), destination)
-    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                 0o600, dir_fd=directory)
-    created = True
+    try:
+        fd = os.open(".", os.O_WRONLY | os.O_TMPFILE, 0o600, dir_fd=directory)
+        anonymous = True
+    except (AttributeError, OSError) as error:
+        if isinstance(error, OSError) and error.errno not in (
+                errno.EOPNOTSUPP, errno.EINVAL, errno.EISDIR, errno.ENOENT, errno.ENOSYS):
+            raise
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o600, dir_fd=directory)
+        created = True
+        print("This destination cannot automatically remove an export interrupted by a crash. "
+              "If the export stops abruptly, remove only its temporary file after it has stopped: "
+              + repr(os.path.join(parent, temporary)), file=sys.stderr, flush=True)
     with os.fdopen(fd, "wb") as output, os.fdopen(source, "rb") as archive:
         try:
             while True:
@@ -334,25 +346,32 @@ try:
             shutil.copyfileobj(archive, output, 1024 * 1024)
         output.flush()
         os.fsync(output.fileno())
-    # Linux's no-replace rename also works on removable filesystems without
-    # hard links. Older libc/kernel combinations can use a no-replace link.
-    rename = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
-    renamed = False
-    if rename is not None:
-        rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
-                           ctypes.c_char_p, ctypes.c_uint]
-        rename.restype = ctypes.c_int
-        if rename(directory, os.fsencode(temporary), directory, os.fsencode(filename), 1) == 0:
-            renamed = True
-        elif ctypes.get_errno() not in (errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP):
-            code = ctypes.get_errno()
-            raise OSError(code, os.strerror(code), destination)
-    if not renamed:
-        os.link(temporary, filename, src_dir_fd=directory, dst_dir_fd=directory,
-                follow_symlinks=False)
-        os.unlink(temporary, dir_fd=directory)
-    created = False
-    os.fsync(directory)
+        if anonymous:
+            # Linking through procfs does not require CAP_DAC_READ_SEARCH. Keep
+            # the descriptor open until publication; SIGKILL before this point
+            # releases the unnamed inode without leaving any staging pathname.
+            os.link("/proc/self/fd/" + str(output.fileno()), filename,
+                    dst_dir_fd=directory, follow_symlinks=True)
+        else:
+            # No-replace rename also works on removable filesystems without
+            # hard links. Older libc/kernel combinations can use a link.
+            rename = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
+            renamed = False
+            if rename is not None:
+                rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+                                   ctypes.c_char_p, ctypes.c_uint]
+                rename.restype = ctypes.c_int
+                if rename(directory, os.fsencode(temporary), directory, os.fsencode(filename), 1) == 0:
+                    renamed = True
+                elif ctypes.get_errno() not in (errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP):
+                    code = ctypes.get_errno()
+                    raise OSError(code, os.strerror(code), destination)
+            if not renamed:
+                os.link(temporary, filename, src_dir_fd=directory, dst_dir_fd=directory,
+                        follow_symlinks=False)
+                os.unlink(temporary, dir_fd=directory)
+            created = False
+        os.fsync(directory)
 finally:
     try:
         if created:
@@ -366,10 +385,15 @@ finally:
         options = ({"user": uid, "group": account.pw_gid,
                     "extra_groups": os.getgrouplist(account.pw_name, account.pw_gid)}
                    if os.geteuid() == 0 else {})
-        result = subprocess.run(["/usr/bin/python3", "-I", "-S", "-c", script, str(source), str(target)],
+        result = subprocess.run([sys.executable, "-I", "-S", "-c", script, str(source), str(target)],
                                 pass_fds=(source,), capture_output=True, text=True, **options)
         if result.returncode:
-            raise RuntimeError("Archive created, but saving the chosen copy failed: " + result.stderr.strip())
+            detail = result.stderr.strip() or (
+                "Export writer stopped with signal " + str(-result.returncode) + "."
+                if result.returncode < 0 else "Export writer exited with status " + str(result.returncode) + ".")
+            raise RuntimeError("Archive created, but saving the chosen copy failed: " + detail)
+        if output is not None and result.stderr:
+            output(result.stderr)
     finally:
         os.close(source)
 
@@ -948,7 +972,7 @@ class Store:
         if process.returncode == 0 and action == "export" and params.get("destination"):
             if len(archives) != 1:
                 raise RuntimeError("Could not identify the completed export archive.")
-            deliver_export(archives[0], params["destination"])
+            deliver_export(archives[0], params["destination"], output=output)
             output("Saved export: " + params["destination"] + "\n")
         return process.returncode
 

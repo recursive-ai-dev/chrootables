@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Explicitly fetch checksum-pinned x86_64 AppImage tools; no installation."""
+"""Explicitly fetch checksum-pinned native AppImage tools; no installation."""
 import argparse
 import hashlib
 import os
@@ -18,6 +18,14 @@ TOOLS = {
     "runtime-x86_64": (
         "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64",
         "617aa77314d57c8b8e4fae9c3f0b35af7b30d5529cb69e98f64f92510ed98a46"),
+}
+ARM_TOOLS = {
+    "appimagetool-1.9.1-aarch64.AppImage": (
+        "https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-aarch64.AppImage",
+        "f0837e7448a0c1e4e650a93bb3e85802546e60654ef287576f46c71c126a9158"),
+    "runtime-aarch64": (
+        "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-aarch64",
+        "9a72a744d221576c9347ec074243acc5c3c7568896b12714e0e82e9f0bf47900"),
 }
 MAX_TOOL_BYTES = 64 * 1024 * 1024
 
@@ -49,11 +57,14 @@ def validate_cached_tool(path, expected):
     return True
 
 
-def fetch(output):
-    if platform.machine() not in ("x86_64", "amd64"):
-        raise ValueError("These pinned release tools support x86_64 hosts only.")
+def fetch(output, architecture=None):
+    machine = (architecture or platform.machine()).lower()
+    machine = {"amd64": "x86_64", "arm64": "aarch64"}.get(machine, machine)
+    if machine not in ("x86_64", "aarch64"):
+        raise ValueError("Pinned release tools support x86_64 and aarch64 only.")
+    selected = TOOLS if machine == "x86_64" else ARM_TOOLS
     output.mkdir(parents=True, exist_ok=True)
-    for filename, (url, expected) in TOOLS.items():
+    for filename, (url, expected) in selected.items():
         destination = output / filename
         if validate_cached_tool(destination, expected):
             print(destination)
@@ -95,8 +106,10 @@ def fetch(output):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--architecture", choices=("x86_64", "aarch64"),
+                        help="download tools for this architecture (default: host)")
     arguments = parser.parse_args()
     try:
-        fetch(arguments.output.resolve())
+        fetch(arguments.output.resolve(), arguments.architecture)
     except (OSError, ValueError) as error:
         parser.exit(1, f"Build tool download failed: {error}\n")

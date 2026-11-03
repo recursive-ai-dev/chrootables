@@ -12,6 +12,8 @@ def check(prefix):
     application = prefix / "lib/chrootables"
     manager = prefix / "bin/chrootable-manager"
     desktop = prefix / "bin/chrootables-desktop"
+    bundled_python = application / "runtime/bin/python3"
+    interpreter = bundled_python if bundled_python.is_file() else Path("/usr/bin/python3")
     for executable in (manager, desktop):
         if not executable.is_file() or not os.access(executable, os.X_OK):
             raise RuntimeError(f"Missing package executable: {executable}")
@@ -35,7 +37,7 @@ def check(prefix):
         report = run(manager, "--doctor", "--json")
         if report.returncode not in (0, 1) or json.loads(report.stdout)["schema_version"] != 1:
             raise RuntimeError("Installed host diagnostics failed.")
-        broker = run("/usr/bin/python3", "-I", "-S", application / "chrootables/broker.py",
+        broker = run(interpreter, "-I", "-S", application / "chrootables/broker.py",
                      "--store", store,
                      input='{"id":1,"action":"inventory"}\n{"id":2,"action":"doctor"}\n', check=True)
         messages = [json.loads(line) for line in broker.stdout.splitlines()]

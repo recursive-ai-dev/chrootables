@@ -17,6 +17,18 @@ from chrootables.backend import OperationCancelled, Store, build_command, name, 
 from chrootables.broker import serve
 
 
+# Run the actual unprivileged export program on its compatibility route without
+# requiring a removable filesystem in the unit-test environment.
+NAMED_EXPORT_STAGING = (
+    "original_open = os.open\n"
+    "def named_staging_open(path, flags, *args, **kwargs):\n"
+    "    if flags & os.O_TMPFILE == os.O_TMPFILE:\n"
+    "        raise OSError(errno.EOPNOTSUPP, 'anonymous files unsupported')\n"
+    "    return original_open(path, flags, *args, **kwargs)\n"
+    "os.open = named_staging_open\n"
+)
+
+
 class ValidationTests(unittest.TestCase):
     def test_rejects_path_traversal_and_shell_input(self):
         for value in ("../root", "/tmp/image", "-option", "a;b", "$(id)", "a\nb", "", "a" * 65, None):
@@ -247,11 +259,12 @@ class StoreTests(unittest.TestCase):
         archive = self.path / "exports/lab.tar.gz"
         process = Mock(stdout=io.StringIO(str(archive) + "\n"), returncode=0)
         process.poll.return_value = 0
+        output = Mock()
         with patch("chrootables.backend.subprocess.Popen", return_value=process), \
                 patch("chrootables.backend.deliver_export") as deliver:
             self.assertEqual(store.operate("export", {"name": "lab", "destination": "/tmp/saved.tar.gz"},
-                                          lambda _: None), 0)
-        deliver.assert_called_once_with(archive, "/tmp/saved.tar.gz")
+                                          output), 0)
+        deliver.assert_called_once_with(archive, "/tmp/saved.tar.gz", output=output)
         log = self.path / "logs/lab.log"
         log.write_text("operation output")
         (self.path / "activity.tsv").write_text(f"now\texport\tlab\tok\t{log}\n")
@@ -502,6 +515,7 @@ assert store.inventory()['images'][0]['status'] == 'ready'
         self.assertEqual(run.call_args.kwargs["user"], 2000)
         self.assertEqual(run.call_args.kwargs["group"], 2100)
         self.assertEqual(run.call_args.kwargs["extra_groups"], [2100, 2200, 2300])
+        self.assertEqual(run.call_args.args[0][:4], [sys.executable, "-I", "-S", "-c"])
 
     @unittest.skipIf(os.getuid() == 0, "Tests the user-side export writer")
     def test_export_delivers_and_refuses_overwrite(self):
@@ -581,61 +595,86 @@ assert store.inventory()['images'][0]['status'] == 'ready'
                 self.assertEqual(list(self.path.glob(".chrootables-export-*")), [])
 
     @unittest.skipIf(os.getuid() == 0, "Tests the user-side export writer")
-    def test_export_publication_is_atomic_on_both_publication_routes(self):
+    def test_export_publication_is_atomic_on_all_publication_routes(self):
         source = self.path / "source.tar.gz"
         source.write_bytes(b"complete archive")
         target = self.path / "saved.tar.gz"
         real_run = subprocess.run
-        for fallback in (False, True):
+        for route in ("anonymous", "named-rename", "named-link"):
             for competitor in (False, True):
-                with self.subTest(fallback=fallback, competitor=competitor):
+                with self.subTest(route=route, competitor=competitor):
                     def inject_copy_observer(argv, **kwargs):
                         injected = (
                             "original_copy = os.copy_file_range\n"
+                            "observed_copy = False\n"
                             "def observe_copy(*args):\n"
-                            "    assert not os.path.exists(sys.argv[2]), 'partial destination visible'\n"
-                            "    return original_copy(*args)\n"
+                            "    global observed_copy\n"
+                            "    if not observed_copy:\n"
+                            "        assert not os.path.exists(sys.argv[2]), 'partial destination visible'\n"
+                            f"        assert os.fstat(args[1]).st_nlink == {0 if route == 'anonymous' else 1}\n"
+                            "    result = original_copy(*args)\n"
+                            f"    if {competitor!r} and not observed_copy:\n"
+                            "        with open(sys.argv[2], 'xb') as other:\n"
+                            "            other.write(b'competitor')\n"
+                            "    observed_copy = True\n"
+                            "    return result\n"
                             "os.copy_file_range = observe_copy\n")
-                        if fallback:
+                        if route.startswith("named"):
+                            injected += NAMED_EXPORT_STAGING
+                        if route == "named-link":
                             injected += "ctypes.CDLL = lambda *args, **kwargs: object()\n"
                         argv = list(argv)
                         argv[4] = argv[4].replace("source, destination =", injected + "source, destination =", 1)
-                        if competitor:
-                            argv[4] = argv[4].replace(
-                                "    rename = getattr", "    with open(destination, 'xb') as other:\n"
-                                "        other.write(b'competitor')\n    rename = getattr", 1)
                         return real_run(argv, **kwargs)
+                    notices = []
                     with patch("chrootables.backend.subprocess.run", side_effect=inject_copy_observer):
                         if competitor:
                             with self.assertRaisesRegex(RuntimeError, "saving the chosen copy failed"):
-                                deliver_export(source, target)
+                                deliver_export(source, target, output=notices.append)
                         else:
-                            deliver_export(source, target)
+                            deliver_export(source, target, output=notices.append)
+                            self.assertEqual(bool(notices), route.startswith("named"))
+                            if notices:
+                                self.assertIn("remove only its temporary file", "".join(notices))
                     self.assertEqual(target.read_bytes(), b"competitor" if competitor else b"complete archive")
+                    if not competitor:
+                        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+                        self.assertEqual(target.stat().st_uid, os.getuid())
                     self.assertEqual(list(self.path.glob(".chrootables-export-*")), [])
                     target.unlink()
 
     @unittest.skipIf(os.getuid() == 0, "Tests the user-side export writer")
-    def test_export_abrupt_writer_exit_never_exposes_partial_final_archive(self):
+    def test_export_sigkill_cleans_anonymous_staging_and_identifies_fallback_residue(self):
         source = self.path / "source.tar.gz"
         source.write_bytes(b"archive payload")
         target = self.path / "saved.tar.gz"
         real_run = subprocess.run
-        def interrupt(argv, **kwargs):
-            argv = list(argv)
-            injected = ("def interrupted_copy(source, destination, size):\n"
-                        "    os.write(destination, b'partial')\n"
-                        "    os._exit(17)\n"
-                        "os.copy_file_range = interrupted_copy\n")
-            argv[4] = argv[4].replace("source, destination =", injected + "source, destination =", 1)
-            return real_run(argv, **kwargs)
-        with patch("chrootables.backend.subprocess.run", side_effect=interrupt):
-            with self.assertRaises(RuntimeError):
-                deliver_export(source, target)
-        self.assertFalse(target.exists())
-        self.assertEqual(source.read_bytes(), b"archive payload")
-        # Uncatchable death may leave a recognizable staging file, never a final archive.
-        self.assertEqual(len(list(self.path.glob(".chrootables-export-*"))), 1)
+        for named in (False, True):
+            with self.subTest(named=named):
+                def interrupt(argv, **kwargs):
+                    argv = list(argv)
+                    injected = ("import signal\n"
+                                "def interrupted_copy(source, destination, size):\n"
+                                "    os.write(destination, b'partial')\n"
+                                f"    assert os.fstat(destination).st_nlink == {1 if named else 0}\n"
+                                "    os.kill(os.getpid(), signal.SIGKILL)\n"
+                                "os.copy_file_range = interrupted_copy\n")
+                    if named:
+                        injected += NAMED_EXPORT_STAGING
+                    argv[4] = argv[4].replace("source, destination =", injected + "source, destination =", 1)
+                    return real_run(argv, **kwargs)
+                with patch("chrootables.backend.subprocess.run", side_effect=interrupt):
+                    with self.assertRaises(RuntimeError) as error:
+                        deliver_export(source, target)
+                self.assertFalse(target.exists())
+                self.assertEqual(source.read_bytes(), b"archive payload")
+                leftovers = list(self.path.glob(".chrootables-export-*"))
+                self.assertEqual(len(leftovers), 1 if named else 0)
+                if named:
+                    self.assertIn(repr(str(leftovers[0])), str(error.exception))
+                    self.assertIn("after it has stopped", str(error.exception))
+                    self.assertEqual(leftovers[0].read_bytes(), b"partial")
+                    leftovers[0].unlink()
 
     @unittest.skipIf(os.getuid() == 0, "Tests the user-side export writer")
     def test_export_rejects_nonregular_source_without_blocking(self):
@@ -643,6 +682,58 @@ assert store.inventory()['images'][0]['status'] == 'ready'
         os.mkfifo(source)
         with self.assertRaisesRegex(ValueError, "regular file"):
             deliver_export(source, self.path / "saved.tar.gz")
+
+    @unittest.skipIf(os.getuid() == 0, "Tests the user-side export writer")
+    def test_export_publication_failure_removes_both_staging_kinds(self):
+        source = self.path / "source.tar.gz"
+        source.write_bytes(b"archive payload")
+        target = self.path / "saved.tar.gz"
+        real_run = subprocess.run
+        for named in (False, True):
+            with self.subTest(named=named):
+                def fail_publication(argv, **kwargs):
+                    injected = ("def failed_link(*args, **kwargs):\n"
+                                "    raise OSError(errno.EPERM, 'link publication denied')\n"
+                                "os.link = failed_link\n")
+                    if named:
+                        injected += NAMED_EXPORT_STAGING
+                        injected += "ctypes.CDLL = lambda *args, **kwargs: object()\n"
+                    argv = list(argv)
+                    argv[4] = argv[4].replace("source, destination =", injected + "source, destination =", 1)
+                    return real_run(argv, **kwargs)
+                with patch("chrootables.backend.subprocess.run", side_effect=fail_publication):
+                    with self.assertRaisesRegex(RuntimeError, "link publication denied"):
+                        deliver_export(source, target)
+                self.assertFalse(target.exists())
+                self.assertEqual(list(self.path.glob(".chrootables-export-*")), [])
+                self.assertEqual(source.read_bytes(), b"archive payload")
+
+    @unittest.skipIf(os.getuid() == 0, "Tests the user-side export writer")
+    def test_export_does_not_fall_back_after_anonymous_permission_or_storage_errors(self):
+        source = self.path / "source.tar.gz"
+        source.write_bytes(b"archive payload")
+        target = self.path / "saved.tar.gz"
+        real_run = subprocess.run
+        for error in ("errno.EACCES", "errno.ENOSPC", "errno.EDQUOT"):
+            with self.subTest(error=error):
+                def fail_creation(argv, **kwargs):
+                    injected = (
+                        "original_open = os.open\n"
+                        "def checked_open(path, flags, *args, **kwargs):\n"
+                        "    assert not str(path).startswith('.chrootables-export-'), 'unexpected fallback'\n"
+                        "    if flags & os.O_TMPFILE == os.O_TMPFILE:\n"
+                        f"        raise OSError({error}, 'injected creation failure')\n"
+                        "    return original_open(path, flags, *args, **kwargs)\n"
+                        "os.open = checked_open\n")
+                    argv = list(argv)
+                    argv[4] = argv[4].replace("source, destination =", injected + "source, destination =", 1)
+                    return real_run(argv, **kwargs)
+                with patch("chrootables.backend.subprocess.run", side_effect=fail_creation):
+                    with self.assertRaisesRegex(RuntimeError, "injected creation failure"):
+                        deliver_export(source, target)
+                self.assertFalse(target.exists())
+                self.assertEqual(list(self.path.glob(".chrootables-export-*")), [])
+                self.assertEqual(source.read_bytes(), b"archive payload")
 
     @unittest.skipIf(os.getuid() == 0, "Tests the user-side export writer")
     def test_export_flush_failure_does_not_publish_unsynced_bytes(self):

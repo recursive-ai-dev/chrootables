@@ -36,6 +36,7 @@ def main():
 
     run("bash", "-n", "chrootable-manager")
     run("bash", "-n", "tests/integration.sh")
+    run("bash", "-n", "scripts/check-portable.sh")
     run(sys.executable, "-m", "compileall", "-q", "chrootables", "scripts", "tests")
     run(sys.executable, "-m", "py_compile", "chrootables-desktop")
     run(sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py", "-v")

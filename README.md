@@ -4,10 +4,10 @@ A native Linux desktop workbench for Debian image environments. Create a workspa
 open a terminal, experiment in a disposable session, and return to a saved recovery
 point. The Qt desktop and the Bash terminal interface use the same image store.
 
-## Install version 1.2.2
+## Install version 1.3.0
 
 Download packages and SHA256 checksums from the
-[1.2.2 release](https://github.com/recursive-ai-dev/chrootables/releases/tag/v1.2.2).
+[1.3.0 release](https://github.com/recursive-ai-dev/chrootables/releases/tag/v1.3.0).
 The native packages install Python/Qt and workspace prerequisites through your
 host package manager. Launch the desktop as your normal user; workspace changes
 request administrator access when needed.
@@ -15,7 +15,7 @@ request administrator access when needed.
 ### Ubuntu / Debian
 
 ```bash
-sudo apt install ./chrootables_1.2.2-1_all.deb
+sudo apt install ./chrootables_1.3.0-1_all.deb
 chrootables-desktop
 ```
 
@@ -28,32 +28,48 @@ application-menu entry and manual pages.
 ### Fedora
 
 ```bash
-sudo dnf install ./chrootables-1.2.2-1.noarch.rpm
+sudo dnf install ./chrootables-1.3.0-1.noarch.rpm
 chrootables-desktop
 ```
 
 The RPM uses the same application/helper layout as the Debian package. Fedora is
 the tested RPM target; compatibility with RHEL derivatives is not yet verified.
 
-### AppImage · x86_64
+### AppImage · x86_64 and ARM64
 
 ```bash
-chmod +x Chrootables-1.2.2-1-x86_64.AppImage
-./Chrootables-1.2.2-1-x86_64.AppImage
+chmod +x Chrootables-1.3.0-1-x86_64.AppImage
+./Chrootables-1.3.0-1-x86_64.AppImage
 ```
 
-This is a **host-runtime AppImage**: it requires `/usr/bin/python3` 3.10+ and
-system PySide6 6.8+; it does not bundle Python or Qt. On Ubuntu 26.04 install
-`python3-pyside6.qtwidgets`; on Fedora install `python3-pyside6`. The launcher
-extracts its payload before authenticating its helper, allowing administrator
-operations to find the application outside a user-only FUSE mount. Workspace
-prerequisites are still needed on the host. Use `--demo` for a read-only tour.
+The standard AppImage bundles CPython 3.13 and PySide6/Qt 6.11. It runs without
+host Python or PySide6. ARM64 hosts use the `aarch64` artifact. Linux glibc and
+normal desktop graphics libraries are still required (glibc 2.34+ on x86_64,
+2.39+ on ARM64). Debian 13, Ubuntu 26.04 and Fedora provide suitable runtimes.
+The `--host-runtime` build variant uses distribution Python/Qt instead and has a
+distinct filename.
+
+On a minimal Ubuntu/Debian desktop, install graphics dependencies with:
+
+```bash
+sudo apt install libgl1 libegl1 libfontconfig1 libfreetype6 libglib2.0-0t64 \
+  libdbus-1-3 libxkbcommon0 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 \
+  libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-randr0 libxcb-shape0 \
+  libxcb-sync1 libxcb-xfixes0 libxcb-xkb1 libx11-xcb1 libwayland-client0 \
+  libwayland-cursor0 libwayland-egl1 libatomic1 libstdc++6 libzstd1 fonts-dejavu-core
+```
+
+Workspace operations require the Linux prerequisites described below. The launcher
+extracts before administrator authentication so the helper can access its bundled
+interpreter outside a user-only FUSE mount. Use `--demo` for a read-only tour.
+Runtime licenses, provenance and replacement instructions ship inside the AppImage;
+the matching `runtime-sources.tar.gz` release asset contains upstream source inputs.
 
 Each artifact has a `.sha256` sidecar. Verify it in the download directory, for
 example:
 
 ```bash
-sha256sum -c chrootables_1.2.2-1_all.deb.sha256
+sha256sum -c chrootables_1.3.0-1_all.deb.sha256
 ```
 
 Removing a native package leaves `/var/lib/chrootable-manager` intact. Installed
@@ -70,16 +86,21 @@ Install `dpkg-deb` for Debian packages or `rpmbuild` for RPM packages, then run:
 /usr/bin/python3 scripts/build-packages.py  # Debian and RPM
 ```
 
-AppImage tools are fetched only through a separate explicit command. Both the
-builder and runtime downloads are pinned by SHA256:
+AppImage tools are fetched only through a separate explicit command. Builder, AppImage runtime, bundled Python/Qt and source downloads are pinned by SHA256:
 
 ```bash
 /usr/bin/python3 scripts/fetch-build-tools.py --output "$HOME/.cache/chrootables/build-tools"
 export APPIMAGETOOL="$HOME/.cache/chrootables/build-tools/appimagetool-1.9.1-x86_64.AppImage"
 export APPIMAGE_RUNTIME_FILE="$HOME/.cache/chrootables/build-tools/runtime-x86_64"
+/usr/bin/python3 scripts/fetch-appimage-runtime.py --output "$HOME/.cache/chrootables/runtime" --architecture x86_64
+export CHROOTABLE_APPIMAGE_RUNTIME="$HOME/.cache/chrootables/runtime"
 /usr/bin/python3 scripts/build-appimage.py
 /usr/bin/python3 scripts/build-packages.py --all
 ```
+
+Use `aarch64` in the fetch commands and tool filenames when building on ARM64.
+The default AppImage build also produces the runtime source archive.
+Use `scripts/build-appimage.py --host-runtime` for the smaller compatibility variant.
 
 Artifacts and checksums go into `dist/`. Use `--output /path/to/artifacts` or
 `--revision 2` to choose another destination/revision. An identical rebuild is
@@ -169,6 +190,13 @@ compact VT/ANSI subset; full emoji grapheme shaping and complete terminal
 emulation remain outside its scope. For full terminal fidelity use the external
 terminal button in the session window.
 
+New official-mirror Debian workspaces include signed main, updates and security
+sources, and install available security upgrades during creation, including the
+minimal profile. Offline archives retain their exact sources and cached upgrade
+packages. Refresh them with `--archive-sync` to obtain newer fixes; older archives
+remain usable with a notice that cached security upgrades are absent. Custom
+mirrors keep their own source and upgrade policy.
+
 ## Support matrix
 
 | Layer | Supported | Notes |
@@ -176,7 +204,7 @@ terminal button in the session window.
 | Host distro | Fedora, Debian, Ubuntu; Arch and openSUSE best-effort | Auto-install uses `dnf`, `apt-get`, `pacman`, or `zypper`; other distros must install the prerequisites manually |
 | Host runtime | Python 3.10+, PySide6 6.8+ | CI runs the test suite on `fedora:latest` and `debian:trixie` |
 | Guest images | Debian 13 (Trixie), Debian 12 (Bookworm) | minimal, C/C++, Python, networking, Rust, Go, and web (Node.js) profiles |
-| Architecture | x86_64 | ARM64 is on the roadmap but not yet verified |
+| Architecture | x86_64 and ARM64 | Native CI covers Debian on both; Fedora coverage uses x86_64 |
 
 ## First run and administrator access
 
@@ -250,16 +278,19 @@ must contain a root filesystem. Leave `SIZE_MIB` empty (`""`) to fit capacity to
 contents with room to work. Import preserves file capabilities and reads the release
 and architecture from the archive; profile and lifecycle are not stored in exports.
 Only import archives you trust: their contents run as root in later sessions.
-Allow space for both the compressed archive copy and the new image. Imports stopped
-abruptly can retain staging files; discard removes both files.
+Import staging uses a copy-on-write clone when the filesystem and optional Perl
+helper support it. Other hosts use a conservative full copy. Allow space for the
+new image and, where needed, the compressed archive copy. Imports stopped abruptly
+can retain staging files; discard removes them.
 
 Exports remain in the protected store and are copied to your chosen destination by
 a child process running as your normal user. The privileged helper opens the
 source; the user process creates the destination. The destination is never written
 with administrator privileges. A complete, flushed file is published atomically
-without overwriting an existing destination. Abrupt termination can leave a hidden
-`.chrootables-export-*` temporary file in the destination directory; it can be
-removed after the export process has stopped.
+without overwriting an existing destination. Supporting filesystems use anonymous
+staging, which leaves no temporary filename after termination. Other filesystems
+use a hidden `.chrootables-export-*` file and report cleanup guidance; remove it
+only after the export process has stopped.
 
 ## Images and trust model
 
@@ -436,12 +467,16 @@ images and loop mounts. Allow a few GiB of temporary free space:
 sudo ./chrootable-manager --setup
 sudo tests/integration.sh
 sudo tests/integration.sh python  # also verifies profile installation and Python
+sudo env CHROOTABLE_TEST_ARCHIVE=1 tests/integration.sh python  # cached creation without network
 ```
 
 It checks persistent writes, disposable rollback, network isolation, shared folder
 writes and read-only access, cloning,
 snapshots, automatic recovery on restore, expansion, repair, export, deletion and
 restoring a deleted workspace. Its temporary store is removed afterward.
+Set `TMPDIR` to a disk-backed directory with sufficient free space when `/tmp`
+is a small RAM filesystem, for example `sudo env TMPDIR=/path/to/test-disk
+tests/integration.sh`. The directory must exist before running the test.
 
 ## License
 

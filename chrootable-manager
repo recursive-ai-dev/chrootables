@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 
 APP_NAME="Chrootable Manager"
-APP_VERSION=1.2.2
+APP_VERSION=1.3.0
 SCRIPT_PATH=${BASH_SOURCE[0]}
 STORE_DIR=${CHROOTABLE_HOME:-/var/lib/chrootable-manager}
 DEBIAN_SUITE=${CHROOTABLE_DEBIAN_SUITE:-stable}
@@ -755,7 +755,90 @@ capabilities() {
 # debs. Creates for that suite then run without a network. apt verifies each
 # deb against the copied lists, so no store-local signing key is needed.
 
+# Keep official Debian guests on their installed release rather than moving the
+# "stable" alias to a new major version later. Custom mirrors retain their own
+# source policy; never silently contact another repository on their behalf.
+guest_apt_sources() {
+    local root=$1 mirror=$2 suite=$3 line codename= release
+    valid_mirror "$mirror" && valid_suite "$suite" || { fail "Invalid guest package source."; return 1; }
+    if [[ ${mirror%/} == https://deb.debian.org/debian ]]; then
+        if [[ $suite == stable || $suite == oldstable ]]; then
+            release=$(guest_resolve "$root" /etc/os-release) || return
+            if [[ -f $release && ! -L $release ]]; then
+                while IFS= read -r line || [[ -n $line ]]; do
+                    [[ $line == VERSION_CODENAME=* ]] || continue
+                    codename=${line#*=}; codename=${codename//\"/}; codename=${codename//\'/}
+                done <"$release"
+            fi
+            case $codename in trixie|bookworm) suite=$codename ;; esac
+        fi
+        case $suite in
+            trixie|bookworm)
+                printf 'deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://deb.debian.org/debian %s main\n' "$suite" "$suite-updates"
+                printf 'deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://deb.debian.org/debian-security %s-security main\n' "$suite"
+                return ;;
+        esac
+    fi
+    printf 'deb %s %s main\n' "$mirror" "$suite"
+}
+
+guest_security_sources_enabled() {
+    grep -q '^deb \[signed-by=/usr/share/keyrings/debian-archive-keyring.gpg\] https://deb.debian.org/debian-security ' "$WORKER_ROOT/etc/apt/sources.list"
+}
+provision_environment() {
+    local -n configuration=$1
+    local variable
+    configuration=(HOME=/root USER=root LOGNAME=root LANG=C.UTF-8 LC_ALL=C.UTF-8
+        PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        TMPDIR=/tmp TMP=/tmp TEMP=/tmp DEBIAN_FRONTEND=noninteractive)
+    # Proxy settings are the only host configuration needed for downloads. Do
+    # not pass host paths (TMPDIR, APT_CONFIG, DPKG_ROOT), startup hooks, or secrets
+    # unrelated to package retrieval into package maintainer scripts.
+    for variable in http_proxy https_proxy ftp_proxy all_proxy no_proxy HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY NO_PROXY; do
+        [[ ! -v $variable ]] || configuration+=("$variable=${!variable}")
+    done
+}
+bootstrap_guest() {
+    local -a environment=()
+    provision_environment environment
+    # debootstrap also enters the guest during its second stage. Keep its host
+    # executable search path, while supplying an explicit environment and hash.
+    env -i "${environment[@]}" PATH="$PATH" SHA_SIZE=256 debootstrap "$@"
+}
+guest_package_command() {
+    local -a environment=()
+    provision_environment environment
+    chroot "$WORKER_ROOT" /usr/bin/env -i "${environment[@]}" "$@"
+}
+
+guest_apt_update() {
+    # A partial update must not silently omit security indices or reuse stale ones.
+    guest_package_command apt-get \
+        -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update --error-on=any
+}
+archive_has_security_updates() {
+    [[ -f $1/security-upgrades && ! -L $1/security-upgrades && $(<"$1/security-upgrades") == 1 ]]
+}
+
 archive_path() { printf '%s/%s-%s' "$ARCHIVE_DIR" "$1" "$2"; }
+check_archive_cache() {
+    local archive=$1 issue type owner permissions path status=
+    [[ -e $archive || -L $archive ]] || return 0
+    issue=$(store_directory_check "$ARCHIVE_DIR" "$EUID") &&
+        issue=$(store_directory_check "$archive" "$EUID") || { fail "Unsafe offline archive: $issue"; return 1; }
+    # A protected parent cannot make a foreign-owned or writable cache file safe.
+    # Walk without following links, including unknown entries, and propagate a
+    # failed scan rather than treating a partially inspected cache as trusted.
+    while IFS=' ' read -r -d '' type owner permissions path; do
+        if [[ $type == status ]]; then status=$owner; continue; fi
+        [[ $type == f || $type == d ]] || { fail "Unsafe offline archive entry type: $path"; return 1; }
+        [[ $owner == "$EUID" && $permissions =~ ^[0-7]{1,4}$ ]] && (( (8#$permissions & 0022) == 0 )) || {
+            fail "Offline archive entries must be owned by UID $EUID and not writable by group/others: $path"; return 1;
+        }
+    done < <(result=0; find -P "$archive" -printf '%y %U %m %p\0' || result=$?; printf 'status %s 0 .\0' "$result")
+    [[ $status == 0 ]] || { fail "Could not completely inspect offline archive: $archive"; return 1; }
+}
+
 archive_has_profile() {
     local archive=$1 profile=$2
     [[ ${CHROOTABLE_ARCHIVE:-1} != 0 && -s $archive/base.tgz && -s $archive/mirror ]] || return 1
@@ -804,6 +887,7 @@ archive_sync() (
     rm -rf --one-file-system -- "$ARCHIVE_STAGING/scratch" || return
     printf '%s\n' "$DEBIAN_MIRROR" >"$ARCHIVE_STAGING/mirror" || return
     printf '%s\n' "${profiles[@]}" >"$ARCHIVE_STAGING/profiles" || return
+    check_archive_cache "$ARCHIVE_STAGING" || return
     # Creates hold this lock shared while they read the archive, so the swap
     # waits for them and a create never sees a half-replaced archive.
     exec {swap_lock}>>"$ARCHIVE_DIR/.lock" || return
@@ -831,47 +915,66 @@ archive_worker() {
     shift 4
     local -a package_list=()
     mount --bind "$scratch" "$WORKER_ROOT" || return
-    SHA_SIZE=256 debootstrap --force-check-gpg --keyring=/usr/share/keyrings/debian-archive-keyring.gpg \
-        --variant=minbase --arch="$arch" --make-tarball="$staging/base.tgz" \
+    bootstrap_guest --force-check-gpg --keyring=/usr/share/keyrings/debian-archive-keyring.gpg \
+        --variant=minbase --include=ca-certificates --arch="$arch" --make-tarball="$staging/base.tgz" \
         "$suite" "$staging/tarball-work" "$DEBIAN_MIRROR" || return
     rm -rf --one-file-system -- "$staging/tarball-work" || return
     # Unpack the tarball just written: this proves it bootstraps, and resolves
     # profile dependencies against exactly the base a create will have.
-    debootstrap --variant=minbase --arch="$arch" --unpack-tarball="$staging/base.tgz" "$suite" "$WORKER_ROOT" || return
-    printf 'deb %s %s main\n' "$DEBIAN_MIRROR" "$suite" >"$WORKER_ROOT/etc/apt/sources.list" || return
+    bootstrap_guest --variant=minbase --arch="$arch" --unpack-tarball="$staging/base.tgz" "$suite" "$WORKER_ROOT" || return
+    guest_apt_sources "$WORKER_ROOT" "$DEBIAN_MIRROR" "$suite" >"$WORKER_ROOT/etc/apt/sources.list" || return
+    cp -- "$WORKER_ROOT/etc/apt/sources.list" "$staging/sources.list" || return
     mount_session_devices || return
     setup_resolv_conf "$work" "$WORKER_ROOT"
-    chroot "$WORKER_ROOT" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get update || return
+    guest_apt_update || return
+    if guest_security_sources_enabled; then
+        guest_package_command apt-get \
+            --download-only --with-new-pkgs -y --no-install-recommends upgrade || return
+        printf '1\n' >"$staging/security-upgrades" || return
+    fi
     for profile in "$@"; do
         read -r -a package_list <<<"$(profile_packages "$profile")"
         (( ${#package_list[@]} )) || continue
-        chroot "$WORKER_ROOT" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get \
+        guest_package_command apt-get \
             --download-only -y --no-install-recommends install "${package_list[@]}" || {
             fail "Downloading profile $profile failed."; return 1;
         }
     done
     find "$WORKER_ROOT/var/cache/apt/archives" -maxdepth 1 -type f -name '*.deb' \
-        -exec cp -p -t "$staging/debs" -- {} + || return
+        -exec cp --preserve=mode,timestamps -t "$staging/debs" -- {} + || return
     find "$WORKER_ROOT/var/lib/apt/lists" -maxdepth 1 -type f ! -name lock \
-        -exec cp -p -t "$staging/lists" -- {} + || return
+        -exec cp --preserve=mode,timestamps -t "$staging/lists" -- {} + || return
 }
 archive_install_profile() {
     # Offline profile install: Debian-signed lists from the archive, debs read
     # through an overlay so apt's lock and partial files never touch the store.
     local archive=$1 mirror
     shift
+    check_archive_cache "$archive" || return
     mirror=$(<"$archive/mirror") || return
     valid_mirror "$mirror" || { fail "Archive records an invalid mirror."; return 1; }
     # Lists are only used when sources.list names the mirror they came from.
-    printf 'deb %s %s main\n' "$mirror" "$DEBIAN_SUITE" >"$WORKER_ROOT/etc/apt/sources.list" || return
+    if [[ -e $archive/sources.list || -L $archive/sources.list ]]; then
+        [[ -f $archive/sources.list && ! -L $archive/sources.list ]] || { fail "Archive package sources must be a regular file."; return 1; }
+        cp -- "$archive/sources.list" "$WORKER_ROOT/etc/apt/sources.list" || return
+    else
+        # Older caches contain only the main suite's indices and packages.
+        printf 'deb %s %s main\n' "$mirror" "$DEBIAN_SUITE" >"$WORKER_ROOT/etc/apt/sources.list" || return
+    fi
     find "$archive/lists" -maxdepth 1 -type f -exec cp -p -t "$WORKER_ROOT/var/lib/apt/lists" -- {} + || return
     mkdir -p "$WORKER_OVERLAY/upper" "$WORKER_OVERLAY/work" || return
     mount -t overlay overlay -o "lowerdir=$archive/debs,upperdir=$WORKER_OVERLAY/upper,workdir=$WORKER_OVERLAY/work" \
         "$WORKER_ROOT/var/cache/apt/archives" || return
-    chroot "$WORKER_ROOT" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get \
-        --no-download -y --no-install-recommends install "$@" || return
+    if archive_has_security_updates "$archive"; then
+        guest_package_command apt-get \
+            --no-download --with-new-pkgs -y --no-install-recommends upgrade || return
+    fi
+    if (( $# )); then
+        guest_package_command apt-get \
+            --no-download -y --no-install-recommends install "$@" || return
+    fi
     umount "$WORKER_ROOT/var/cache/apt/archives" || return
-    printf 'deb %s %s main\n' "$DEBIAN_MIRROR" "$DEBIAN_SUITE" >"$WORKER_ROOT/etc/apt/sources.list"
+    guest_apt_sources "$WORKER_ROOT" "$DEBIAN_MIRROR" "$DEBIAN_SUITE" >"$WORKER_ROOT/etc/apt/sources.list"
 }
 
 allocate_image() {
@@ -1093,18 +1196,75 @@ validate_tar_archive() {
     (( entries )) || { fail "Archive is empty: $archive"; return 1; }
     IMPORT_REQUIRED_MIB=$(required_capacity_mib "$payload" "$entries")
 }
+copy_import_archive_stream() {
+    local source=$1 destination=$2 parent=${1%/*} filename=${1##*/}
+    preflight_free_space "$(stat -c%s -- "$source")" || return
+    # With no optional descriptor helper, retain the nonrecursive stream copy:
+    # substituted devices/FIFOs are copied as nodes and never read as content.
+    { tar --create --no-recursion --file=- --directory="${parent:-/}" -- "$filename" |
+        tar --extract --no-same-owner --no-same-permissions --file=- --directory="${destination%/*}"; } || return
+    [[ -f $destination && ! -L $destination ]] || { fail "Archive changed to an unsafe file type while copying."; return 1; }
+}
+copy_import_archive() {
+    local source=$1 destination=$2
+    if ! command -v perl >/dev/null 2>&1; then
+        copy_import_archive_stream "$source" "$destination"
+        return
+    fi
+    # Perl is normally installed with debootstrap, but remains optional. Only a
+    # nonblocking, no-follow descriptor may be passed to cp: checking the user
+    # pathname and then reopening it would reintroduce the FIFO/symlink race.
+    env -i PATH="$PATH" LC_ALL=C perl -f -MFcntl=O_RDONLY,O_NOFOLLOW,O_NONBLOCK -e '
+        use strict; use warnings;
+        my ($source, $destination, $store) = @ARGV;
+        sysopen(my $input, $source, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+            or die "Archive changed to an unsafe file type or could not be opened: $!\n";
+        my @info = stat($input);
+        @info && -f $input or die "Archive changed to an unsafe file type while copying.\n";
+        my $pinned = "/proc/$$/fd/" . fileno($input);
+        # The parent retains its descriptor until cp exits. A path replacement
+        # cannot redirect it; changes to the inode are isolated by the snapshot
+        # before validation, whether cloned or copied.
+        my $result;
+        {
+            open(my $saved, ">&", \*STDERR) or die "Cannot save diagnostic stream: $!\n";
+            open(STDERR, ">", "/dev/null") or die "Cannot suppress clone diagnostics: $!\n";
+            $result = system("cp", "--reflink=always", "--", $pinned, $destination);
+            open(STDERR, ">&", $saved) or die "Cannot restore diagnostic stream: $!\n";
+        }
+        if ($result == 0) {
+            print "Archive snapshot created using filesystem reflink.\n";
+            exit 0;
+        }
+        $result >= 0 or die "Cannot start archive copy: $!\n";
+        exit(128 + ($result & 127)) if $result & 127;
+        # Cloning is unavailable (for example ext4 or a different filesystem).
+        # Check conservative full-copy space before writing payload bytes.
+        open(my $disk, "-|", "df", "-PB1", "--", $store) or die "Cannot check import copy space: $!\n";
+        my $header = <$disk>; my $row = <$disk>;
+        close($disk) or die "Cannot check import copy space.\n";
+        my @fields = split(/\s+/, $row // "");
+        my $available = $fields[3] // "";
+        $available =~ /^\d+$/ or die "Cannot determine import copy space.\n";
+        $available >= $info[7] or die "Not enough free space for archive copy: need $info[7] bytes, have $available.\n";
+        $result = system("cp", "--reflink=never", "--sparse=always", "--", $pinned, $destination);
+        $result >= 0 or die "Cannot start archive copy: $!\n";
+        exit(128 + ($result & 127)) if $result & 127;
+        exit($result >> 8) if $result;
+        print "Archive snapshot created using a sparse file copy.\n";
+    ' "$source" "$destination" "$STORE_DIR"
+}
 import_image() (
-    local name=$1 archive=$2 size=${3:-} lifecycle=${4:-persistent} profile=${5:-minimal} image descriptor arch source_name source_parent
+    local name=$1 archive=$2 size=${3:-} lifecycle=${4:-persistent} profile=${5:-minimal} image descriptor arch source_name
     unused_image "$name" || return
     valid_lifecycle "$lifecycle" || { fail "Lifecycle must be persistent or ephemeral."; return 1; }
     valid_profile "$profile" || { fail "Unknown profile: $profile. See --profiles."; return 1; }
     [[ -z $size ]] || valid_size_mib "$size" || { fail "Size must be a whole number from 512 to 1048576 MiB."; return 1; }
     canonicalize_archive_file "$archive" archive || return
-    source_name=${archive##*/}; source_parent=${archive%/*}
+    source_name=${archive##*/}
     image="$IMAGE_DIR/$name.img"
     lock_image "$image" descriptor || return
     unused_image "$name" || return
-    preflight_free_space "$(stat -c%s -- "$archive")" || return
     begin_operation import "$name" || return
     PENDING=$(mktemp "$IMAGE_DIR/.$name.XXXXXX.partial") || return
     OP_PENDING=${PENDING#"$STORE_DIR/"}; operation_stage copying-archive || return
@@ -1112,11 +1272,7 @@ import_image() (
     # Snapshot on the store filesystem, then validate and extract only this copy.
     # Do not follow a substituted symlink or read a substituted FIFO/device.
     mkdir -m 0700 -- "$PENDING.archive" || return
-    # Nonrecursive tar copies a substituted special node as a node, without
-    # opening it, and a substituted directory without descending into it.
-    # A private destination makes the resulting regular file immutable to users.
-    { tar --create --no-recursion --file=- --directory="${source_parent:-/}" -- "$source_name" |
-        tar --extract --no-same-owner --no-same-permissions --file=- --directory="$PENDING.archive"; } >>"$OP_LOG" 2>&1 || return
+    copy_import_archive "$archive" "$PENDING.archive/$source_name" >>"$OP_LOG" 2>&1 || return
     archive="$PENDING.archive/$source_name"
     [[ -f $archive && ! -L $archive ]] || { fail "Archive changed to an unsafe file type while copying."; return 1; }
     operation_stage validating-archive || return
@@ -1548,35 +1704,46 @@ worker_main() (
             local name=$1 arch=$2 profile=$3 packages archive offline=0
             valid_suite "$DEBIAN_SUITE" && valid_mirror "$DEBIAN_MIRROR" || { fail "Invalid Debian suite or mirror."; return 1; }
             archive=$(archive_path "$DEBIAN_SUITE" "$arch")
+            # Unsafe existing caches fail closed before debootstrap or network fallback.
+            [[ ${CHROOTABLE_ARCHIVE:-1} == 0 ]] || check_archive_cache "$archive" || return
             mount -o loop "$image" "$WORKER_ROOT" || return
             if archive_has_profile "$archive" minimal; then
                 info "Bootstrapping from the offline archive: $archive"
-                debootstrap --variant=minbase --arch="$arch" --unpack-tarball="$archive/base.tgz" "$DEBIAN_SUITE" "$WORKER_ROOT" || return
+                bootstrap_guest --variant=minbase --arch="$arch" --unpack-tarball="$archive/base.tgz" "$DEBIAN_SUITE" "$WORKER_ROOT" || return
                 ! archive_has_profile "$archive" "$profile" || offline=1
             else
-                SHA_SIZE=256 debootstrap --force-check-gpg --keyring=/usr/share/keyrings/debian-archive-keyring.gpg --variant=minbase --arch="$arch" "$DEBIAN_SUITE" "$WORKER_ROOT" "$DEBIAN_MIRROR" || return
+                bootstrap_guest --force-check-gpg --keyring=/usr/share/keyrings/debian-archive-keyring.gpg --variant=minbase --include=ca-certificates --arch="$arch" "$DEBIAN_SUITE" "$WORKER_ROOT" "$DEBIAN_MIRROR" || return
             fi
-            printf 'deb %s %s main\n' "$DEBIAN_MIRROR" "$DEBIAN_SUITE" >"$WORKER_ROOT/etc/apt/sources.list" || return
+            guest_apt_sources "$WORKER_ROOT" "$DEBIAN_MIRROR" "$DEBIAN_SUITE" >"$WORKER_ROOT/etc/apt/sources.list" || return
             printf '%s\n' "$name" >"$WORKER_ROOT/etc/hostname" || return
             printf '127.0.0.1 localhost\n127.0.1.1 %s\n::1 localhost ip6-localhost ip6-loopback\n' "$name" >"$WORKER_ROOT/etc/hosts" || return
             packages=$(profile_packages "$profile") || return
-            if [[ -n $packages ]]; then
-                local -a package_list=()
-                read -r -a package_list <<<"$packages"
-                if (( offline )); then
-                    info "Installing the $profile profile from the offline archive."
+            local -a package_list=()
+            [[ -z $packages ]] || read -r -a package_list <<<"$packages"
+            if (( offline )); then
+                if (( ${#package_list[@]} )) || archive_has_security_updates "$archive"; then
+                    info "Installing cached updates and the $profile profile from the offline archive."
                     mount_session_devices || return
                     mkdir -p "$WORKER_OVERLAY" || return
                     mount -t tmpfs -o mode=0700,nosuid,nodev tmpfs "$WORKER_OVERLAY" || return
                     archive_install_profile "$archive" "${package_list[@]}" || return
-                else
-                    mount_session_devices || return
-                    setup_resolv_conf "$work" "$WORKER_ROOT"
-                    chroot "$WORKER_ROOT" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get update || return
-                    chroot "$WORKER_ROOT" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${package_list[@]}" || return
+                fi
+                if guest_security_sources_enabled && ! archive_has_security_updates "$archive"; then
+                    info "This older offline archive has no cached security upgrades. Run --archive-sync $DEBIAN_SUITE to refresh it before relying on current fixes."
+                fi
+            elif (( ${#package_list[@]} )) || guest_security_sources_enabled; then
+                mount_session_devices || return
+                setup_resolv_conf "$work" "$WORKER_ROOT"
+                guest_apt_update || return
+                if guest_security_sources_enabled; then
+                    guest_package_command apt-get \
+                        --with-new-pkgs -y --no-install-recommends upgrade || return
+                fi
+                if (( ${#package_list[@]} )); then
+                    guest_package_command apt-get install -y --no-install-recommends "${package_list[@]}" || return
                 fi
             fi
-            chroot "$WORKER_ROOT" apt-get clean || return
+            guest_package_command apt-get clean || return
             ;;
         archive) archive_worker "$image" "$@" || return ;;
         export)

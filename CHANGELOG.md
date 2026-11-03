@@ -1,7 +1,29 @@
 # Changelog
 
-The current release is numbered `1.2.2`. Earlier development release numbers
+The current release is numbered `1.3.0`. Earlier development release numbers
 are retained below as historical records.
+
+## v1.3.0 — 2026-11-03
+
+- Bundle pinned CPython and PySide6/Qt in the default AppImage, with runtime
+  licenses, provenance, replacement instructions and matching source archives.
+  Preserve an explicitly selected host-runtime build variant.
+- Add native ARM64 test, Debian installation, AppImage and privileged integration
+  coverage, alongside the existing x86_64 targets.
+- Configure signed Debian updates/security sources for official mirrors and
+  apply available security upgrades during workspace creation. Preserve matching
+  source definitions and upgrade packages in offline archives; keep legacy caches
+  and custom-mirror policies compatible.
+- Reject unsafe offline cache ownership, writable entries, links and special
+  files before extraction or guest execution.
+- Reset host temporary-directory variables at the guest execution boundary so
+  disk-backed host staging does not break guest package configuration.
+- Use anonymous export staging where supported so abrupt writer termination
+  leaves no temporary filename. Preserve atomic no-overwrite publication and
+  provide cleanup guidance on filesystems requiring named staging.
+- Snapshot imported archives through a safely opened regular descriptor, using
+  filesystem reflinks where available and a conservative full-copy fallback.
+  Hosts without the optional descriptor helper retain the safe tar-stream path.
 
 ## v1.2.2 — 2026-11-03
 

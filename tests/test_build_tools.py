@@ -40,6 +40,22 @@ class BuildToolTests(unittest.TestCase):
         self.assertEqual(self.target.stat().st_mode & 0o777, 0o755)
         self.assertFalse(list(self.root.glob(".download-*")))
 
+    def test_arm_tools_selected_from_host_or_explicit_architecture(self):
+        arm = {"arm-tool": ("https://example.invalid/arm", self.expected)}
+        with patch.object(FETCH, "ARM_TOOLS", arm), \
+                patch.object(FETCH, "urlopen", return_value=io.BytesIO(self.payload)) as download:
+            FETCH.fetch(self.root, "aarch64")
+            self.assertEqual((self.root / "arm-tool").read_bytes(), self.payload)
+            self.assertFalse(self.target.exists())
+            with patch.object(FETCH.platform, "machine", return_value="arm64"):
+                FETCH.fetch(self.root)
+            self.assertEqual(download.call_count, 1)
+
+    def test_unsupported_architecture_fails_before_creating_output(self):
+        with self.assertRaisesRegex(ValueError, "x86_64 and aarch64"):
+            FETCH.fetch(self.root / "absent", "riscv64")
+        self.assertFalse((self.root / "absent").exists())
+
     def test_unsafe_cache_entries_are_rejected_without_downloading(self):
         outside = self.root / "outside"
         outside.write_bytes(self.payload)

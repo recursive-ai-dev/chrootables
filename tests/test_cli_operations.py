@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import shlex
 import subprocess
 import tarfile
 import tempfile
@@ -393,7 +394,7 @@ printf '%s\\n' "$required"
         size = int(re.search(r"size_mib=(\d+)", (self.store / "images/fitted.img.meta").read_text()).group(1))
         self.assertEqual(size, required + required // 4)
         self.assertEqual([int(value) for value in (self.store / "free-space-requests").read_text().splitlines()],
-                         [archive.stat().st_size, size * 1048576])
+                         [size * 1048576])
 
 
     def test_import_extracts_the_validated_snapshot_when_the_source_changes(self):
@@ -425,6 +426,7 @@ import_image "$3" "$1" 512 persistent minimal
                 target = self.store / "private-data"
                 target.write_text("must not be read")
                 result = self.bash(self.IMPORT_STUBS + """
+command() { if [[ $* == '-v perl' ]]; then return 1; fi; builtin command "$@"; }
 SOURCE_ARCHIVE=$1
 KIND=$2
 TARGET=$3
@@ -441,7 +443,7 @@ run_worker() { printf 'unexpected extraction' >"$STORE_DIR/extracted"; }
 import_image "$4" "$1" 512 persistent minimal
 """, archive, kind, target, f"import{index}", identifier=f"{index + 1:032x}")
                 self.assertNotEqual(result.returncode, 0, result.stderr)
-                self.assertIn("unsafe file type", result.stderr)
+                self.assertIn("unsafe file type", (self.store / "logs" / f"{index + 1:032x}.log").read_text())
                 self.assertFalse((self.store / "extracted").exists())
                 self.assertEqual(target.read_text(), "must not be read")
                 self.assertEqual(list((self.store / "images").glob(".*.partial*")), [])
@@ -450,6 +452,7 @@ import_image "$4" "$1" 512 persistent minimal
     def test_import_copy_failure_cleans_both_staged_files(self):
         archive = self.write_archive()
         result = self.bash(self.IMPORT_STUBS + """
+command() { if [[ $* == '-v perl' ]]; then return 1; fi; builtin command "$@"; }
 tar() {
     command tar "$@" || return
     [[ $1 != --create ]] || return 23
@@ -626,6 +629,377 @@ snapshot_path lab saved
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, str(self.store / "normalized"))
         self.assertFalse((self.store / "normalized").exists())
+
+    def make_offline_cache(self):
+        archive = self.store / "archive/trixie-amd64"
+        for directory in (archive / "debs", archive / "lists"):
+            directory.mkdir(parents=True, exist_ok=True)
+        for filename in ("base.tgz", "sources.list", "profiles", "security-upgrades"):
+            (archive / filename).write_text("1\n")
+        (archive / "mirror").write_text("https://deb.debian.org/debian\n")
+        (archive / "debs/package.deb").write_bytes(b"package")
+        (archive / "lists/repository_InRelease").write_bytes(b"signed index")
+        return archive
+
+    def test_offline_cache_rejects_symlinks_special_files_and_writable_entries_before_bootstrap(self):
+        archive = self.make_offline_cache()
+        external = self.store / "external"
+        external.mkdir()
+        for relative in ("base.tgz", "mirror", "sources.list", "profiles", "security-upgrades",
+                         "debs", "lists", "debs/package.deb", "lists/repository_InRelease"):
+            for mutation in ("writable", "symlink"):
+                with self.subTest(relative=relative, mutation=mutation):
+                    target = archive / relative
+                    saved = target.with_name(target.name + ".saved")
+                    original_mode = target.stat().st_mode & 0o777
+                    if mutation == "writable":
+                        target.chmod(original_mode | 0o020)
+                    else:
+                        target.rename(saved)
+                        target.symlink_to(external)
+                    result = self.bash(self.CREATE_WORKER_STUBS + '''
+DEBIAN_SUITE=trixie
+worker_main create unused "$STORE_DIR/work" lab amd64 minimal
+''')
+                    self.assertNotEqual(result.returncode, 0, result.stderr)
+                    self.assertFalse((self.store / "bootstrap-calls").exists())
+                    self.assertFalse((self.store / "apt-calls").exists())
+                    if mutation == "writable":
+                        target.chmod(original_mode)
+                    else:
+                        target.unlink()
+                        saved.rename(target)
+        fifo = archive / "debs/unexpected.fifo"
+        os.mkfifo(fifo)
+        result = self.bash('check_archive_cache "$1"', archive)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("entry type", result.stderr)
+        fifo.unlink()
+        self.assertEqual(self.bash('check_archive_cache "$1"', archive).returncode, 0)
+
+    def test_offline_cache_rejects_foreign_owners_and_partial_scan_failures(self):
+        archive = self.make_offline_cache()
+        result = self.bash('''
+find() { printf 'f %s 644 foreign-package.deb\\0status 0 0 .\\0' "$((EUID + 1))"; }
+check_archive_cache "$1"
+''', archive)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("owned by UID", result.stderr)
+        result = self.bash('''
+find() { printf 'f %s 644 package.deb\\0' "$EUID"; return 19; }
+check_archive_cache "$1"
+''', archive)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("completely inspect", result.stderr)
+
+    def test_archive_publication_refuses_an_unsafe_new_cache(self):
+        archive = self.store / "archive/trixie-amd64"
+        archive.mkdir(parents=True)
+        (archive / "base.tgz").write_bytes(b"existing safe archive")
+        result = self.bash(self.archive_sync_script('''
+run_worker() {
+    printf new >"$ARCHIVE_STAGING/base.tgz"
+    chmod 0666 "$ARCHIVE_STAGING/base.tgz"
+}
+'''))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((archive / "base.tgz").read_bytes(), b"existing safe archive")
+        self.assertEqual(list(archive.parent.glob(".trixie*")), [])
+
+    def test_guest_sources_cover_supported_security_channels_and_preserve_custom_policy(self):
+        root = self.store / "guest"
+        (root / "etc").mkdir(parents=True)
+        (root / "etc/os-release").write_text('VERSION_CODENAME="trixie"\n')
+        for suite in ("trixie", "bookworm", "stable", "oldstable"):
+            with self.subTest(suite=suite):
+                result = self.bash('guest_apt_sources "$1" https://deb.debian.org/debian/ "$2"', root, suite)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                effective = suite if suite in ("trixie", "bookworm") else "trixie"
+                lines = result.stdout.splitlines()
+                self.assertEqual(len(lines), 3)
+                self.assertTrue(all("[signed-by=/usr/share/keyrings/debian-archive-keyring.gpg]" in line for line in lines))
+                self.assertTrue(lines[0].endswith(f" {effective} main"))
+                self.assertTrue(lines[1].endswith(f" {effective}-updates main"))
+                self.assertTrue(lines[2].endswith(f"/debian-security {effective}-security main"))
+        for mirror, suite in (("https://mirror.example/debian", "trixie"),
+                              ("https://deb.debian.org/debian", "sid")):
+            result = self.bash('guest_apt_sources "$1" "$2" "$3"', root, mirror, suite)
+            self.assertEqual(result.stdout, f"deb {mirror} {suite} main\n")
+        for mirror, suite in (("http://mirror.example/debian", "trixie"),
+                              ("https://deb.debian.org/debian", "trixie\ntrusted=yes")):
+            result = self.bash('guest_apt_sources "$1" "$2" "$3"', root, mirror, suite)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "")
+
+    CREATE_WORKER_STUBS = r'''
+require_root() { :; }
+mount() { :; }
+umount() { :; }
+worker_cleanup() { :; }
+mount_session_devices() { :; }
+setup_resolv_conf() { :; }
+bootstrap_guest() {
+    printf '%s\n' "$*" >>"$STORE_DIR/bootstrap-calls"
+    mkdir -p "$WORKER_ROOT/etc/apt" "$WORKER_ROOT/var/lib/apt/lists" "$WORKER_ROOT/var/cache/apt/archives"
+    printf 'VERSION_CODENAME=trixie\n' >"$WORKER_ROOT/etc/os-release"
+}
+chroot() {
+    printf '%s\n' "$*" >>"$STORE_DIR/apt-calls"
+    cp "$WORKER_ROOT/etc/apt/sources.list" "$STORE_DIR/active-sources"
+}
+'''
+
+    def test_guest_package_environment_removes_host_paths_and_preserves_explicit_proxy(self):
+        result = self.bash(r'''
+export TMPDIR=/host-only/tmp TMP=/host-only/tmp TEMP=/host-only/tmp
+export APT_CONFIG=/host-only/apt.conf DPKG_ROOT=/host-only/root DEBOOTSTRAP_DIR=/host-only/bootstrap
+export PYTHONPATH=/host-only/python PERL5OPT=-MHostOnly HOST_SENTINEL=must-not-cross
+for variable in http_proxy https_proxy ftp_proxy all_proxy no_proxy HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY NO_PROXY; do unset "$variable"; done
+export https_proxy=https://proxy.example:8443 no_proxy=localhost,.internal
+WORKER_ROOT=unused
+chroot() { shift; "$@"; }
+guest_package_command /usr/bin/env
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        environment = dict(line.split("=", 1) for line in result.stdout.splitlines())
+        self.assertEqual(environment, {
+            "HOME": "/root", "USER": "root", "LOGNAME": "root", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "TMPDIR": "/tmp", "TMP": "/tmp", "TEMP": "/tmp", "DEBIAN_FRONTEND": "noninteractive",
+            "https_proxy": "https://proxy.example:8443", "no_proxy": "localhost,.internal",
+        })
+
+    def test_guest_postinst_mktemp_uses_guest_tmp_when_host_tmpdir_is_absent(self):
+        result = self.bash(r'''
+export TMPDIR=/host-only/nonexistent TMP=/host-only/nonexistent TEMP=/host-only/nonexistent
+WORKER_ROOT=unused
+chroot() { shift; "$@"; }
+guest_package_command /bin/sh -ec '
+    temporary=$(mktemp -t ca-certificates.tmp.XXXXXX)
+    trap '\''rm -f -- "$temporary"'\'' EXIT
+    test "${temporary%/*}" = /tmp
+    printf "%s\n" created-in-guest-tmp
+'
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "created-in-guest-tmp\n")
+
+    def test_bootstrap_environment_is_clean_and_retains_host_search_path_and_sha256(self):
+        bindir = self.store / "bin"
+        bindir.mkdir()
+        bootstrap = bindir / "debootstrap"
+        bootstrap.write_text('#!/bin/sh\n/usr/bin/env\n')
+        bootstrap.chmod(0o755)
+        result = self.bash(r'''
+export TMPDIR=/host-only/tmp TMP=/host-only/tmp TEMP=/host-only/tmp
+export APT_CONFIG=/host-only/apt.conf DEBOOTSTRAP_DIR=/host-only/bootstrap SHA_SIZE=1
+export HOST_SENTINEL=must-not-cross
+PATH="$1:$PATH" bootstrap_guest ignored-arguments
+''', bindir)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        environment = dict(line.split("=", 1) for line in result.stdout.splitlines())
+        self.assertEqual(environment["TMPDIR"], "/tmp")
+        self.assertEqual(environment["SHA_SIZE"], "256")
+        self.assertEqual(environment["DEBIAN_FRONTEND"], "noninteractive")
+        self.assertTrue(environment["PATH"].startswith(str(bindir) + ":"))
+        self.assertNotIn("APT_CONFIG", environment)
+        self.assertNotIn("DEBOOTSTRAP_DIR", environment)
+        self.assertNotIn("HOST_SENTINEL", environment)
+
+
+    def test_online_minimal_creation_applies_verified_security_upgrades(self):
+        result = self.bash(self.CREATE_WORKER_STUBS + '''
+DEBIAN_SUITE=trixie
+worker_main create unused "$STORE_DIR/work" lab amd64 minimal
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = (self.store / "apt-calls").read_text().splitlines()
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(all("/usr/bin/env -i " in call and "TMPDIR=/tmp" in call for call in calls))
+        self.assertIn("update --error-on=any", calls[0])
+        self.assertIn("Acquire::Retries=2", calls[0])
+        self.assertIn("Acquire::https::Timeout=30", calls[0])
+        self.assertIn("--with-new-pkgs -y --no-install-recommends upgrade", calls[1])
+        self.assertTrue(calls[2].endswith("apt-get clean"))
+        self.assertIn("--include=ca-certificates", (self.store / "bootstrap-calls").read_text())
+        self.assertIn("trixie-security", (self.store / "active-sources").read_text())
+
+    def test_custom_minimal_guest_keeps_its_existing_upgrade_policy(self):
+        result = self.bash(self.CREATE_WORKER_STUBS + '''
+DEBIAN_SUITE=trixie DEBIAN_MIRROR=https://mirror.example/debian
+worker_main create unused "$STORE_DIR/work" lab amd64 minimal
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len((self.store / "apt-calls").read_text().splitlines()), 1)
+        self.assertEqual((self.store / "active-sources").read_text(), "deb https://mirror.example/debian trixie main\n")
+
+    def test_failed_security_index_update_prevents_upgrade(self):
+        result = self.bash(self.CREATE_WORKER_STUBS + '''
+chroot() {
+    printf '%s\n' "$*" >>"$STORE_DIR/apt-calls"
+    [[ $* != *'update --error-on=any' ]] || return 44
+}
+DEBIAN_SUITE=trixie
+worker_main create unused "$STORE_DIR/work" lab amd64 minimal
+''')
+        self.assertEqual(result.returncode, 44, result.stderr)
+        self.assertNotIn("upgrade", (self.store / "apt-calls").read_text())
+
+    def test_offline_security_cache_upgrades_without_contacting_network(self):
+        archive = self.store / "archive/trixie-amd64"
+        for directory in (archive / "debs", archive / "lists"):
+            directory.mkdir(parents=True)
+        (archive / "base.tgz").write_text("tarball")
+        (archive / "mirror").write_text("https://deb.debian.org/debian\n")
+        (archive / "security-upgrades").write_text("1\n")
+        # The recorded sources deliberately differ from the currently selected
+        # mirror: cached package indices must use exactly their original URIs.
+        recorded = "deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://deb.debian.org/debian-security trixie-security main\n"
+        (archive / "sources.list").write_text(recorded)
+        result = self.bash(self.CREATE_WORKER_STUBS + '''
+DEBIAN_SUITE=trixie
+worker_main create unused "$STORE_DIR/work" lab amd64 minimal
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = (self.store / "apt-calls").read_text()
+        self.assertNotIn(" update", calls)
+        self.assertTrue(all("/usr/bin/env -i " in call and "TMPDIR=/tmp" in call for call in calls.splitlines()))
+        self.assertIn("--no-download --with-new-pkgs -y --no-install-recommends upgrade", calls)
+        self.assertNotIn(" install ", calls)
+        # After cache consumption, the normal online sources are restored.
+        self.assertEqual(len((self.store / "active-sources").read_text().splitlines()), 3)
+
+    def test_legacy_offline_cache_stays_usable_and_reports_resync_requirement(self):
+        archive = self.store / "archive/trixie-amd64"
+        archive.mkdir(parents=True)
+        (archive / "base.tgz").write_text("tarball")
+        (archive / "mirror").write_text("https://deb.debian.org/debian\n")
+        result = self.bash(self.CREATE_WORKER_STUBS + '''
+DEBIAN_SUITE=trixie
+worker_main create unused "$STORE_DIR/work" lab amd64 minimal
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("older offline archive", result.stderr)
+        self.assertIn("--archive-sync trixie", result.stderr)
+        self.assertEqual(len((self.store / "apt-calls").read_text().splitlines()), 1)
+
+    def test_archive_sync_downloads_security_upgrades_and_records_matching_sources(self):
+        staging = self.store / "staging"
+        for directory in ("scratch", "debs", "lists"):
+            (staging / directory).mkdir(parents=True)
+        result = self.bash(self.CREATE_WORKER_STUBS + '''
+work="$STORE_DIR/work"
+WORKER_ROOT="$work/root"
+mkdir -p "$WORKER_ROOT"
+archive_worker "$1/scratch" trixie amd64 "$1" python
+''', staging)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = (self.store / "apt-calls").read_text().splitlines()
+        self.assertIn("update --error-on=any", calls[0])
+        self.assertIn("--download-only --with-new-pkgs -y --no-install-recommends upgrade", calls[1])
+        self.assertIn("--download-only -y --no-install-recommends install python3", calls[2])
+        self.assertEqual((staging / "security-upgrades").read_text(), "1\n")
+        self.assertEqual((staging / "sources.list").read_text(), (self.store / "active-sources").read_text())
+        self.assertIn("--include=ca-certificates", (self.store / "bootstrap-calls").read_text())
+
+    @unittest.skipUnless(shutil.which("perl"), "optional Perl descriptor helper is unavailable")
+    def test_descriptor_helper_ignores_untrusted_perl_startup_environment(self):
+        archive = self.write_archive()
+        poison = self.store / "perl"
+        poison.mkdir()
+        (poison / "ChrootablePoison.pm").write_text('package ChrootablePoison; BEGIN { die "unsafe startup module loaded"; } 1;')
+        destination = self.store / "copy.tar.gz"
+        result = self.bash('PERL5LIB=$3 PERLLIB=$3 PERL5OPT=-MChrootablePoison PERL_USE_UNSAFE_INC=1 copy_import_archive "$1" "$2"', archive, destination, poison)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(destination.read_bytes(), archive.read_bytes())
+
+    @unittest.skipUnless(shutil.which("perl"), "optional Perl descriptor helper is unavailable")
+    def test_descriptor_copy_child_signal_and_copy_failure_preserve_exit_and_cleanup(self):
+        archive = self.write_archive()
+        for index, mode in enumerate(("signal", "failure")):
+            bindir = self.store / f"bin{index}"
+            bindir.mkdir()
+            if mode == "signal":
+                script = '#!/bin/bash\nkill -TERM "$$"\n'
+                expected = 143
+            else:
+                script = '#!/bin/bash\n[[ $1 != --reflink=always ]] || exit 1\nexit 28\n'
+                expected = 28
+            (bindir / "cp").write_text(script)
+            (bindir / "cp").chmod(0o755)
+            result = self.bash(self.IMPORT_STUBS + 'PATH="$3:$PATH" import_image "$2" "$1" 512 persistent minimal', archive, f"failed{index}", bindir, identifier=f"{index + 1:032x}")
+            self.assertEqual(result.returncode, expected, result.stderr)
+            self.assertFalse((self.store / "images" / f"failed{index}.img").exists())
+            self.assertEqual(list((self.store / "images").glob(".*.partial*")), [])
+
+    @unittest.skipUnless(shutil.which("perl"), "optional Perl descriptor helper is unavailable")
+    def test_descriptor_copy_rejects_symlinks_fifos_and_directories_without_opening_contents(self):
+        destination_dir = self.store / "copy"
+        destination_dir.mkdir()
+        sources = [self.store / "link.tar.gz", self.store / "fifo.tar.gz", self.store / "directory.tar.gz"]
+        sources[0].symlink_to(self.image)
+        os.mkfifo(sources[1])
+        sources[2].mkdir()
+        for source in sources:
+            with self.subTest(source=source):
+                result = self.bash('copy_import_archive "$1" "$2"', source, destination_dir / source.name)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("unsafe file type", result.stderr)
+                self.assertFalse((destination_dir / source.name).exists())
+
+    @unittest.skipUnless(shutil.which("perl"), "optional Perl descriptor helper is unavailable")
+    def test_descriptor_copy_keeps_original_inode_after_path_replacement(self):
+        archive = self.write_archive(payload=b"original data")
+        original = archive.read_bytes()
+        bindir = self.store / "bin"
+        bindir.mkdir()
+        wrapper = bindir / "cp"
+        wrapper.write_text('#!/bin/bash\nCOPY_SOURCE=' + shlex.quote(str(archive)) + '''
+if [[ ! -f "$COPY_SOURCE.saved" ]]; then
+    mv -- "$COPY_SOURCE" "$COPY_SOURCE.saved"
+    printf replaced >"$COPY_SOURCE"
+fi
+if [[ $1 == --reflink=always ]]; then exit 1; fi
+exec /usr/bin/cp "$@"
+''')
+        wrapper.chmod(0o755)
+        destination = self.store / "copy.tar.gz"
+        result = self.bash('export COPY_SOURCE=$1; PATH="$3:$PATH" copy_import_archive "$1" "$2"', archive, destination, bindir)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(destination.read_bytes(), original)
+        self.assertEqual(archive.read_bytes(), b"replaced")
+        self.assertIn("sparse file copy", result.stdout)
+
+    @unittest.skipUnless(shutil.which("perl"), "optional Perl descriptor helper is unavailable")
+    def test_full_copy_space_failure_never_starts_fallback_payload_copy(self):
+        archive = self.write_archive()
+        bindir = self.store / "bin"
+        bindir.mkdir()
+        (bindir / "cp").write_text('#!/bin/bash\nCOPY_CALLS=' + shlex.quote(str(self.store / "copy-calls")) + '\nprintf "%s\\n" "$1" >>"$COPY_CALLS"\nexit 1\n')
+        (bindir / "df").write_text('#!/bin/bash\nprintf "Filesystem 1-blocks Used Available Capacity Mounted\\n/dev/test 4096 4096 0 100%% /\\n"\n')
+        for executable in bindir.iterdir():
+            executable.chmod(0o755)
+        result = self.bash('export COPY_CALLS="$STORE_DIR/copy-calls"; PATH="$3:$PATH" copy_import_archive "$1" "$2"', archive, self.store / "copy.tar.gz", bindir)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Not enough free space for archive copy", result.stderr)
+        self.assertEqual((self.store / "copy-calls").read_text(), "--reflink=always\n")
+        self.assertFalse((self.store / "copy.tar.gz").exists())
+
+    @unittest.skipUnless(shutil.which("perl"), "optional Perl descriptor helper is unavailable")
+    def test_successful_clone_avoids_full_copy_capacity_requirement(self):
+        archive = self.write_archive()
+        bindir = self.store / "bin"
+        bindir.mkdir()
+        (bindir / "cp").write_text('#!/bin/bash\n[[ $1 == --reflink=always ]] || exit 71\nshift\nexec /usr/bin/cp --reflink=never "$@"\n')
+        (bindir / "df").write_text('#!/bin/bash\nexit 72\n')
+        for executable in bindir.iterdir():
+            executable.chmod(0o755)
+        destination = self.store / "copy.tar.gz"
+        result = self.bash('PATH="$3:$PATH" copy_import_archive "$1" "$2"', archive, destination, bindir)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(destination.read_bytes(), archive.read_bytes())
+        self.assertIn("filesystem reflink", result.stdout)
+
 
     def test_validate_tar_archive_rejects_traversal_and_device_nodes(self):
         for member, message in (

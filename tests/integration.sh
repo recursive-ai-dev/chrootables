@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 
 manager_source="$(readlink -f "$(dirname "$0")/../chrootable-manager")"
-test_root="$(mktemp -d /tmp/chrootable-manager-test.XXXXXX)"
+test_root="$(mktemp -d "${TMPDIR:-/tmp}/chrootable-manager-test.XXXXXX")"
 manager_path="$test_root/chrootable-manager"
 inspect_mount="$test_root/inspect"
 shared_dir="$test_root/shared host; [project],data"
@@ -35,7 +35,27 @@ profile=${1:-minimal}
 size=1024
 [[ $profile != python ]] || size=2048
 
-"$manager_path" --create persistent-test "$size" persistent "$profile"
+if [[ ${CHROOTABLE_TEST_ARCHIVE:-0} == 1 ]]; then
+    "$manager_path" --archive-sync "$CHROOTABLE_DEBIAN_SUITE" "$profile"
+    cache="$CHROOTABLE_HOME/archive/$CHROOTABLE_DEBIAN_SUITE-$(dpkg --print-architecture)"
+    test -z "$(find "$cache" ! -user root -print -quit)"
+    test -z "$(find "$cache" -perm /022 -print -quit)"
+    test -z "$(find "$cache" -type l -print -quit)"
+    # Prove cached base, upgrades, and profile dependencies need no network.
+    unshare --net -- "$manager_path" --create persistent-test "$size" persistent "$profile"
+else
+    "$manager_path" --create persistent-test "$size" persistent "$profile"
+fi
+case ${CHROOTABLE_DEBIAN_MIRROR:-https://deb.debian.org/debian} in
+    https://deb.debian.org/debian|https://deb.debian.org/debian/)
+        "$manager_path" --exec persistent-test -- /bin/sh -ec '
+            test -s /etc/ssl/certs/ca-certificates.crt
+            grep -Fqx "deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://deb.debian.org/debian-security trixie-security main" /etc/apt/sources.list
+            apt-cache policy | grep -q "deb.debian.org/debian-security"
+            test -z "$(apt-get -s --with-new-pkgs upgrade | sed -n "/^Inst /p")"
+        '
+        ;;
+esac
 if [[ $profile == python ]]; then
     "$manager_path" --exec persistent-test -- python3 -c 'import venv, ssl; print("Python profile ready")'
 fi

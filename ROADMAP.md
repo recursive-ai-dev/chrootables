@@ -1,17 +1,12 @@
 # Chrootables Roadmap
 
-Status as of 2026-11-03. v1.2.2 hardens archive import, nested snapshot paths,
-atomic export delivery, helper request framing and terminal resource limits.
-The current audit is tracked in `TODO.md`; the completed 1.2.1 audit is preserved
-in `docs/TODO-1.2.1-ARCHIVE.md`. v1.2.0 added validated workspace
-archive import
-(`--import`), desktop interrupted-publication recovery, safe operation
-cancellation, log/export retention management and journal compaction, desktop
-offline archive syncing, sub-GiB (`512 MiB+`) desktop creation, full 7-profile
-interactive TUI parity, embedded terminal search (`Ctrl+Shift+F`) and extended
-VT/SGR sequences, and broadened external terminal support. The project is Apache-2.0.
+Status as of 2026-11-03. v1.3.0 mitigates the remaining 1.2.2 distribution and
+lifecycle limitations: bundled Python/Qt AppImages, native ARM64 CI, anonymous
+export staging, efficient private import snapshots and signed guest security
+updates with offline cache support. Current follow-up work is tracked in
+`TODO.md`; earlier audit TODOs and evidence are preserved under `docs/`.
 Qt desktop and Bash CLI continue to share one image store and the trusted-root
-execution model. Historical audit reports remain under `docs/`.
+execution model. The project is Apache-2.0.
 
 ## Release checks
 
@@ -31,7 +26,7 @@ execution model. Historical audit reports remain under `docs/`.
   artifacts; explicitly pinned AppImage tools/runtime; root minimal/Python
   integration on version tags, release branches and manual runs.
 - Next: signed package repositories (COPR, PPA or OBS), source packages,
-  signed release provenance, and a separately evaluated self-contained AppImage.
+  signed release provenance. Bundled-runtime AppImages are implemented.
   Keep `scripts/install-desktop.py` as the source-checkout path.
 - Release hygiene: audit reports live under `docs/` as historical baselines;
   maintain the CHANGELOG for each release.
@@ -41,8 +36,8 @@ execution model. Historical audit reports remain under `docs/`.
 
 - Implemented: best-effort Arch/openSUSE dependency mappings and Rust, Go,
   and Node.js development profiles.
-- ARM64 images (aarch64 debootstrap is already suite-driven; verify loop
-  mount, OverlayFS, and terminal paths on arm64 hosts).
+- Implemented: native ARM64 Debian tests, package validation, AppImage builds and
+  privileged image/namespace/OverlayFS integration.
 - Next: additional host coverage beyond the Debian/Fedora CI matrix.
 
 ## Phase 3 — Product features (currently stated non-goals)

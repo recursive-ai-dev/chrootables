@@ -1,0 +1,42 @@
+Chrootables portable runtime
+===========================
+
+This AppImage dynamically loads Python 3.13.18, PySide6/Shiboken 6.11.2,
+Qt 6.11.2 (Qt Base, SVG and Wayland), and ICU 73.2 supplied by the upstream wheels.
+Python and its dependencies retain their upstream licenses; Qt/PySide/Shiboken
+are used under the GNU Lesser General Public License, version 3. License texts
+and third-party attribution records are in this directory. Chrootables itself
+remains under its Apache-2.0 license.
+
+The matching Chrootables-VERSION-runtime-sources.tar.gz release asset contains
+the unchanged Qt Base, SVG, Wayland, PySide/Shiboken, CPython and ICU source archives,
+plus the Python Build Standalone build scripts and dependency license texts. It is offered
+from the same release page as the AppImage, at no charge. runtime-manifest.json
+records the exact upstream URLs, SHA256 digests, versions and architecture inputs.
+Python Build Standalone's pythonbuild/downloads.py records its dependency source
+URLs/checksums and cpython-unix contains its build configuration. Qt source archives
+contain their build instructions; PySide's setup.py supports rebuilding its wheels.
+
+You may inspect, modify and replace these libraries, and reverse engineer this
+application to debug your modifications. Extract the AppImage using:
+
+    ./Chrootables-VERSION-REVISION-ARCH.AppImage --appimage-extract
+
+Replace the desired shared libraries in
+squashfs-root/usr/lib/chrootables/runtime/lib/python3.13/site-packages/PySide6/Qt/lib
+or the PySide6/shiboken6 modules in the adjacent site-packages directories, then
+run squashfs-root/AppRun. The portable interpreter is in runtime/bin/python3.
+No runtime checksum enforcement prevents running modified libraries. Keep module
+versions and ABI requirements compatible. For redistribution, rebuild with the
+repository's scripts/build-appimage.py and your reviewed runtime pins/sources.
+
+Only the needed Qt runtime modules/plugins are included; development tools,
+Python packaging tools, tests and bytecode caches are omitted. The runtime does
+not replace host glibc, graphics drivers, X11/Wayland, font or system services.
+Qt wheels require glibc >= 2.34 on x86_64 and >= 2.39 on aarch64.
+
+Upstream documentation:
+https://github.com/astral-sh/python-build-standalone
+https://doc.qt.io/qtforpython-6/licenses.html
+https://doc.qt.io/qt-6/linux-requirements.html
+https://www.qt.io/development/open-source-lgpl-obligations
