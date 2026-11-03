@@ -1,5 +1,14 @@
 # Dependency Security Audit
 
+This is a historical development audit. Its version labels, line numbers, test
+counts, measurements and proposed follow-ups describe that earlier snapshot,
+not the current release. See [the 1.3.0 engineering audit](SPRINT-1.3.0.md) for
+current implementation and verification evidence. In 1.3.0, official guest security
+sources, available upgrades and matching offline archives are implemented and
+tested. The optional advance key-expiry forecast proposed below is not implemented;
+bootstrap/APT signature validation remains enforced. No security-update bypass
+flag from that historical proposal was introduced.
+
 ## Dependency Inventory
 
 ### 1. Manifests, Lockfiles, Package Sources, and Build/Install Scripts

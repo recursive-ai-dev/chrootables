@@ -37,7 +37,7 @@ host-runtime masking. A headless Wayland run also exposed a missing client windo
 decoration plugin and shared temporary extraction interference after root testing.
 Review of the corrective launcher caught detached terminals waiting for
 authentication after GUI exit; a narrowly scoped retention marker prevents
-removing their runtime before the command starts. Privileged helper and export
+removing their runtime before the command starts. Helper and export
 interpreter launches disable bytecode writes so root-owned caches cannot prevent
 the invoking user from removing a completed runtime. The portable test masks host Python executables, PySide and
 Qt libraries inside a private mount namespace. It checks dependency resolution,
@@ -71,15 +71,35 @@ about whole-application speed; filesystem, cache and system load affect results.
   texts, IJG acknowledgment and all seven source archive SHA-256/size pairs.
 - DEB and RPM rebuilt identically across output paths and umasks 022/077; extracted
   CLI, diagnostics, helper and desktop smoke checks passed.
-- Full frozen-source regression, final AppImages, native architecture CI and
-  publication checks remain in progress; exact evidence will close REL-06.
+- Final full local check: **388 tests passed, zero skipped**, syntax checks,
+  both demos and required DEB build. Final inventory medians: fresh 42.561 ms
+  (80 ms budget), cached 1.365 ms (10 ms budget), unchanged render 0.850 ms
+  (2 ms budget). Corresponding p95 values: 56.161, 2.144 and 0.966 ms.
+- Final x86_64 bundled and compatibility AppImages launched normally through FUSE
+  as the user after the root check. Private launch directories were removed.
+  The bundled artifact also passed with host Python/PySide/Qt masked: helper,
+  normal-user export, no bytecode mutation, offscreen, Xvfb/xcb and headless
+  Weston/pixman Wayland rendering with client decorations.
+- [Release-validation CI](https://github.com/recursive-ai-dev/chrootables/actions/runs/41719520388) passed all seven jobs on `3e99b6d`: native x86_64/ARM64
+  tests, installation/upgrade/removal, privileged integration and both AppImage
+  variants. Final tag/publication evidence will be recorded after completion.
+- Local DEB, RPM, bundled/compatibility x86_64 AppImages and runtime source bundle
+  reproduced byte-for-byte across directories and umasks 022/077. The release RPM
+  is selected from Fedora CI, where that exact package passed installation tests;
+  its code/assets/permissions and decompressed documentation match the local RPM.
+  Compressed documentation and RPM metadata differ between the build environments.
+- Build host: Ubuntu 26.04.1 x86_64, Linux 7.0.0-42-generic, Python 3.14.4,
+  PySide6 6.10.2, Bash 5.3.9, dpkg-deb 1.23.7, RPM 6.1.0 and glibc 2.43.
+  SOURCE_DATE_EPOCH=1793059200; AppImage tools/runtime and bundled input pins are
+  recorded in repository manifests. BUILDINFO.txt accompanies release assets.
 
 ## Remaining platform limits
 
 Supported binaries target Linux: architecture-independent DEB/RPM and bundled
 x86_64/aarch64 AppImages. The bundle still requires normal host graphics libraries
-and glibc 2.34+ (x86_64) or 2.39+ (ARM64). Offscreen and X11/Xvfb execution are
-checked; a physical Wayland desktop is not claimed. No Windows/macOS execution is
+and glibc 2.34+ (x86_64) or 2.39+ (ARM64). Offscreen, X11/Xvfb and
+headless Weston/Wayland execution are checked; physical desktop/GPU coverage is
+not claimed. No Windows/macOS execution is
 claimed. Guests run as trusted host-root environments, not security sandboxes.
 Offline caches require refresh to receive future security fixes. Filesystems
 without anonymous staging can retain a recognizable hidden export staging file
@@ -88,3 +108,9 @@ Private AppImage runtimes are retained after abnormal termination or detached
 terminal handoff; remove them only after operations, helpers and sessions finish.
 Explicit upstream extract-and-run mode needs a private TMPDIR to avoid sharing
 content-named extraction paths across users.
+
+An obsolete root-owned extraction from an earlier verification run remains at
+`/tmp/appimage_extracted_568014dbdd34b32f7cc0bd9b7d744d5d`: cached sudo authentication
+expired before cleanup. This is ENV-01 in TODO.md, isolated from the release and
+repository. The corrected harness and final default launches clean their own
+paths. No credentials or authentication bypass were used.

@@ -55,26 +55,26 @@ Nine meaningful follow-up improvements were identified from actual remaining lim
 ## REL-03 — AppImage runtime distribution
 
 - Priority / severity: **P2 / Medium**
-- Status: **IN_PROGRESS**
+- Status: **VERIFIED**
 - Affected components: AppImage builder, runtime manifest, fetcher and portable checks.
 - Problem / evidence: The existing AppImage requires host Python and PySide6, limiting portability.
 - Implementation: Bundle pinned CPython and locked Qt wheels with provenance/licenses and isolated relocated helper launches.
 - Acceptance: AppImage CLI/helper/desktop run without host Python or Qt; builds are reproducible and downloads hash-checked.
 - Required tests: Malformed runtime/cache input, no-host-runtime smoke, reproducibility, GUI/plugin checks and helper isolation.
 - Dependencies: None
-- Verification evidence: 8 runtime tests and actual x86_64 bundled AppImage passed with host Python/PySide/Qt masked; offscreen and Xvfb/xcb rendered. Full frozen-source reproducibility pass pending.
+- Verification evidence: 388 tests passed with zero skips. Both architecture CI AppImage runtime tests passed; pinned source/license audit passed. Final x86_64 bundle passed actual FUSE/default and no-host offscreen/Xvfb/Wayland launch, helper/export and no-bytecode checks. Local builds reproduce across directories and umasks.
 
 ## REL-04 — ARM64 distribution coverage
 
 - Priority / severity: **P2 / Medium**
-- Status: **IN_PROGRESS**
+- Status: **VERIFIED**
 - Affected components: CI matrix and AppImage tool pins.
 - Problem / evidence: No native ARM64 tests or verified architecture-specific AppImage tools exist.
 - Implementation: Add native ARM64 Debian tests/install/integration, pinned ARM AppImage tools and bundled ARM artifacts.
 - Acceptance: Native ARM CI exercises runtime and privileged operations; only verified artifacts are published.
 - Required tests: Native unit/demo/package install/upgrade/removal and minimal/Python privileged integration.
 - Dependencies: REL-03
-- Verification evidence: pending.
+- Verification evidence: Native ARM64 Debian unit/demo/install/upgrade/removal, minimal/offline Python integration, bundled and compatibility AppImage reproducibility/startup, no-host helper/export/Xvfb/Wayland checks passed in CI run 41719520388.
 
 ## REL-05 — Import staging performance and capacity
 
@@ -91,14 +91,14 @@ Nine meaningful follow-up improvements were identified from actual remaining lim
 ## REL-09 — Portable extraction isolation and cleanup
 
 - Priority / severity: **P2 / Medium**
-- Status: **IN_PROGRESS**
+- Status: **VERIFIED**
 - Affected components: AppImage launch and portable verification harness.
 - Problem / evidence: A real root portable check left a root-owned upstream extraction directory in shared /tmp; the next unprivileged launch of the same artifact failed with permission denied before reaching Python.
 - Implementation: Isolate extraction temporary directories and clean owned fixtures deterministically; retain interrupted runtimes and detached terminal handoffs with explicit cleanup guidance; suppress privileged bytecode writes; retain safe permissions and cover supported launch paths.
 - Acceptance: Root verification cannot block a subsequent normal-user launch; invocations never use another user's extraction cache.
 - Required tests: Repeated/overlapping launches, signal handling, detached authentication/handoff, cleanup and real root-to-normal-user startup.
 - Dependencies: REL-03
-- Verification evidence: pending.
+- Verification evidence: Six launcher regressions, 50 desktop tests and 72 backend tests passed within the 388-test full suite. Actual root helper/export created no bytecode and the invoking user removed its runtime. Final root portable check followed by normal-user launches passed; normal exits left no private extraction directories.
 
 ## REL-06 — Release preparation and verification
 
@@ -110,4 +110,15 @@ Nine meaningful follow-up improvements were identified from actual remaining lim
 - Acceptance: All feasible tasks verified; final CI and downloaded release assets pass; limitations documented precisely.
 - Required tests: Full local suite, native CI, reproducible builds and post-publication checksum verification.
 - Dependencies: REL-01 through REL-05, REL-07, REL-08, REL-09
-- Verification evidence: pending.
+- Verification evidence: 388 local tests passed with zero skips; all seven native CI jobs passed on 3e99b6d (run 41719520388). Local reproducibility and final portable startup checks passed. Tag publication and downloaded-release verification pending.
+
+## ENV-01 — Remove obsolete root-owned verification fixture
+
+- Priority / severity: **P3 / Low** (local environment cleanup, not an application defect)
+- Status: **BLOCKED**
+- Affected component: `/tmp/appimage_extracted_568014dbdd34b32f7cc0bd9b7d744d5d` from an earlier root AppImage check.
+- Problem / evidence: The old upstream runtime retained this root-owned extraction. Final artifacts use different contents and the corrected harness owns and cleans its own temporary paths. Both cleanup attempts returned `sudo: interactive authentication is required` after cached authorization expired.
+- Proposed action: Renew sudo authentication, then remove only that obsolete directory; no credentials are stored or bypass attempted.
+- Acceptance: The exact directory no longer exists; unrelated temporary directories remain intact.
+- Required test: Confirm no process uses the old fixture, remove it, verify absence.
+- Dependencies: External sudo authentication. Release verification and publication can proceed independently.
