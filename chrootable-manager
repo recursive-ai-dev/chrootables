@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Debian image workspaces. Self-contained for easy installation.
+#
+# Code-quality sprint notes live in docs/SPRINT-CODE-QUALITY-2026-11-25.md.
 set -Eeuo pipefail
 
 APP_NAME="Chrootable Manager"
@@ -8,6 +10,7 @@ SCRIPT_PATH=${BASH_SOURCE[0]}
 # The desktop backend pins its own default suite in backend.py; the CLI keeps
 # the moving stable alias so interactive creates follow the current stable
 # release, while the desktop always sends an advertised suite explicitly.
+# This store default mirrors backend.DEFAULT_STORE; change them together.
 STORE_DIR=${CHROOTABLE_HOME:-/var/lib/chrootable-manager}
 DEBIAN_SUITE=${CHROOTABLE_DEBIAN_SUITE:-stable}
 DEBIAN_MIRROR=${CHROOTABLE_DEBIAN_MIRROR:-https://deb.debian.org/debian}
