@@ -12,7 +12,7 @@ import stat
 import sys
 import time
 
-from PySide6.QtCore import Qt, QEvent, QSettings, QSize, QTimer, QProcess
+from PySide6.QtCore import Qt, QEvent, QProcess, QSettings, QSize, QTimer
 from PySide6.QtGui import QColor, QFont, QIcon, QKeySequence, QPainter, QPen, QPixmap, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame, QHBoxLayout, QVBoxLayout,
@@ -27,6 +27,15 @@ from .backend import DEFAULT_STORE, ROOT, PROFILES, SUITES, archive_file, name, 
 from .client import Client
 from .style import STYLE, scaled_style
 from .terminal import TerminalWindow
+
+# Fixed interface limits and delays (Qt intervals are milliseconds).
+NOTES_MAX_CHARS = 4000
+NOTES_PREVIEW_CHARS = 240
+WORKSPACE_ROW_HEIGHT = 93
+OUTPUT_BLOCK_LIMIT = 4000
+POLL_INTERVAL_MS = 6000
+REFRESH_DELAY_MS = 1500
+CAPTURE_DELAY_MS = 1800
 
 
 def label(text, role=None, wrap=False):
@@ -56,13 +65,28 @@ def box(horizontal=False, margins=0, spacing=12):
     return widget, layout
 
 
-def clear(layout):
-    while layout.count():
-        item = layout.takeAt(0)
-        if item.widget():
-            item.widget().deleteLater()
-        elif item.layout():
-            clear(item.layout())
+def profile_combo():
+    """Build the profile selector shared by the create and import dialogs."""
+    combo = QComboBox()
+    for key, (title, description, suggested) in PROFILES.items():
+        combo.addItem(title, key)
+    return combo
+
+
+def suite_combo():
+    """Build the Debian release selector shared by the create and import dialogs."""
+    combo = QComboBox()
+    for key, title in SUITES.items():
+        combo.addItem(title, key)
+    return combo
+
+
+def lifecycle_combo():
+    """Build the persistent/disposable selector shared by the session dialogs."""
+    combo = QComboBox()
+    combo.addItem("Persistent — keep my changes", "persistent")
+    combo.addItem("Disposable — reset after every session", "ephemeral")
+    return combo
 
 
 def capacity(mib):
@@ -126,13 +150,9 @@ class CreateDialog(QDialog):
         self.name_input = QLineEdit()
         self.name_input.setPlaceholderText("e.g. python-playground")
         self.name_input.setObjectName("workspaceName")
-        self.profile = QComboBox()
-        for key, (title, description, suggested) in PROFILES.items():
-            self.profile.addItem(title, key)
+        self.profile = profile_combo()
         self.profile_description = label(PROFILES["minimal"][1], "muted", True)
-        self.suite = QComboBox()
-        for key, title in SUITES.items():
-            self.suite.addItem(title, key)
+        self.suite = suite_combo()
         size_row_widget, size_row = box(horizontal=True, spacing=8)
         self.size_input = QSpinBox()
         self.size_input.setRange(1, 1024)
@@ -144,9 +164,7 @@ class CreateDialog(QDialog):
         self.size_unit.setAccessibleName("Capacity unit")
         size_row.addWidget(self.size_input, 1)
         size_row.addWidget(self.size_unit)
-        self.lifecycle = QComboBox()
-        self.lifecycle.addItem("Persistent — keep my changes", "persistent")
-        self.lifecycle.addItem("Disposable — reset after every session", "ephemeral")
+        self.lifecycle = lifecycle_combo()
         form.addRow("Workspace name", self.name_input)
         form.addRow("Starting profile", self.profile)
         form.addRow("", self.profile_description)
@@ -244,12 +262,8 @@ class ImportDialog(QDialog):
                     stem = stem[:-len(suffix)]
                     break
             self.name_input.setText(stem[:56] + "-import" if stem else "")
-        self.profile = QComboBox()
-        for key, (title, description, suggested) in PROFILES.items():
-            self.profile.addItem(title, key)
-        self.suite = QComboBox()
-        for key, title in SUITES.items():
-            self.suite.addItem(title, key)
+        self.profile = profile_combo()
+        self.suite = suite_combo()
         self.size_input = QSpinBox()
         self.size_input.setRange(512, 1048576)
         self.size_input.setSingleStep(512)
@@ -262,9 +276,7 @@ class ImportDialog(QDialog):
         size_widget, size_row = box(horizontal=True, spacing=8)
         size_row.addWidget(self.size_input, 1)
         size_row.addWidget(self.auto_size)
-        self.lifecycle = QComboBox()
-        self.lifecycle.addItem("Persistent — keep my changes", "persistent")
-        self.lifecycle.addItem("Disposable — reset after every session", "ephemeral")
+        self.lifecycle = lifecycle_combo()
         form.addRow("Archive (.tar.gz)", archive_widget)
         form.addRow("Workspace name", self.name_input)
         form.addRow("Profile metadata", self.profile)
@@ -446,8 +458,8 @@ class NotesDialog(QDialog):
 
     def validate(self):
         length = len(self.editor.toPlainText())
-        self.limit_label.setText(f"{length:,} / 4,000 characters")
-        self.save_button.setEnabled(length <= 4000)
+        self.limit_label.setText(f"{length:,} / {NOTES_MAX_CHARS:,} characters")
+        self.save_button.setEnabled(length <= NOTES_MAX_CHARS)
 
     def value(self):
         return self.editor.toPlainText().strip()
@@ -519,7 +531,7 @@ class Window(QMainWindow):
                     pass
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._poll_timer)
-        self.timer.start(6000)
+        self.timer.start(POLL_INTERVAL_MS)
         for keys, callback in [("Ctrl+N", self.create), ("Ctrl+F", self.focus_search), ("F5", self.refresh), ("Ctrl+Return", self.open_terminal)]:
             shortcut = QShortcut(QKeySequence(keys), self)
             shortcut.activated.connect(callback)
@@ -534,6 +546,26 @@ class Window(QMainWindow):
     def build_ui(self):
         central, horizontal = box(horizontal=True, spacing=0)
         self.setCentralWidget(central)
+        self.build_sidebar(horizontal)
+        content, self.content_layout = box(margins=16, spacing=12)
+        self.content_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        self.content_scroll = QScrollArea()
+        self.content_scroll.setWidgetResizable(True)
+        self.content_scroll.setWidget(content)
+        horizontal.addWidget(self.content_scroll, 1)
+        self.build_header()
+        self.build_notice()
+        self.pages = QStackedWidget()
+        self.content_layout.addWidget(self.pages, 1)
+        self.build_library()
+        self.build_recovery()
+        self.build_activity()
+        self.build_health()
+        self.build_task_panel()
+        self.build_footer()
+
+    def build_sidebar(self, horizontal):
+        """Build the brand, navigation and store controls column."""
         sidebar = QFrame()
         self.sidebar = sidebar
         sidebar.setObjectName("sidebar")
@@ -586,12 +618,8 @@ class Window(QMainWindow):
         self.sidebar_scroll.setFixedWidth(196)
         horizontal.addWidget(self.sidebar_scroll)
 
-        content, self.content_layout = box(margins=16, spacing=12)
-        self.content_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
-        self.content_scroll = QScrollArea()
-        self.content_scroll.setWidgetResizable(True)
-        self.content_scroll.setWidget(content)
-        horizontal.addWidget(self.content_scroll, 1)
+    def build_header(self):
+        """Build the page title row with refresh, import and create actions."""
         top, row = box(horizontal=True)
         headings, titles = box(spacing=6)
         self.eyebrow = label("WORKSPACE LIBRARY", "eyebrow")
@@ -613,6 +641,8 @@ class Window(QMainWindow):
         row.addWidget(self.new_button)
         self.content_layout.addWidget(top)
 
+    def build_notice(self):
+        """Build the dismissible health banner row."""
         self.notice = QFrame()
         self.notice.setObjectName("notice")
         notice_row = QHBoxLayout(self.notice)
@@ -623,13 +653,8 @@ class Window(QMainWindow):
         self.notice.hide()
         self.content_layout.addWidget(self.notice)
 
-        self.pages = QStackedWidget()
-        self.content_layout.addWidget(self.pages, 1)
-        self.build_library()
-        self.build_recovery()
-        self.build_activity()
-        self.build_health()
-
+    def build_task_panel(self):
+        """Build the streaming task output panel with its progress and cancel."""
         self.task_panel, task_layout = box(spacing=8)
         task_top, task_row = box(horizontal=True)
         self.task_title = label("Task output", "section")
@@ -655,11 +680,14 @@ class Window(QMainWindow):
         task_layout.addWidget(self.task_progress)
         self.task_output = QPlainTextEdit()
         self.task_output.setReadOnly(True)
-        self.task_output.setMaximumBlockCount(4000)
+        self.task_output.setMaximumBlockCount(OUTPUT_BLOCK_LIMIT)
         self.task_output.setFixedHeight(100)
         task_layout.addWidget(self.task_output)
         self.task_panel.hide()
         self.content_layout.addWidget(self.task_panel)
+
+    def build_footer(self):
+        """Build the status bar row under the pages."""
         footer, footer_row = box(horizontal=True)
         self.status = label("Reading local workspaces…", "muted", True)
         footer_row.addWidget(self.status, 1)
@@ -1082,6 +1110,15 @@ class Window(QMainWindow):
         self.terminal_button = button("›_  Open terminal", self.open_terminal, "primary")
         self.terminal_button.setToolTip("Open in your native terminal · Ctrl Return")
         layout.addWidget(self.terminal_button)
+        self.build_detail_session(layout)
+        self.build_detail_metadata(layout)
+        self.build_detail_notes(layout)
+        self.build_detail_actions(layout)
+        self.detail_card = card
+        self.details.setWidget(card)
+
+    def build_detail_session(self, layout):
+        """Build the session isolation, shared folder and trial controls."""
         self.offline = QCheckBox("Isolate network for this session")
         self.offline.setToolTip("Only loopback is available; internet and host networking are disconnected.")
         self.offline.toggled.connect(lambda checked: self.save_session_choice("isolated", checked))
@@ -1112,6 +1149,9 @@ class Window(QMainWindow):
         self.trial_button = button("Try a disposable session", lambda: self.open_terminal(disposable=True))
         layout.addWidget(self.trial_button)
         layout.addSpacing(2)
+
+    def build_detail_metadata(self, layout):
+        """Build the distribution, storage, session and recovery field grid."""
         metadata = QWidget()
         metadata.setStyleSheet("background: transparent;")
         grid = QGridLayout(metadata)
@@ -1128,6 +1168,9 @@ class Window(QMainWindow):
             field_layout.addWidget(val_label)
             grid.addWidget(field, r, c, 1, span)
         layout.addWidget(metadata)
+
+    def build_detail_notes(self, layout):
+        """Build the personal notes header and preview labels."""
         notes_header, notes_row = box(horizontal=True, spacing=8)
         notes_row.addWidget(label("PERSONAL NOTES", "eyebrow"), 1)
         self.notes_button = button("Edit notes…", self.edit_notes, "quiet")
@@ -1136,6 +1179,9 @@ class Window(QMainWindow):
         self.notes_preview = label("", "muted", True)
         layout.addWidget(self.notes_preview)
         layout.addStretch()
+
+    def build_detail_actions(self, layout):
+        """Build the snapshot button and the ••• maintenance menu."""
         actions, row = box(horizontal=True, spacing=8)
         self.save_snapshot_button = button("Save snapshot", self.snapshot)
         row.addWidget(self.save_snapshot_button, 1)
@@ -1160,8 +1206,6 @@ class Window(QMainWindow):
         self.more_button.setMenu(menu)
         row.addWidget(self.more_button)
         layout.addWidget(actions)
-        self.detail_card = card
-        self.details.setWidget(card)
 
     def render_library(self):
         if self.store_locked:
@@ -1216,7 +1260,7 @@ class Window(QMainWindow):
             else:
                 item = QListWidgetItem()
                 item.setData(Qt.ItemDataRole.UserRole, data)
-                item.setSizeHint(QSize(0, 93))
+                item.setSizeHint(QSize(0, WORKSPACE_ROW_HEIGHT))
                 self.workspaces.addItem(item)
                 self.workspaces.setItemWidget(item, WorkspaceRow(data, fav))
             item.setData(
@@ -1241,7 +1285,7 @@ class Window(QMainWindow):
             self.empty_text.setText("Try a different search or filter." if filtered else "Start with a clean Debian image or a ready-to-build profile.\nKeep your changes, or start fresh every time.")
             self.empty_create.setVisible(not filtered)
 
-    def select_workspace(self, item, previous=None):
+    def select_workspace(self, item, _previous=None):
         if item is None:
             return
         data = item.data(Qt.ItemDataRole.UserRole)
@@ -1280,7 +1324,7 @@ class Window(QMainWindow):
             self.offline.setEnabled(can_configure)
             self.restricted.setEnabled(can_configure)
             self.notes_button.setEnabled(not self.demo)
-            self.notes_preview.setText(notes[:240] + ("…" if len(notes) > 240 else "") if notes else "Add project details or commands to remember.")
+            self.notes_preview.setText(notes[:NOTES_PREVIEW_CHARS] + ("…" if len(notes) > NOTES_PREVIEW_CHARS else "") if notes else "Add project details or commands to remember.")
             self.share_path.setToolTip(share or "Choose a host folder to make it available at /shared.")
             self.share_choose.setEnabled(can_configure)
             self.share_clear.setEnabled(can_configure and bool(share))
@@ -1313,15 +1357,15 @@ class Window(QMainWindow):
 
     def workspace_notes(self, target):
         if target not in self.notes_cache:
-            self.notes_cache[target] = "" if self.demo else self.settings.value(self.session_settings_prefix + "/" + target + "/notes", "", type=str)[:4000]
+            self.notes_cache[target] = "" if self.demo else self.settings.value(self.session_settings_prefix + "/" + target + "/notes", "", type=str)[:NOTES_MAX_CHARS]
         return self.notes_cache[target]
 
     def save_notes(self, target, text):
         if self.demo:
             return
         name(target)
-        if len(text) > 4000:
-            raise ValueError("Notes must be at most 4,000 characters.")
+        if len(text) > NOTES_MAX_CHARS:
+            raise ValueError(f"Notes must be at most {NOTES_MAX_CHARS:,} characters.")
         self.notes_cache[target] = text
         self.settings.setValue(self.session_settings_prefix + "/" + target + "/notes", text)
         self.render_library()
@@ -1712,7 +1756,7 @@ class Window(QMainWindow):
         if hasattr(self, "splitter"):
             self.update_compact_layout()
 
-    def open_terminal(self, checked=False, disposable=False):
+    def open_terminal(self, _checked=False, disposable=False):
         data = self.selected_data()
         if not data or self.demo or self.busy or data["status"] == "busy":
             return
@@ -1758,7 +1802,7 @@ class Window(QMainWindow):
         window.finished.connect(lambda: self.terminals.remove(window))
         window.show()
         self.status.setText("Embedded terminal opened. Administrator authentication happens in the terminal.")
-        QTimer.singleShot(1500, self.refresh)
+        QTimer.singleShot(REFRESH_DELAY_MS, self.refresh)
 
     def check_health(self):
         if self.demo or not self.client.is_ready:
@@ -1882,7 +1926,7 @@ def main():
             args.screenshot.parent.mkdir(parents=True, exist_ok=True)
             window.grab().save(str(args.screenshot))
             window.close()
-        QTimer.singleShot(1800, capture)
+        QTimer.singleShot(CAPTURE_DELAY_MS, capture)
     return app.exec()
 
 

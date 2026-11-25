@@ -96,9 +96,6 @@ class Style:
     def __hash__(self):
         return hash((self.fg, self.bg, self.flags))
 
-    def replaced(self, fg=None, bg=None, flags=0):
-        return Style(fg, bg, flags)
-
 
 DEFAULT_STYLE = Style()
 
@@ -289,6 +286,44 @@ class VtScreen:
         if not preserve_wrap:
             self._clamp_cursor()
         count = lambda index=0: max(1, self._param(index))
+        self._csi_dispatch(final, count)
+        self._clamp_cursor(preserve_wrap=preserve_wrap)
+
+    def _csi_dispatch(self, final, count):
+        """Route one validated CSI sequence to its focused handler."""
+        if final in ("A", "B", "e", "C", "a", "D", "E", "F", "G", "`", "H", "f", "d"):
+            self._csi_move(final, count)
+        elif final in ("J", "K", "X"):
+            self._csi_erase(final, count)
+        elif final in ("L", "M", "S", "T"):
+            self._csi_scroll(final, count)
+        elif final == "@":  # ICH
+            self._insert_blanks(count())
+        elif final == "P":  # DCH
+            self._delete_cells(count())
+        elif final == "b":  # REP
+            if self._last_char:
+                for _ in range(min(count(), self.columns * self.rows)):
+                    self._put(self._last_char)
+        elif final == "r":  # DECSTBM
+            top = self._param(0, 1) - 1
+            bottom = self._param(1, self.rows) - 1 if self._param_count() > 1 else self.rows - 1
+            if 0 <= top < bottom < self.rows:
+                self._top, self._bottom = top, bottom
+                self.row, self.column = 0, 0
+        elif final == "s":
+            self._save_cursor()
+        elif final == "u":
+            self._restore_cursor()
+        elif final in ("n", "c"):
+            self._csi_report(final)
+        elif final == "m":
+            self._apply_sgr()
+        elif final in ("h", "l"):
+            self._apply_mode(final == "h")
+
+    def _csi_move(self, final, count):
+        """Cursor movement and absolute positioning sequences."""
         if final == "A":
             self.row -= count()
         elif final in ("B", "e"):
@@ -310,7 +345,10 @@ class VtScreen:
             self.column = self._param(1, 1) - 1
         elif final == "d":
             self.row = count() - 1
-        elif final == "J":
+
+    def _csi_erase(self, final, count):
+        """Erase display and line sequences, including ECH."""
+        if final == "J":
             mode = self._param(0, 0) if self._param_count() else 0
             if mode == 3:
                 self.history.clear()
@@ -333,7 +371,12 @@ class VtScreen:
                 self._erase(self.row, 0, min(self.column + 1, self.columns))
             else:
                 self._erase(self.row, 0, self.columns)
-        elif final == "L":
+        elif final == "X":  # ECH
+            self._erase(self.row, self.column, min(self.columns, self.column + count()))
+
+    def _csi_scroll(self, final, count):
+        """Insert, delete and scroll sequences that shift whole lines."""
+        if final == "L":
             for _ in range(min(count(), self._bottom - self.row + 1)):
                 del self.lines[self._bottom]
                 self.lines.insert(self.row, self._blank_line())
@@ -341,31 +384,14 @@ class VtScreen:
             for _ in range(min(count(), self._bottom - self.row + 1)):
                 del self.lines[self.row]
                 self.lines.insert(self._bottom, self._blank_line())
-        elif final == "@":  # ICH
-            self._insert_blanks(count())
-        elif final == "P":  # DCH
-            self._delete_cells(count())
         elif final == "S":
             self._scroll_up(count())
         elif final == "T":
             self._scroll_down(count())
-        elif final == "X":  # ECH
-            self._erase(self.row, self.column, min(self.columns, self.column + count()))
-        elif final == "b":  # REP
-            if self._last_char:
-                for _ in range(min(count(), self.columns * self.rows)):
-                    self._put(self._last_char)
-        elif final == "r":  # DECSTBM
-            top = self._param(0, 1) - 1
-            bottom = self._param(1, self.rows) - 1 if self._param_count() > 1 else self.rows - 1
-            if 0 <= top < bottom < self.rows:
-                self._top, self._bottom = top, bottom
-                self.row, self.column = 0, 0
-        elif final == "s":
-            self._save_cursor()
-        elif final == "u":
-            self._restore_cursor()
-        elif final == "n":  # DSR
+
+    def _csi_report(self, final):
+        """Cursor and identity report responses."""
+        if final == "n":  # DSR
             mode = self._param(0, 0)
             if mode == 5:
                 self.responses.append("\x1b[0n")
@@ -374,11 +400,6 @@ class VtScreen:
         elif final == "c":  # DA: VT220 with ANSI color
             if self._param(0, 0) == 0:
                 self.responses.append("\x1b[?62;22c")
-        elif final == "m":
-            self._apply_sgr()
-        elif final in ("h", "l"):
-            self._apply_mode(final == "h")
-        self._clamp_cursor(preserve_wrap=preserve_wrap)
 
     def _apply_sgr(self):
         chunks = [chunk for chunk in self._params.split(";")] if self._params else ["0"]
@@ -390,62 +411,73 @@ class VtScreen:
         while index < len(params):
             value = params[index]
             if isinstance(value, list):  # ISO 8613-6 colon form
-                head = value[0]
-                if head in ("38", "48"):
-                    color = self._colon_color(value)
-                    if head == "38":
-                        fg = color
-                    else:
-                        bg = color
-                elif head == "4":
-                    flags = flags & ~UNDERLINE if value[1:2] == ["0"] else flags | UNDERLINE
-            elif value == 0:
-                fg, bg, flags = None, None, 0
-            elif value == 1:
-                flags |= BOLD
-            elif value == 2:
-                flags |= DIM
-            elif value == 3:
-                flags |= ITALIC
-            elif value == 4:
-                flags |= UNDERLINE
-            elif value == 7:
-                flags |= REVERSE
-            elif value == 9:
-                flags |= STRIKE
-            elif value == 21:
-                flags &= ~BOLD
-            elif value == 22:
-                flags &= ~(BOLD | DIM)
-            elif value == 23:
-                flags &= ~ITALIC
-            elif value == 24:
-                flags &= ~UNDERLINE
-            elif value == 27:
-                flags &= ~REVERSE
-            elif value == 29:
-                flags &= ~STRIKE
-            elif 30 <= value <= 37:
-                fg = value - 30
-            elif value == 39:
-                fg = None
-            elif 40 <= value <= 47:
-                bg = value - 40
-            elif value == 49:
-                bg = None
-            elif 90 <= value <= 97:
-                fg = value - 90 + 8
-            elif 100 <= value <= 107:
-                bg = value - 100 + 8
-            elif value in (38, 48):
-                color, next_index = self._extended_color(params, index + 1)
-                if value == 38:
-                    fg = color
-                else:
-                    bg = color
-                index = next_index
+                fg, bg, flags = self._sgr_colon_group(value, fg, bg, flags)
+            else:
+                fg, bg, flags, index = self._sgr_numeric(params, index, value, fg, bg, flags)
             index += 1
         self.style = Style(fg, bg, flags)
+
+    def _sgr_colon_group(self, value, fg, bg, flags):
+        """Apply one ISO 8613-6 colon-separated parameter group."""
+        head = value[0]
+        if head in ("38", "48"):
+            color = self._colon_color(value)
+            if head == "38":
+                fg = color
+            else:
+                bg = color
+        elif head == "4":
+            flags = flags & ~UNDERLINE if value[1:2] == ["0"] else flags | UNDERLINE
+        return fg, bg, flags
+
+    def _sgr_numeric(self, params, index, value, fg, bg, flags):
+        """Apply one numeric SGR parameter; returns state and the resume index."""
+        next_index = index
+        if value == 0:
+            fg, bg, flags = None, None, 0
+        elif value == 1:
+            flags |= BOLD
+        elif value == 2:
+            flags |= DIM
+        elif value == 3:
+            flags |= ITALIC
+        elif value == 4:
+            flags |= UNDERLINE
+        elif value == 7:
+            flags |= REVERSE
+        elif value == 9:
+            flags |= STRIKE
+        elif value == 21:
+            flags &= ~BOLD
+        elif value == 22:
+            flags &= ~(BOLD | DIM)
+        elif value == 23:
+            flags &= ~ITALIC
+        elif value == 24:
+            flags &= ~UNDERLINE
+        elif value == 27:
+            flags &= ~REVERSE
+        elif value == 29:
+            flags &= ~STRIKE
+        elif 30 <= value <= 37:
+            fg = value - 30
+        elif value == 39:
+            fg = None
+        elif 40 <= value <= 47:
+            bg = value - 40
+        elif value == 49:
+            bg = None
+        elif 90 <= value <= 97:
+            fg = value - 90 + 8
+        elif 100 <= value <= 107:
+            bg = value - 100 + 8
+        elif value in (38, 48):
+            color, next_index = self._extended_color(params, index + 1)
+            if value == 38:
+                fg = color
+            else:
+                bg = color
+        return fg, bg, flags, next_index
 
     def _extended_color(self, params, index):
         mode = params[index] if index < len(params) else 5
@@ -547,81 +579,98 @@ class VtScreen:
                 continue
             state = self._state
             if state == _GROUND:
-                if character == "\x1b":
-                    self._state = _ESC
-                elif character == "\r":
-                    self.column = 0
-                elif character in "\n\x0b\x0c":
-                    self._line_feed()
-                elif character == "\x0e":  # SO
-                    self._shift = 1
-                elif character == "\x0f":  # SI
-                    self._shift = 0
-                elif character == "\t":
-                    self.column = min(self.columns - 1, (self.column // 8 + 1) * 8)
-                elif character == "\b":
-                    self.column = max(0, min(self.column, self.columns - 1) - 1)
-                elif character >= " ":
-                    self._put(character)
-                # BEL, NUL and other C0 controls are ignored.
+                self._feed_ground(character)
             elif state == _ESC:
-                if character == "[":
-                    self._state = _CSI
-                    self._params = ""
-                elif character == "]":
-                    self._state = _OSC
-                elif character in "PX^_":  # DCS, SOS, PM, APC
-                    self._state = _STRING
-                elif character in "()*+":
-                    self._state = _CHARSET
-                    self._charset_target = "()*+".index(character)
-                elif " " <= character <= "/":  # Other two-byte escapes, such as ESC # 8.
-                    self._state = _CHARSET
-                    self._charset_target = None
-                else:
-                    self._state = _GROUND
-                    if character == "7":
-                        self._save_cursor()
-                    elif character == "8":
-                        self._restore_cursor()
-                    elif character == "D":
-                        self._line_feed()
-                    elif character == "M":
-                        self._reverse_line_feed()
-                    elif character == "E":
-                        self._line_feed()
-                        self.column = 0
-                    elif character == "c":
-                        self._reset()
+                self._feed_escape(character)
             elif state in (_CSI, _CSI_IGNORE):
-                if character == "\x1b":
-                    self._state = _ESC
-                elif "@" <= character <= "~":
-                    self._state = _GROUND
-                    if state == _CSI:
-                        self._apply_csi(character)
-                elif state == _CSI:
-                    if " " <= character <= "?" and len(self._params) < MAX_CSI_PARAMS:
-                        self._params += character
-                    else:
-                        # Consume the rest without retaining unbounded parameters.
-                        self._state = _CSI_IGNORE
-            elif state == _OSC:
-                if character == "\x07":
-                    self._state = _GROUND
-                elif character == "\x1b":
-                    self._state = _OSC_ESC
-            elif state == _OSC_ESC:
+                self._feed_csi(state, character)
+            else:
+                self._feed_string(state, character)
+
+    def _feed_ground(self, character):
+        """Interpret one C0 control or printable character."""
+        if character == "\x1b":
+            self._state = _ESC
+        elif character == "\r":
+            self.column = 0
+        elif character in "\n\x0b\x0c":
+            self._line_feed()
+        elif character == "\x0e":  # SO
+            self._shift = 1
+        elif character == "\x0f":  # SI
+            self._shift = 0
+        elif character == "\t":
+            self.column = min(self.columns - 1, (self.column // 8 + 1) * 8)
+        elif character == "\b":
+            self.column = max(0, min(self.column, self.columns - 1) - 1)
+        elif character >= " ":
+            self._put(character)
+        # BEL, NUL and other C0 controls are ignored.
+
+    def _feed_escape(self, character):
+        """Interpret the byte after ESC: introducers and single-char escapes."""
+        if character == "[":
+            self._state = _CSI
+            self._params = ""
+        elif character == "]":
+            self._state = _OSC
+        elif character in "PX^_":  # DCS, SOS, PM, APC
+            self._state = _STRING
+        elif character in "()*+":
+            self._state = _CHARSET
+            self._charset_target = "()*+".index(character)
+        elif " " <= character <= "/":  # Other two-byte escapes, such as ESC # 8.
+            self._state = _CHARSET
+            self._charset_target = None
+        else:
+            self._state = _GROUND
+            if character == "7":
+                self._save_cursor()
+            elif character == "8":
+                self._restore_cursor()
+            elif character == "D":
+                self._line_feed()
+            elif character == "M":
+                self._reverse_line_feed()
+            elif character == "E":
+                self._line_feed()
+                self.column = 0
+            elif character == "c":
+                self._reset()
+
+    def _feed_csi(self, state, character):
+        """Collect CSI parameters or dispatch the final byte."""
+        if character == "\x1b":
+            self._state = _ESC
+        elif "@" <= character <= "~":
+            self._state = _GROUND
+            if state == _CSI:
+                self._apply_csi(character)
+        elif state == _CSI:
+            if " " <= character <= "?" and len(self._params) < MAX_CSI_PARAMS:
+                self._params += character
+            else:
+                # Consume the rest without retaining unbounded parameters.
+                self._state = _CSI_IGNORE
+
+    def _feed_string(self, state, character):
+        """Track OSC/DCS string states, their terminators and charset selection."""
+        if state == _OSC:
+            if character == "\x07":
                 self._state = _GROUND
-            elif state == _STRING:
-                if character == "\x1b":
-                    self._state = _STRING_ESC
-            elif state == _STRING_ESC:
-                self._state = _GROUND if character == "\\" else _STRING
-            elif state == _CHARSET:
-                self._state = _GROUND
-                if self._charset_target in (0, 1):
-                    self._charsets[self._charset_target] = "0" if character == "0" else "B"
+            elif character == "\x1b":
+                self._state = _OSC_ESC
+        elif state == _OSC_ESC:
+            self._state = _GROUND
+        elif state == _STRING:
+            if character == "\x1b":
+                self._state = _STRING_ESC
+        elif state == _STRING_ESC:
+            self._state = _GROUND if character == "\\" else _STRING
+        elif state == _CHARSET:
+            self._state = _GROUND
+            if self._charset_target in (0, 1):
+                self._charsets[self._charset_target] = "0" if character == "0" else "B"
 
     def resize(self, rows, columns):
         rows = max(2, rows)
@@ -977,9 +1026,13 @@ class TerminalPane(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        background = QColor("#1c1c1c")
-        foreground = QColor("#e6e6e2")
-        painter.fillRect(self.rect(), background)
+        painter.fillRect(self.rect(), QColor("#1c1c1c"))
+        self._paint_cells(painter)
+        self._paint_selection(painter)
+        self._paint_cursor(painter)
+
+    def _paint_cells(self, painter):
+        """Paint the visible grid, batching runs of ordinary monospaced text."""
         fonts = {}
         last_flags = None
         for row, line in enumerate(self.screen.viewport(self.scroll_offset)):
@@ -1027,19 +1080,26 @@ class TerminalPane(QWidget):
                 painter.setPen(text_color)
                 painter.drawText(column * self.cell_width, y + self._metrics.ascent(), text)
                 column += width
-        if self._selection_start is not None and self._selection_end is not None:
-            start, end = sorted((self._selection_start, self._selection_end))
-            for row in range(start[0], end[0] + 1):
-                left = start[1] if row == start[0] else 0
-                right = end[1] if row == end[0] else self.screen.columns
-                painter.fillRect(left * self.cell_width, row * self.cell_height,
-                                 (right - left) * self.cell_width, self.cell_height,
-                                 QColor(100, 160, 220, 100))
+
+    def _paint_selection(self, painter):
+        """Paint the active selection rectangle rows."""
+        if self._selection_start is None or self._selection_end is None:
+            return
+        start, end = sorted((self._selection_start, self._selection_end))
+        for row in range(start[0], end[0] + 1):
+            left = start[1] if row == start[0] else 0
+            right = end[1] if row == end[0] else self.screen.columns
+            painter.fillRect(left * self.cell_width, row * self.cell_height,
+                             (right - left) * self.cell_width, self.cell_height,
+                             QColor(100, 160, 220, 100))
+
+    def _paint_cursor(self, painter):
+        """Paint the block cursor only on a live session at the viewport top."""
         if (not self.scroll_offset and self._cursor_shown and self.screen.cursor_visible and self.process is not None
                 and self.process.running):
             painter.fillRect(min(self.screen.column, self.screen.columns - 1) * self.cell_width,
                              self.screen.row * self.cell_height,
-                             self.cell_width, self.cell_height, foreground)
+                             self.cell_width, self.cell_height, QColor("#e6e6e2"))
 
     def focusNextPrevChild(self, next_child):
         # Tab and Shift+Tab belong to the session, not to widget navigation.

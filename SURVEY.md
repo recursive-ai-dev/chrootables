@@ -1,4 +1,11 @@
 Code-Quality Survey — chrootables
+
+Sprint status (2026-11-25): P1 #1–#5, P2 #6–#9 and #11, and the P3 items were
+implemented as pure refactors; see docs/SPRINT-CODE-QUALITY-2026-11-25.md and
+the Unreleased CHANGELOG section. P2 #10 (type annotations) remains deferred
+as its own incremental effort, per the risk notes below. The findings below are
+preserved as written.
+
 P1 — High-value, safe/mechanical
 1. Duplicated .meta parsing (Bash) — 3 full copies + 2 partial
 - chrootable-manager:108-122 (copy_metadata), 1849-1863 (image_json), 1911-1925 (image_details) contain the identical while IFS='=' read -r mkey mval … case $mkey in lifecycle|suite|architecture|created_at|last_used_at|profile|origin … block.

@@ -8,15 +8,17 @@ import os
 from pathlib import Path
 import sys
 import threading
+import traceback
 
 # Works when invoked as an absolute script by pkexec with a clean environment.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from chrootables.backend import Store, MUTATIONS, OperationCancelled
+from chrootables.backend import DEFAULT_STORE, MAX_MESSAGE_ID, MAX_REQUEST_BYTES, Store, MUTATIONS, OperationCancelled
 
 MAX_PENDING_REQUESTS = 16
 
 
 def serve(store, input_stream=sys.stdin, output_stream=sys.stdout, *, writable=False):
+    """Serve desktop requests on stdio until the input stream closes."""
     output_lock = threading.Lock()
     mutation_lock = threading.Lock()
     def send(message):
@@ -61,6 +63,9 @@ def serve(store, input_stream=sys.stdin, output_stream=sys.stdout, *, writable=F
                 raise ValueError("Unsupported desktop request.")
             send({"id": identifier, "event": "result", "ok": True, "data": data})
         except Exception as error:
+            # Deliberately broad: any failure must still answer the desktop, and
+            # the traceback goes to stderr, which the protocol never parses.
+            traceback.print_exc(file=sys.stderr)
             code = ("permission_required" if isinstance(error, PermissionError) else
                     "cancelled" if isinstance(error, OperationCancelled) else "operation_failed")
             send({"id": identifier, "event": "result", "ok": False, "error": str(error), "code": code})
@@ -69,16 +74,16 @@ def serve(store, input_stream=sys.stdin, output_stream=sys.stdout, *, writable=F
     pending = threading.BoundedSemaphore(MAX_PENDING_REQUESTS)
     with ThreadPoolExecutor(max_workers=4) as pool:
         while True:
-            line = input_stream.readline(65537)
+            line = input_stream.readline(MAX_REQUEST_BYTES + 1)
             if not line:
                 break
-            if len(line) > 65536:
+            if len(line) > MAX_REQUEST_BYTES:
                 send({"event": "error", "error": "Request too large."})
                 break
             try:
                 request = json.loads(line)
                 if (not isinstance(request, dict) or type(request.get("id")) is not int
-                        or not 0 < request["id"] <= 2147483647
+                        or not 0 < request["id"] <= MAX_MESSAGE_ID
                         or not isinstance(request.get("action"), str)
                         or not isinstance(request.get("params", {}), dict)):
                     raise ValueError("Invalid request.")
@@ -102,8 +107,9 @@ def serve(store, input_stream=sys.stdin, output_stream=sys.stdout, *, writable=F
 
 
 def main():
+    """Parse arguments and serve one store as a stdio helper process."""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--store", default="/var/lib/chrootable-manager")
+    parser.add_argument("--store", default=str(DEFAULT_STORE))
     parser.add_argument("--writable", action="store_true")
     args = parser.parse_args()
     if args.writable and os.geteuid() != 0:

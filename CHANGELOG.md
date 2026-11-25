@@ -3,6 +3,24 @@
 The current release is numbered `1.3.0`. Earlier development release numbers
 are retained below as historical records.
 
+## Unreleased
+
+- Deduplicate repeated logic without behavior change: one Bash metadata
+  reader, image enumeration and snapshot counters, one create/import
+  argument validator in the CLI and backend, shared dialog widget
+  factories, and decomposed long functions in the desktop, terminal,
+  backend and privileged worker/doctor code paths.
+- Name the capacity bounds, protocol limits, chunk sizes and interface
+  delays once and derive validation, error and UI texts from them.
+- Align CLI and backend drift: a documented default-suite policy with one
+  backend `DEFAULT_SUITE`, the advertised operation-event protocol
+  consumed with safe fallbacks, the capacity message derived from the
+  advertised limits, and shared store and request-size constants.
+- Add the missing public API docstrings, explain the intentional
+  swallowed-exception handlers, and drop the unused `clear` and
+  `Style.replaced` helpers. Track the work in
+  docs/SPRINT-CODE-QUALITY-2026-11-25.md.
+
 ## v1.3.0 — 2026-11-03
 
 - Bundle pinned CPython and PySide6/Qt in the default AppImage, with runtime
