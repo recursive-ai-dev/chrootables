@@ -96,9 +96,6 @@ class Style:
     def __hash__(self):
         return hash((self.fg, self.bg, self.flags))
 
-    def replaced(self, fg=None, bg=None, flags=0):
-        return Style(fg, bg, flags)
-
 
 DEFAULT_STYLE = Style()
 
