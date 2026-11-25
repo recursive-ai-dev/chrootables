@@ -39,6 +39,19 @@ CANCELLABLE_STAGES = {
     "copying-archive", "validating-archive",
 }
 CANCEL_RESEND_SECONDS = 1.0
+# Protocol limits shared with the desktop client and the broker.
+MAX_REQUEST_BYTES = 65536
+MAX_MESSAGE_ID = 2147483647
+# Bounded read sizes; regular files are read and tailed in fixed chunks.
+READ_CHUNK_BYTES = 256 * 1024
+LOG_TAIL_POLL_BYTES = 4 * READ_CHUNK_BYTES
+# One operation record plus a one-byte canary to detect oversized records.
+OPERATION_STATE_MAX_BYTES = 256 * 1024
+# The suite applied when a create or import request omits one. The desktop
+# always sends a suite from the advertised capabilities; this fallback matches
+# the CLI capability list (trixie), while the interactive CLI keeps the moving
+# "stable" alias so terminal users follow the current stable release.
+DEFAULT_SUITE = "trixie"
 
 
 class OperationCancelled(RuntimeError):
@@ -46,7 +59,13 @@ class OperationCancelled(RuntimeError):
 
 
 def load_capabilities():
-    """Use the installed CLI as the desktop's capability authority, once at start."""
+    """Use the installed CLI as the capability authority, once at start.
+
+    schema_version, limits, profiles and suites are validated in full. The
+    remaining advertised keys (session_options, features, storage,
+    operation_events) are informational for integrators; operation_events is
+    consumed leniently below, and missing keys keep the built-in fallbacks.
+    """
     try:
         result = subprocess.run([str(MANAGER), "--capabilities", "--json"],
                                 capture_output=True, text=True, timeout=5,
@@ -82,37 +101,61 @@ PROFILES = {item["id"]: (item["title"], item["description"],
                          max(1, item["recommended_size_mib"] // 1024))
             for item in CAPABILITIES["profiles"]}
 SUITES = {item["id"]: item["title"] for item in CAPABILITIES["suites"]}
+# Event protocol advertised by the CLI; fall back to the current contract so a
+# partially capable CLI still works unchanged.
+_OPERATION_EVENTS = CAPABILITIES.get("operation_events", {})
+EVENT_PREFIX = _OPERATION_EVENTS.get("prefix", "CHROOTABLE_EVENT ")
+OPERATION_ID_ENV = _OPERATION_EVENTS.get("id_environment", "CHROOTABLE_OPERATION_ID")
 
 
 def name(value):
+    """Validate a workspace name shared by every operation."""
     if not isinstance(value, str) or not NAME_RE.fullmatch(value):
         raise ValueError("Use 1–64 letters, digits, dots, underscores or hyphens; start with a letter or digit.")
     return value
 
 
 def size(value):
-    if (type(value) is not int or not
-            CAPABILITIES["limits"]["min_size_mib"] <= value <= CAPABILITIES["limits"]["max_size_mib"]):
-        raise ValueError("Capacity must be between 512 MiB and 1 TiB.")
+    """Validate a requested image capacity within the advertised limits."""
+    limits = CAPABILITIES["limits"]
+    if type(value) is not int or not limits["min_size_mib"] <= value <= limits["max_size_mib"]:
+        raise ValueError(f"Capacity must be between {limits['min_size_mib']:,} MiB "
+                         f"and {limits['max_size_mib']:,} MiB.")
     return str(value)
 
 
 def operation_id(value):
+    """Validate an operation record identifier."""
     if not isinstance(value, str) or not OPERATION_ID_RE.fullmatch(value):
         raise ValueError("Operation ID must be 32 lowercase hexadecimal characters.")
     return value
 
 
 def export_name(value):
+    """Validate a retained export archive filename."""
     if not isinstance(value, str) or not EXPORT_NAME_RE.fullmatch(value):
         raise ValueError("Invalid export archive filename.")
     return value
 
 
 def keep_count(value):
+    """Validate how many operation logs pruning retains."""
     if type(value) is not int or not 0 <= value <= 10000:
         raise ValueError("Keep count must be a whole number from 0 to 10000.")
     return value
+
+
+def _lifecycle_profile_suite(params):
+    """Validate the shared create/import session arguments.
+
+    Returns (lifecycle, profile, suite) with the advertised defaults applied.
+    """
+    mode = params.get("lifecycle", "persistent")
+    profile = params.get("profile", "minimal")
+    suite = params.get("suite", DEFAULT_SUITE)
+    if mode not in ("persistent", "ephemeral") or profile not in PROFILES or suite not in SUITES:
+        raise ValueError("Unsupported lifecycle, profile or Debian release.")
+    return mode, profile, suite
 
 
 def archive_file(value):
@@ -159,7 +202,7 @@ def build_command(action, params):
             raise ValueError("This operation requires confirmation.")
         return args + ["--delete-export", export_name(params.get("filename")), "--yes"], env
     if action == "archive-sync":
-        suite = params.get("suite", "trixie")
+        suite = params.get("suite", DEFAULT_SUITE)
         if suite not in SUITES and suite != "stable":
             raise ValueError("Unsupported Debian release.")
         profiles = params.get("profiles", [])
@@ -169,19 +212,11 @@ def build_command(action, params):
     target = name(params.get("name"))
     args += ["--" + action, target]
     if action == "create":
-        mode = params.get("lifecycle", "persistent")
-        profile = params.get("profile", "minimal")
-        suite = params.get("suite", "trixie")
-        if mode not in ("persistent", "ephemeral") or profile not in PROFILES or suite not in SUITES:
-            raise ValueError("Unsupported lifecycle, profile or Debian release.")
+        mode, profile, suite = _lifecycle_profile_suite(params)
         args += [size(params.get("size_mib")), mode, profile]
         env["CHROOTABLE_DEBIAN_SUITE"] = suite
     elif action == "import":
-        mode = params.get("lifecycle", "persistent")
-        profile = params.get("profile", "minimal")
-        suite = params.get("suite", "trixie")
-        if mode not in ("persistent", "ephemeral") or profile not in PROFILES or suite not in SUITES:
-            raise ValueError("Unsupported lifecycle, profile or Debian release.")
+        mode, profile, suite = _lifecycle_profile_suite(params)
         # An empty capacity asks the manager to fit the image to the archive.
         requested = params.get("size_mib")
         args += [archive_file(params.get("archive")), "" if requested is None else size(requested), mode, profile]
@@ -201,7 +236,7 @@ def build_command(action, params):
     return args, env
 
 
-def read_regular(path, limit=256 * 1024, offset=None):
+def read_regular(path, limit=READ_CHUNK_BYTES, offset=None):
     """Read bounded regular files without following a final symlink."""
     return _read_regular_chunk(path, limit, offset)[0]
 
@@ -222,7 +257,7 @@ def _open_regular(path):
             os.close(descriptor)
 
 
-def _read_regular_chunk(path, limit=256 * 1024, offset=None):
+def _read_regular_chunk(path, limit=READ_CHUNK_BYTES, offset=None):
     """Return bounded text and the byte position actually consumed."""
     with _open_regular(path) as (stream, info):
         start = max(0, info.st_size - limit) if offset is None else (
@@ -263,9 +298,9 @@ class _OperationLogTail:
                 # final read drains the entire size observed when it opens the log.
                 remaining = info.st_size - self.offset
                 if not final:
-                    remaining = min(remaining, 4 * 256 * 1024)
+                    remaining = min(remaining, LOG_TAIL_POLL_BYTES)
                 while remaining:
-                    data = stream.read(min(remaining, 256 * 1024))
+                    data = stream.read(min(remaining, READ_CHUNK_BYTES))
                     if not data:
                         break
                     self.offset = stream.tell()
@@ -298,17 +333,11 @@ def _probe_lock_status(lock_path):
         os.close(fd)
 
 
-def deliver_export(archive, destination, output=None):
-    """Open the archive as root; create the user's destination after dropping privileges."""
-    target = Path(destination)
-    if not target.is_absolute():
-        raise ValueError("Export destination must be an absolute path.")
-    uid = int(os.environ.get("PKEXEC_UID", os.getuid()))
-    if uid == 0:
-        raise ValueError("Desktop exports need the invoking user's identity.")
-    account = pwd.getpwuid(uid)
-    source = os.open(archive, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    script = '''import ctypes, errno, os, shutil, sys, uuid
+# The privileged export writer, run as its own interpreter. It stages into an
+# anonymous O_TMPFILE where supported, falls back to a named temporary file
+# with explicit cleanup guidance, and publishes the destination atomically
+# with no-replace semantics so an abrupt stop never exposes partial contents.
+_EXPORT_WRITER_SCRIPT = '''import ctypes, errno, os, shutil, sys, uuid
 source, destination = int(sys.argv[1]), sys.argv[2]
 parent, filename = os.path.split(destination)
 directory = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
@@ -379,6 +408,19 @@ finally:
     finally:
         os.close(directory)
 '''
+
+
+def deliver_export(archive, destination, output=None):
+    """Open the archive as root; create the user's destination after dropping privileges."""
+    target = Path(destination)
+    if not target.is_absolute():
+        raise ValueError("Export destination must be an absolute path.")
+    uid = int(os.environ.get("PKEXEC_UID", os.getuid()))
+    if uid == 0:
+        raise ValueError("Desktop exports need the invoking user's identity.")
+    account = pwd.getpwuid(uid)
+    source = os.open(archive, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    script = _EXPORT_WRITER_SCRIPT
     try:
         if not stat.S_ISREG(os.fstat(source).st_mode):
             raise ValueError("Export source must be a regular file.")
@@ -399,6 +441,7 @@ finally:
 
 
 def metadata(path):
+    """Read a metadata file into a dict; missing files yield no fields."""
     try:
         return dict(line.split("=", 1) for line in read_regular(path).splitlines() if "=" in line)
     except FileNotFoundError:
@@ -411,8 +454,8 @@ def _operation_state(path, identifier):
         "format", "id", "pid", "process_start", "status", "stage", "action", "name",
         "pending", "destination", "image_inode", "image_size", "meta_inode", "meta_size",
     }
-    text, consumed = _read_regular_chunk(path, 256 * 1024 + 1, offset=0)
-    if consumed > 256 * 1024:
+    text, consumed = _read_regular_chunk(path, OPERATION_STATE_MAX_BYTES + 1, offset=0)
+    if consumed > OPERATION_STATE_MAX_BYTES:
         raise ValueError("Operation record is too large.")
     lines = text.split("\n")
     if lines and not lines[-1]:
@@ -446,6 +489,8 @@ def _process_alive(pid, expected_start):
 
 
 class Store:
+    """Caching, validating view of one workspace store on the host."""
+
     def __init__(self, path=DEFAULT_STORE):
         path = Path(path)
         if any(character in str(path) for character in "\x00\t\r\n"):
@@ -482,6 +527,7 @@ class Store:
         self._cancel_signalled_at = 0.0
 
     def environment(self, extra=None):
+        """Return the scrubbed child environment for CLI helper invocations."""
         result = {
             "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             "LANG": "C.UTF-8", "HOME": "/root" if os.geteuid() == 0 else str(Path.home()),
@@ -491,12 +537,55 @@ class Store:
         return result
 
     def inventory(self):
+        """Return the full store inventory: images, snapshots, activity and more."""
         # Broker reads may overlap; publish each cache signature with its data.
         with self._inventory_lock:
             return self._inventory()
 
     def _inventory(self):
+        image_dir_entries = self._scan_images()
+        raw_snapshots, snap_counts = self._scan_snapshots()
+        images_sig = (tuple(image_dir_entries), tuple(sorted(snap_counts.items()))) if image_dir_entries is not None else None
+        if self._images_sig is not None and images_sig is not None and images_sig == self._images_sig:
+            images = []
+            images_root = self.path / "images"
+            for item in self._images_cache:
+                status = _probe_lock_status(images_root / (item["name"] + ".img.lock"))
+                images.append(item if item["status"] == status else {**item, "status": status})
+        else:
+            # The helper probes locks in-process on both cold and cached reads.
+            # Avoid one CLI subprocess per image solely to repeat that probe.
+            result = subprocess.run([str(MANAGER), "--list", "--json"],
+                                    env=self.environment({"CHROOTABLE_LIST_PROBE_LOCKS": "0"}),
+                                    capture_output=True, encoding="utf-8", errors="replace", timeout=20)
+            if result.returncode:
+                raise PermissionError(result.stderr.strip() or "Cannot read the workspace store.")
+            images = json.loads(result.stdout)
+            images = [{**item, "status": _probe_lock_status(self.path / "images" / (item["name"] + ".img.lock"))}
+                      for item in images]
+            self._images_sig = images_sig
+            self._images_cache = images
+        image_names = {x["name"] for x in images}
+        snapshots = [
+            {"name": ws_name, "label": label, "size_mib": size_mib, "created_at": created_at,
+             "allocated_bytes": allocated, "orphan": ws_name not in image_names}
+            for ws_name, label, size_mib, created_at, allocated in raw_snapshots
+        ]
+        activity = self._read_activity()
+        existing = self.path
+        while not existing.exists():
+            existing = existing.parent
+        usage = shutil.disk_usage(existing)
+        storage = self.storage_summary(images, snapshots)
+        return {"images": images, "snapshots": snapshots, "activity": activity,
+                "operations": self._scan_operations(), "exports": list(self._exports_cache),
+                "archives": self._scan_archives(),
+                "store": str(self.path), "free_bytes": usage.free, "total_bytes": usage.total,
+                "storage": storage}
+
+    def _scan_images(self):
         # Check directories explicitly: glob can silently conceal permission errors.
+        # Returns the sorted image entry signature, or None without a store.
         image_dir_entries = None
         if self.path.exists():
             for part in (self.path, self.path / "images", self.path / "snapshots", self.path / "logs", self.path / "exports"):
@@ -513,6 +602,10 @@ class Store:
                                     st = entry.stat(follow_symlinks=False)
                                     image_dir_entries.append((entry.name, False, st.st_ino, st.st_mtime_ns, st.st_size, st.st_blocks))
                             image_dir_entries.sort()
+        return image_dir_entries
+
+    def _scan_snapshots(self):
+        """Return (raw_snapshots, per-workspace counts) across the snapshot folders."""
         snapshots_root = self.path / "snapshots"
         raw_snapshots = []
         snap_counts = {}
@@ -549,61 +642,29 @@ class Store:
                                 self._snap_meta_cache.clear()
                             self._snap_meta_cache[cache_key] = created_at
                     raw_snapshots.append((folder.name, image.name[:-4], img_st.st_size // 1048576, created_at, img_st.st_blocks * 512))
-        images_sig = (tuple(image_dir_entries), tuple(sorted(snap_counts.items()))) if image_dir_entries is not None else None
-        if self._images_sig is not None and images_sig is not None and images_sig == self._images_sig:
-            images = []
-            images_root = self.path / "images"
-            for item in self._images_cache:
-                status = _probe_lock_status(images_root / (item["name"] + ".img.lock"))
-                images.append(item if item["status"] == status else {**item, "status": status})
-        else:
-            # The helper probes locks in-process on both cold and cached reads.
-            # Avoid one CLI subprocess per image solely to repeat that probe.
-            result = subprocess.run([str(MANAGER), "--list", "--json"],
-                                    env=self.environment({"CHROOTABLE_LIST_PROBE_LOCKS": "0"}),
-                                    capture_output=True, encoding="utf-8", errors="replace", timeout=20)
-            if result.returncode:
-                raise PermissionError(result.stderr.strip() or "Cannot read the workspace store.")
-            images = json.loads(result.stdout)
-            images = [{**item, "status": _probe_lock_status(self.path / "images" / (item["name"] + ".img.lock"))}
-                      for item in images]
-            self._images_sig = images_sig
-            self._images_cache = images
-        image_names = {x["name"] for x in images}
-        snapshots = [
-            {"name": ws_name, "label": label, "size_mib": size_mib, "created_at": created_at,
-             "allocated_bytes": allocated, "orphan": ws_name not in image_names}
-            for ws_name, label, size_mib, created_at, allocated in raw_snapshots
-        ]
+        return raw_snapshots, snap_counts
+
+    def _read_activity(self):
+        """Return the recent activity entries, newest first, cached by file stamp."""
         activity_path = self.path / "activity.tsv"
         try:
             act_st = activity_path.lstat()
             act_sig = (act_st.st_ino, act_st.st_mtime_ns, act_st.st_size)
             if act_sig == self._activity_sig:
-                activity = self._activity_cache
-            else:
-                parsed = []
-                for line in read_regular(activity_path).splitlines()[-100:]:
-                    fields = line.split("\t")
-                    if len(fields) == 5:
-                        parsed.append(dict(zip(("time", "action", "name", "status", "log"), fields)))
-                activity = list(reversed(parsed))
-                self._activity_sig = act_sig
-                self._activity_cache = activity
+                return self._activity_cache
+            parsed = []
+            for line in read_regular(activity_path).splitlines()[-100:]:
+                fields = line.split("\t")
+                if len(fields) == 5:
+                    parsed.append(dict(zip(("time", "action", "name", "status", "log"), fields)))
+            activity = list(reversed(parsed))
+            self._activity_sig = act_sig
+            self._activity_cache = activity
+            return activity
         except FileNotFoundError:
             self._activity_sig = None
             self._activity_cache = []
-            activity = []
-        existing = self.path
-        while not existing.exists():
-            existing = existing.parent
-        usage = shutil.disk_usage(existing)
-        storage = self.storage_summary(images, snapshots)
-        return {"images": images, "snapshots": snapshots, "activity": activity,
-                "operations": self._scan_operations(), "exports": list(self._exports_cache),
-                "archives": self._scan_archives(),
-                "store": str(self.path), "free_bytes": usage.free, "total_bytes": usage.total,
-                "storage": storage}
+            return []
 
     def _scan_operations(self):
         op_dir = self.path / "operations"
@@ -689,7 +750,7 @@ class Store:
             if stat.S_ISREG(info.st_mode):
                 total += info.st_blocks * 512
         except OSError:
-            pass
+            pass  # Staged files may vanish between the operation scan and this read.
         try:
             sidecar = Path(str(pending) + ".archive")
             info = sidecar.lstat()
@@ -703,7 +764,7 @@ class Store:
                     if stat.S_ISREG(info.st_mode):
                         total += info.st_blocks * 512
         except OSError:
-            pass
+            pass  # The sidecar estimate is advisory; never fail the inventory for it.
         return total
 
     def _scan_archives(self):
@@ -737,7 +798,7 @@ class Store:
             try:
                 profiles_raw = read_regular(sub_path / "profiles").splitlines() if (sub_path / "profiles").is_file() else []
             except OSError:
-                profiles_raw = []
+                profiles_raw = []  # An unreadable profiles record still leaves the default profile.
             profiles = ["minimal"] + [p.strip() for p in profiles_raw if p.strip() and p.strip() != "minimal"]
             total_bytes = 0
             for root_dir, _, files in os.walk(sub_path, followlinks=False):
@@ -746,7 +807,7 @@ class Store:
                     try:
                         fst = fpath.lstat()
                     except OSError:
-                        continue
+                        continue  # Entries may vanish mid-walk; skip rather than fail the scan.
                     if stat.S_ISREG(fst.st_mode):
                         total_bytes += fst.st_blocks * 512
             st = base_tgz.lstat()
@@ -813,6 +874,7 @@ class Store:
                 "snapshots_bytes": sum(item["allocated_bytes"] for item in snapshots)}
 
     def logs(self, target, selected_log=None):
+        """Return a workspace log list, or one selected log's contents."""
         name(target)
         if selected_log:
             path = Path(selected_log)
@@ -835,6 +897,7 @@ class Store:
         return result.stdout
 
     def doctor(self):
+        """Return the CLI host-health report after validating its schema."""
         result = subprocess.run([str(MANAGER), "--doctor", "--json"], env=self.environment(), capture_output=True,
                                 encoding="utf-8", errors="replace", timeout=15)
         try:
@@ -875,6 +938,7 @@ class Store:
         return report
 
     def cancel_operation(self):
+        """Signal the running operation when its current stage is safe to stop."""
         with self._active_lock:
             process = self._active_process
             stage = self._active_stage
@@ -906,13 +970,18 @@ class Store:
             self._cancel_signalled_at = time.monotonic()
 
     def operate(self, action, params, output, progress=None):
+        """Run one validated mutation, streaming child output and stage events.
+
+        Returns the helper's exit code, delivering completed exports to the
+        caller's destination and raising OperationCancelled on cancellation.
+        """
         if action == "import" and params.get("export") is not None:
             # A retained export is named, not given by path: the caller may be
             # unable to see inside the root-only store. Resolved here, as root.
             params = {**params, "archive": str(self.path / "exports" / export_name(params["export"]))}
         args, extra = build_command(action, params)
         operation_id = uuid.uuid4().hex
-        env = self.environment({**extra, "CHROOTABLE_OPERATION_ID": operation_id})
+        env = self.environment({**extra, OPERATION_ID_ENV: operation_id})
         operation_log = self.path / "logs" / (operation_id + ".log")
         # A reader thread drains the child while the main thread tails its operation log.
         # A private process group lets cancellation reach every child at once.
@@ -926,9 +995,9 @@ class Store:
         archives = []
         def drain():
             for line in process.stdout:
-                if line.startswith("CHROOTABLE_EVENT "):
+                if line.startswith(EVENT_PREFIX):
                     try:
-                        event = json.loads(line[len("CHROOTABLE_EVENT "):])
+                        event = json.loads(line[len(EVENT_PREFIX):])
                     except (ValueError, TypeError):
                         event = None
                     if (isinstance(event, dict) and event.get("id") == operation_id
@@ -1026,6 +1095,7 @@ def session_command(target, store=DEFAULT_STORE, *, disposable=False, isolated=F
 
 def terminal_command(target, store=DEFAULT_STORE, *, disposable=False, isolated=False,
                      share=None, read_only=False, restricted_dev=False):
+    """Wrap the session argv for the first available terminal emulator."""
     command = session_command(target, store, disposable=disposable, isolated=isolated,
                               share=share, read_only=read_only, restricted_dev=restricted_dev)
     title = "Chrootables · " + target
