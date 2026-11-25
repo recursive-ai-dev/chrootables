@@ -1,9 +1,9 @@
 # Changelog
 
-The current release is numbered `1.3.0`. Earlier development release numbers
+The current release is numbered `1.3.2`. Earlier development release numbers
 are retained below as historical records.
 
-## Unreleased
+## v1.3.2 — 2026-11-25
 
 - Deduplicate repeated logic without behavior change: one Bash metadata
   reader, image enumeration and snapshot counters, one create/import
