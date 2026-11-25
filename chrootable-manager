@@ -1908,7 +1908,7 @@ json_string() {
 }
 image_json() {
     local image=$1 bytes=${2:-} blocks=${3:-} name key value comma= status=ready lifecycle=persistent suite=unknown architecture=unknown
-    local profile=minimal created_at=unknown last_used_at=never origin=unknown snaps=0 file
+    local profile=minimal created_at=unknown last_used_at=never origin=unknown snaps=0
     local -A meta=()
     name=${image##*/}; name=${name%.img}
     # The desktop probes locks in-process after its initial JSON inventory, just
@@ -1945,7 +1945,7 @@ image_json() {
 }
 list_images() {
     local format=${1:-text} image name comma= idx=0 bytes blocks stat_output
-    local -a valid_images=() stat_lines=()
+    local -a valid_images=() stat_lines=() filtered_images=()
     collect_images valid_images
     if (( ${#valid_images[@]} )); then
         for image in "${valid_images[@]}"; do
