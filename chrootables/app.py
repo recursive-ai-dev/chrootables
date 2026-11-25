@@ -546,6 +546,26 @@ class Window(QMainWindow):
     def build_ui(self):
         central, horizontal = box(horizontal=True, spacing=0)
         self.setCentralWidget(central)
+        self.build_sidebar(horizontal)
+        content, self.content_layout = box(margins=16, spacing=12)
+        self.content_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        self.content_scroll = QScrollArea()
+        self.content_scroll.setWidgetResizable(True)
+        self.content_scroll.setWidget(content)
+        horizontal.addWidget(self.content_scroll, 1)
+        self.build_header()
+        self.build_notice()
+        self.pages = QStackedWidget()
+        self.content_layout.addWidget(self.pages, 1)
+        self.build_library()
+        self.build_recovery()
+        self.build_activity()
+        self.build_health()
+        self.build_task_panel()
+        self.build_footer()
+
+    def build_sidebar(self, horizontal):
+        """Build the brand, navigation and store controls column."""
         sidebar = QFrame()
         self.sidebar = sidebar
         sidebar.setObjectName("sidebar")
@@ -598,12 +618,8 @@ class Window(QMainWindow):
         self.sidebar_scroll.setFixedWidth(196)
         horizontal.addWidget(self.sidebar_scroll)
 
-        content, self.content_layout = box(margins=16, spacing=12)
-        self.content_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
-        self.content_scroll = QScrollArea()
-        self.content_scroll.setWidgetResizable(True)
-        self.content_scroll.setWidget(content)
-        horizontal.addWidget(self.content_scroll, 1)
+    def build_header(self):
+        """Build the page title row with refresh, import and create actions."""
         top, row = box(horizontal=True)
         headings, titles = box(spacing=6)
         self.eyebrow = label("WORKSPACE LIBRARY", "eyebrow")
@@ -625,6 +641,8 @@ class Window(QMainWindow):
         row.addWidget(self.new_button)
         self.content_layout.addWidget(top)
 
+    def build_notice(self):
+        """Build the dismissible health banner row."""
         self.notice = QFrame()
         self.notice.setObjectName("notice")
         notice_row = QHBoxLayout(self.notice)
@@ -635,13 +653,8 @@ class Window(QMainWindow):
         self.notice.hide()
         self.content_layout.addWidget(self.notice)
 
-        self.pages = QStackedWidget()
-        self.content_layout.addWidget(self.pages, 1)
-        self.build_library()
-        self.build_recovery()
-        self.build_activity()
-        self.build_health()
-
+    def build_task_panel(self):
+        """Build the streaming task output panel with its progress and cancel."""
         self.task_panel, task_layout = box(spacing=8)
         task_top, task_row = box(horizontal=True)
         self.task_title = label("Task output", "section")
@@ -672,6 +685,9 @@ class Window(QMainWindow):
         task_layout.addWidget(self.task_output)
         self.task_panel.hide()
         self.content_layout.addWidget(self.task_panel)
+
+    def build_footer(self):
+        """Build the status bar row under the pages."""
         footer, footer_row = box(horizontal=True)
         self.status = label("Reading local workspaces…", "muted", True)
         footer_row.addWidget(self.status, 1)
@@ -1094,6 +1110,15 @@ class Window(QMainWindow):
         self.terminal_button = button("›_  Open terminal", self.open_terminal, "primary")
         self.terminal_button.setToolTip("Open in your native terminal · Ctrl Return")
         layout.addWidget(self.terminal_button)
+        self.build_detail_session(layout)
+        self.build_detail_metadata(layout)
+        self.build_detail_notes(layout)
+        self.build_detail_actions(layout)
+        self.detail_card = card
+        self.details.setWidget(card)
+
+    def build_detail_session(self, layout):
+        """Build the session isolation, shared folder and trial controls."""
         self.offline = QCheckBox("Isolate network for this session")
         self.offline.setToolTip("Only loopback is available; internet and host networking are disconnected.")
         self.offline.toggled.connect(lambda checked: self.save_session_choice("isolated", checked))
@@ -1124,6 +1149,9 @@ class Window(QMainWindow):
         self.trial_button = button("Try a disposable session", lambda: self.open_terminal(disposable=True))
         layout.addWidget(self.trial_button)
         layout.addSpacing(2)
+
+    def build_detail_metadata(self, layout):
+        """Build the distribution, storage, session and recovery field grid."""
         metadata = QWidget()
         metadata.setStyleSheet("background: transparent;")
         grid = QGridLayout(metadata)
@@ -1140,6 +1168,9 @@ class Window(QMainWindow):
             field_layout.addWidget(val_label)
             grid.addWidget(field, r, c, 1, span)
         layout.addWidget(metadata)
+
+    def build_detail_notes(self, layout):
+        """Build the personal notes header and preview labels."""
         notes_header, notes_row = box(horizontal=True, spacing=8)
         notes_row.addWidget(label("PERSONAL NOTES", "eyebrow"), 1)
         self.notes_button = button("Edit notes…", self.edit_notes, "quiet")
@@ -1148,6 +1179,9 @@ class Window(QMainWindow):
         self.notes_preview = label("", "muted", True)
         layout.addWidget(self.notes_preview)
         layout.addStretch()
+
+    def build_detail_actions(self, layout):
+        """Build the snapshot button and the ••• maintenance menu."""
         actions, row = box(horizontal=True, spacing=8)
         self.save_snapshot_button = button("Save snapshot", self.snapshot)
         row.addWidget(self.save_snapshot_button, 1)
@@ -1172,8 +1206,6 @@ class Window(QMainWindow):
         self.more_button.setMenu(menu)
         row.addWidget(self.more_button)
         layout.addWidget(actions)
-        self.detail_card = card
-        self.details.setWidget(card)
 
     def render_library(self):
         if self.store_locked:
