@@ -3,9 +3,11 @@ from collections import deque
 import json
 import sys
 from PySide6.QtCore import QObject, QProcess, Signal
-from .backend import ROOT
+from .backend import MAX_MESSAGE_ID, MAX_REQUEST_BYTES, ROOT
 
-MAX_REQUEST_BYTES = 65536
+# Grace periods when shutting the helper down after a clean request.
+STOP_WAIT_MS = 1500
+STOP_TERMINATE_WAIT_MS = 1000
 
 
 def valid_result(action, data):
@@ -92,6 +94,7 @@ def valid_result(action, data):
 
 
 def valid_message(message):
+    """Check the helper event envelope before the client trusts any field."""
     if not isinstance(message, dict):
         return False
     event = message.get("event")
@@ -100,7 +103,7 @@ def valid_message(message):
     if event == "error":
         return isinstance(message.get("error"), str)
     identifier = message.get("id")
-    if type(identifier) is not int or not 0 < identifier <= 2147483647:
+    if type(identifier) is not int or not 0 < identifier <= MAX_MESSAGE_ID:
         return False
     if event in ("output", "phase"):
         return isinstance(message.get("text"), str)
@@ -112,12 +115,16 @@ def valid_message(message):
 
 
 class BackendError(RuntimeError):
+    """A failed request carrying the helper's error code, if it sent one."""
+
     def __init__(self, message, code=None):
         super().__init__(message)
         self.code = code
 
 
 class Client(QObject):
+    """Spawn, speak to and tear down the local helper process over stdio."""
+
     ready = Signal(bool)
     disconnected = Signal(str)
     output = Signal(int, str)
@@ -137,6 +144,7 @@ class Client(QObject):
         self._failed = False
 
     def start(self, writable=False):
+        """Restart the helper, optionally through polkit for write access."""
         self.stop()
         self.buffer = b""
         self._lines.clear()
@@ -157,6 +165,7 @@ class Client(QObject):
         process.start(program, args)
 
     def failure(self, message):
+        """Fail every pending request once, then report the disconnection."""
         if self._failed:
             return
         self._failed = True
@@ -171,6 +180,7 @@ class Client(QObject):
             self.disconnected.emit(message)
 
     def read(self, process):
+        """Consume one output chunk, coalescing consecutive output events."""
         if process is not self.process or self._failed:
             return
         # Split once per chunk rather than once per line. Pending lines live on the
@@ -230,6 +240,7 @@ class Client(QObject):
         flush_output()
 
     def request(self, action, params, callback):
+        """Send one validated request; returns its id or -1 when refused."""
         if not self.is_ready:
             callback(False, "The workspace helper is not connected.")
             return -1
@@ -256,13 +267,14 @@ class Client(QObject):
         return identifier
 
     def stop(self):
+        """Close the helper and fail every pending request."""
         self.is_ready = self.writable = False
         if self.process:
             process, self.process = self.process, None
             process.closeWriteChannel()
-            if not process.waitForFinished(1500):
+            if not process.waitForFinished(STOP_WAIT_MS):
                 process.terminate()
-                process.waitForFinished(1000)
+                process.waitForFinished(STOP_TERMINATE_WAIT_MS)
             process.deleteLater()
         callbacks, self.callbacks = self.callbacks, {}
         for callback in callbacks.values():
