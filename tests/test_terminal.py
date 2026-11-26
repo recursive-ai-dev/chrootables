@@ -468,6 +468,60 @@ class VtScreenTests(unittest.TestCase):
                     self.assertEqual(screen.plain().splitlines()[0], "kepttail")
 
 
+class AptProgressTests(unittest.TestCase):
+    def test_apt_style_zero_margin_scroll_region_pins_the_status_row(self):
+        screen = VtScreen(5, 20)
+        screen.feed("\x1b7\x1b[0;4r\x1b8\x1b[5;0Hstatus\x1b[1;1H")
+        screen.feed("a\r\nb\r\nc\r\nd\r\ne\r\n")
+        self.assertEqual((screen._top, screen._bottom), (0, 3))
+        self.assertEqual(screen.plain().splitlines()[4], "status")
+
+    def test_c0_controls_inside_csi_do_not_swallow_following_text(self):
+        screen = VtScreen(2, 20)
+        screen.feed("\x1b[3\rx")
+        screen.feed("ab\x1b[1\bmcd\x7f")
+        self.assertEqual(screen.plain().splitlines()[0], "acd")
+        self.assertEqual(screen.column, 3)
+
+    def test_bulk_text_matches_per_character_placement(self):
+        for columns in (20, 23):
+            text = "".join(chr(32 + index % 95) for index in range(97))
+            bulk, single = VtScreen(4, columns), VtScreen(4, columns)
+            bulk.feed("\x1b[31m" + text)
+            single.feed("\x1b[31m")
+            for character in text:
+                single._put(character)
+            self.assertEqual((bulk.lines, bulk.row, bulk.column), (single.lines, single.row, single.column))
+
+    def test_background_color_erase_fills_erased_and_scrolled_cells(self):
+        screen = VtScreen(3, 10)
+        screen.feed("\x1b[44m\x1b[2Jhi\x1b[K")
+        self.assertEqual(screen.lines[0][0][1].bg, 4)
+        self.assertEqual(screen.lines[0][5][1].bg, 4)
+        self.assertEqual(screen.lines[2][9][1].bg, 4)
+        screen.feed("\r\n\r\n\r\n")
+        self.assertEqual(screen.lines[2][0][1].bg, 4)
+        screen.feed("\x1b[0m")
+        self.assertEqual(screen.viewport(1)[0][0][1].bg, 4)
+
+    def test_alt_screen_resets_primary_scroll_region_and_restores_it(self):
+        screen = VtScreen(5, 20)
+        screen.feed("\x1b[2;4r\x1b[?1049h")
+        self.assertEqual((screen._top, screen._bottom), (0, 4))
+        screen.feed("a\r\nb\r\nc\r\nd\r\ne\r\n")
+        self.assertEqual(screen.plain().splitlines()[0], "b")
+        screen.resize(6, 25)
+        screen.feed("\x1b[?1049l")
+        self.assertEqual((screen.rows, screen.columns), (6, 25))
+
+    def test_origin_mode_tab_csi_and_del_inside_csi(self):
+        screen = VtScreen(5, 24)
+        screen.feed("\x1b[2;4r\x1b[?6h\x1b[2;3Hxy\x1b[I!\x1b[1Z?")
+        self.assertEqual(screen.plain().splitlines()[2], "  xy    ?")
+        screen.feed("\x1b[?6l\x1b[1;1H\x1b[3\x7f1mR")
+        self.assertEqual(screen.lines[0][0][1].fg, 1)
+
+
 class KeyMappingTests(unittest.TestCase):
     def test_common_keys(self):
         self.assertEqual(key_to_bytes(0x51, "q", 0), b"q")
@@ -626,6 +680,17 @@ class TerminalWindowKeyboardTests(unittest.TestCase):
                             Qt.ScrollPhase.NoScrollPhase, False)
         self.window.pane.wheelEvent(event)
         self.assertEqual(self.sent, [b"\x1bOA" * 3])
+
+    def test_escape_in_search_bar_hides_search_without_closing_session(self):
+        QTest.keyClick(self.window.pane, Qt.Key.Key_F,
+                       Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)
+        self.assertTrue(self.window.search_bar.isVisible())
+        self.assertIs(self.window.focusWidget(), self.window.search_input)
+        QTest.keyClick(self.window.search_input, Qt.Key.Key_Escape)
+        self.assertFalse(self.window.search_bar.isVisible())
+        self.assertTrue(self.window.isVisible())
+        self.assertIs(self.window.focusWidget(), self.window.pane)
+        self.assertFalse(self.window._closing)
 
 
 class PtyProcessTests(unittest.TestCase):
@@ -922,6 +987,15 @@ class TerminalPaneTests(unittest.TestCase):
                        Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)
         process.write.assert_called_with(b"\x1b[200~h\xc3\xa9llo\rworld[201~\x1b[201~")
         pane.close()
+
+    def test_double_click_selects_word_including_wide_cells(self):
+        pane = TerminalPane()
+        self.addCleanup(pane.close)
+        pane.screen = VtScreen(3, 20)
+        pane._on_output("echo 界e\u0301-ok next")
+        target = QPoint(6 * pane.cell_width + 1, pane.cell_height // 2)
+        QTest.mouseDClick(pane, Qt.MouseButton.LeftButton, pos=target)
+        self.assertEqual(pane.selected_text(), "界e\u0301-ok")
 
 
 class TerminalWindowTests(unittest.TestCase):

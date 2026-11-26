@@ -1,7 +1,25 @@
 # Changelog
 
-The current release is numbered `1.3.2`. Earlier development release numbers
+The current release is numbered `1.3.3`. Earlier development release numbers
 are retained below as historical records.
+
+## v1.3.3 — 2026-11-26
+
+- Improve the embedded terminal (`chrootables/terminal.py`):
+  - Support `apt`-style zero-margin `DECSTBM` scroll regions (`CSI 0;Nr`),
+    execute C0 controls inside CSI sequences without swallowing following text,
+    ignore `DEL` and C1 controls in ground state, and ignore `DEL` inside CSI.
+  - Bulk-place printable ASCII runs in `VtScreen.feed` and align batched runs to
+    the pixel cell grid with `QFontMetricsF` letter-spacing compensation.
+  - Support `xterm-256color` Background Color Erase (BCE) across screen/line
+    erases and scrolling, Origin Mode (`CSI ? 6 h/l`), forward/backward tab
+    stops (`CSI I` / `CSI Z`), and reset scroll regions when entering the
+    alternate screen.
+  - Add double-click word selection, a right-click Copy/Paste/Find/Clear
+    context menu, and `Escape` dismissal of the search bar without closing the
+    terminal session.
+- Synchronize `chrootable-manager`'s `APP_VERSION` and manual page headers with
+  the package version (`1.3.3`).
 
 ## v1.3.2 — 2026-11-25
 

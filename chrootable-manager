@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 
 APP_NAME="Chrootable Manager"
-APP_VERSION=1.3.0
+APP_VERSION=1.3.3
 SCRIPT_PATH=${BASH_SOURCE[0]}
 # The desktop backend pins its own default suite in backend.py; the CLI keeps
 # the moving stable alias so interactive creates follow the current stable

@@ -10,6 +10,7 @@ import codecs
 from collections import deque
 import fcntl
 import os
+import re
 import shutil
 import signal
 import struct
@@ -18,9 +19,9 @@ import termios
 import unicodedata
 
 from PySide6.QtCore import QObject, QSocketNotifier, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QFontMetricsF, QPainter
 from PySide6.QtWidgets import (
-    QApplication, QDialog, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton,
+    QApplication, QDialog, QHBoxLayout, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton,
     QVBoxLayout, QWidget,
 )
 
@@ -125,6 +126,7 @@ def normalize_cells(line):
 # Parser states.
 _GROUND, _ESC, _CSI, _OSC, _OSC_ESC, _CHARSET, _CSI_IGNORE, _STRING, _STRING_ESC = range(9)
 MAX_CSI_PARAMS = 256
+_ASCII_RUN = re.compile(r"[ -~]+")
 
 
 class VtScreen:
@@ -142,7 +144,8 @@ class VtScreen:
         self.row = 0
         self.column = 0
         self.cursor_visible = True
-        self._saved_cursor = (0, 0, DEFAULT_STYLE, ("B", "B"), 0, columns)
+        self._origin_mode = False
+        self._saved_cursor = (0, 0, DEFAULT_STYLE, ("B", "B"), 0, columns, False)
         self._alt_active = False
         self._primary = None
         self._top = 0
@@ -162,8 +165,12 @@ class VtScreen:
         self._shift = 0
         self._charset_target = None
 
-    def _blank_line(self):
-        return [(" ", DEFAULT_STYLE)] * self.columns
+    def _erase_style(self):
+        return DEFAULT_STYLE if self.style.bg is None else Style(None, self.style.bg, 0)
+
+    def _blank_line(self, *, bce=False):
+        style = self._erase_style() if bce else DEFAULT_STYLE
+        return [(" ", style)] * self.columns
 
     # -- grid operations ---------------------------------------------------
 
@@ -179,12 +186,12 @@ class VtScreen:
                 self.history.append(self.lines[0])
                 self.history_count += 1
             del self.lines[self._top]
-            self.lines.insert(self._bottom, self._blank_line())
+            self.lines.insert(self._bottom, self._blank_line(bce=True))
 
     def _scroll_down(self, count=1):
         for _ in range(min(count, self._bottom - self._top + 1)):
             del self.lines[self._bottom]
-            self.lines.insert(self._top, self._blank_line())
+            self.lines.insert(self._top, self._blank_line(bce=True))
 
     def _line_feed(self):
         self.column = min(self.column, self.columns - 1)
@@ -242,7 +249,7 @@ class VtScreen:
             start -= 1
         if end < self.columns and not self.lines[line][end][0]:
             end += 1
-        self.lines[line][start:end] = [(" ", DEFAULT_STYLE)] * (end - start)
+        self.lines[line][start:end] = [(" ", self._erase_style())] * (end - start)
 
     def _insert_blanks(self, count):
         line = self.lines[self.row]
@@ -255,7 +262,7 @@ class VtScreen:
         line = self.lines[self.row]
         count = min(count, self.columns - self.column)
         del line[self.column:self.column + count]
-        line.extend([(" ", DEFAULT_STYLE)] * count)
+        line.extend([(" ", self._erase_style())] * count)
         normalize_cells(line)
 
     # -- sequence handling ---------------------------------------------------
@@ -291,7 +298,7 @@ class VtScreen:
 
     def _csi_dispatch(self, final, count):
         """Route one validated CSI sequence to its focused handler."""
-        if final in ("A", "B", "e", "C", "a", "D", "E", "F", "G", "`", "H", "f", "d"):
+        if final in ("A", "B", "e", "C", "a", "D", "E", "F", "G", "`", "H", "f", "d", "I", "Z"):
             self._csi_move(final, count)
         elif final in ("J", "K", "X"):
             self._csi_erase(final, count)
@@ -306,11 +313,13 @@ class VtScreen:
                 for _ in range(min(count(), self.columns * self.rows)):
                     self._put(self._last_char)
         elif final == "r":  # DECSTBM
-            top = self._param(0, 1) - 1
-            bottom = self._param(1, self.rows) - 1 if self._param_count() > 1 else self.rows - 1
+            # A zero or omitted margin means the screen edge; apt sends 0;N.
+            top = (self._param(0, 1) or 1) - 1
+            bottom = (self._param(1, self.rows) or self.rows) - 1 if self._param_count() > 1 else self.rows - 1
+            bottom = min(bottom, self.rows - 1)
             if 0 <= top < bottom < self.rows:
                 self._top, self._bottom = top, bottom
-                self.row, self.column = 0, 0
+                self.row, self.column = (self._top if self._origin_mode else 0), 0
         elif final == "s":
             self._save_cursor()
         elif final == "u":
@@ -341,10 +350,18 @@ class VtScreen:
         elif final in ("G", "`"):
             self.column = count() - 1
         elif final in ("H", "f"):
-            self.row = self._param(0, 1) - 1
-            self.column = self._param(1, 1) - 1
+            row = (self._param(0, 1) or 1) - 1
+            self.row = min(self._bottom, self._top + row) if self._origin_mode else row
+            self.column = (self._param(1, 1) or 1) - 1
         elif final == "d":
-            self.row = count() - 1
+            row = count() - 1
+            self.row = min(self._bottom, self._top + row) if self._origin_mode else row
+        elif final == "I":
+            self.column = min(self.columns - 1, (self.column // 8 + count()) * 8)
+        elif final == "Z":
+            stops = count()
+            if self.column > 0:
+                self.column = max(0, ((self.column - 1) // 8 - (stops - 1)) * 8)
 
     def _csi_erase(self, final, count):
         """Erase display and line sequences, including ECH."""
@@ -379,11 +396,11 @@ class VtScreen:
         if final == "L":
             for _ in range(min(count(), self._bottom - self.row + 1)):
                 del self.lines[self._bottom]
-                self.lines.insert(self.row, self._blank_line())
+                self.lines.insert(self.row, self._blank_line(bce=True))
         elif final == "M":
             for _ in range(min(count(), self._bottom - self.row + 1)):
                 del self.lines[self.row]
-                self.lines.insert(self._bottom, self._blank_line())
+                self.lines.insert(self._bottom, self._blank_line(bce=True))
         elif final == "S":
             self._scroll_up(count())
         elif final == "T":
@@ -505,10 +522,13 @@ class VtScreen:
         return None
 
     def _save_cursor(self):
-        self._saved_cursor = (self.row, self.column, self.style, tuple(self._charsets), self._shift, self.columns)
+        self._saved_cursor = (
+            self.row, self.column, self.style, tuple(self._charsets),
+            self._shift, self.columns, self._origin_mode,
+        )
 
     def _restore_cursor(self):
-        self.row, self.column, self.style, charsets, self._shift, columns = self._saved_cursor
+        self.row, self.column, self.style, charsets, self._shift, columns, self._origin_mode = self._saved_cursor
         self._charsets = list(charsets)
         self._clamp_cursor(preserve_wrap=self.column == columns == self.columns)
 
@@ -522,6 +542,10 @@ class VtScreen:
                 continue
             if value == 1:  # DECCKM
                 self.application_cursor = enable
+            elif value == 6:  # DECOM
+                self._origin_mode = enable
+                self.row = self._top if enable else 0
+                self.column = 0
             elif value == 7:  # DECAWM
                 self._autowrap = enable
             elif value == 25:
@@ -535,13 +559,15 @@ class VtScreen:
         if active == self._alt_active:
             return
         if active:
-            self._primary = (self.lines, self.row, self.column, self._top, self._bottom)
+            self._primary = (self.lines, self.row, self.column, self._top, self._bottom, self._origin_mode)
             if save_cursor:
                 self._save_cursor()
+            self._top, self._bottom = 0, self.rows - 1
+            self._origin_mode = False
             self.lines = [self._blank_line() for _ in range(self.rows)]
         else:
             if self._primary is not None:
-                self.lines, self.row, self.column, self._top, self._bottom = self._primary
+                self.lines, self.row, self.column, self._top, self._bottom, self._origin_mode = self._primary
             self._primary = None
             if save_cursor:
                 self._restore_cursor()
@@ -549,16 +575,17 @@ class VtScreen:
         self._clamp_cursor()
 
     def _reset(self):
+        self.style = DEFAULT_STYLE
         self.lines = [self._blank_line() for _ in range(self.rows)]
         self.row = self.column = 0
         self._top, self._bottom = 0, self.rows - 1
-        self.style = DEFAULT_STYLE
+        self._origin_mode = False
         self.history.clear()
         self._primary = None
         self._alt_active = False
         self.bracketed_paste = False
         self.cursor_visible = True
-        self._saved_cursor = (0, 0, DEFAULT_STYLE, ("B", "B"), 0, self.columns)
+        self._saved_cursor = (0, 0, DEFAULT_STYLE, ("B", "B"), 0, self.columns, False)
         self._last_char = ""
         self.application_cursor = False
         self._autowrap = True
@@ -569,23 +596,55 @@ class VtScreen:
     # -- public interface ---------------------------------------------------
 
     def feed(self, text):
-        for character in text:
-            # CAN/SUB abort an incomplete control sequence in every state,
-            # including strings and a pending string terminator.
-            if character in ("\x18", "\x1a"):
-                self._state = _GROUND
-                self._params = ""
-                self._charset_target = None
-                continue
-            state = self._state
-            if state == _GROUND:
-                self._feed_ground(character)
-            elif state == _ESC:
-                self._feed_escape(character)
-            elif state in (_CSI, _CSI_IGNORE):
-                self._feed_csi(state, character)
-            else:
-                self._feed_string(state, character)
+        position, length = 0, len(text)
+        while position < length:
+            if self._state == _GROUND:
+                # Long runs of ordinary text dominate package-manager output;
+                # place them in bulk rather than one character at a time.
+                run = _ASCII_RUN.match(text, position)
+                if run:
+                    self._put_ascii(run.group())
+                    position = run.end()
+                    continue
+            self._feed_character(text[position])
+            position += 1
+
+    def _put_ascii(self, run):
+        """Write printable ASCII; equivalent to calling _put for each character."""
+        if self._insert_mode or not self._autowrap or self._charsets[self._shift] == "0":
+            for character in run:
+                self._put(character)
+            return
+        self._last_char = run[-1]
+        offset, length = 0, len(run)
+        while offset < length:
+            if self.column >= self.columns:
+                self.column = 0
+                self._line_feed()
+            count = min(length - offset, self.columns - self.column)
+            self._erase(self.row, self.column, self.column + count)
+            self.lines[self.row][self.column:self.column + count] = [
+                (character, self.style) for character in run[offset:offset + count]]
+            self.column += count
+            offset += count
+
+    def _feed_character(self, character):
+        # CAN/SUB abort an incomplete control sequence in every state,
+        # including strings and a pending string terminator.
+        if character in ("\x18", "\x1a"):
+            self._state = _GROUND
+            self._params = ""
+            self._charset_target = None
+            return
+        state = self._state
+        if state == _GROUND:
+            self._feed_ground(character)
+        elif state == _ESC:
+            self._feed_escape(character)
+        elif state in (_CSI, _CSI_IGNORE):
+            self._feed_csi(state, character)
+        else:
+            self._feed_string(state, character)
 
     def _feed_ground(self, character):
         """Interpret one C0 control or printable character."""
@@ -603,7 +662,7 @@ class VtScreen:
             self.column = min(self.columns - 1, (self.column // 8 + 1) * 8)
         elif character == "\b":
             self.column = max(0, min(self.column, self.columns - 1) - 1)
-        elif character >= " ":
+        elif character >= " " and character != "\x7f" and not "\x80" <= character <= "\x9f":
             self._put(character)
         # BEL, NUL and other C0 controls are ignored.
 
@@ -642,6 +701,12 @@ class VtScreen:
         """Collect CSI parameters or dispatch the final byte."""
         if character == "\x1b":
             self._state = _ESC
+        elif character < " ":
+            # Terminals execute C0 controls inside a sequence and carry on; the
+            # sequence must not swallow the text that follows.
+            self._feed_ground(character)
+        elif character == "\x7f":
+            pass
         elif "@" <= character <= "~":
             self._state = _GROUND
             if state == _CSI:
@@ -700,9 +765,9 @@ class VtScreen:
             lines, self.row = to_history(self.lines, self.row)
             self.lines = resized(lines)
         if self._primary is not None:
-            lines, row, column, _, _ = self._primary
+            lines, row, column, _, _, origin = self._primary
             lines, row = to_history(lines, row)
-            self._primary = (resized(lines), row, min(column, columns - 1), 0, rows - 1)
+            self._primary = (resized(lines), row, min(column, columns - 1), 0, rows - 1, origin)
         self.rows, self.columns = rows, columns
         self._top, self._bottom = 0, rows - 1
         self._clamp_cursor()
@@ -954,10 +1019,15 @@ class TerminalPane(QWidget):
         font = QFont("Monospace")
         font.setStyleHint(QFont.StyleHint.Monospace)
         font.setPointSize(10)
+        # Glyph advances are fractional but the grid is whole pixels. Without
+        # correction a batched run of text drifts left of the cursor column by
+        # the rounding error of every character before it.
+        advance = QFontMetricsF(font).horizontalAdvance("M" * 64) / 64
+        self.cell_width = max(1, round(advance))
+        font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, self.cell_width - advance)
         self.font = font
         self._metrics = QFontMetrics(font)
-        self.cell_width = max(1, self._metrics.horizontalAdvance("M"))
-        self.cell_height = self._metrics.height()
+        self.cell_height = max(1, self._metrics.height())
         self._cursor_shown = True
         self._blink = QTimer(self)
         self._blink.timeout.connect(self._toggle_cursor)
@@ -1067,18 +1137,19 @@ class TerminalPane(QWidget):
                     )
                 painter.fillRect(column * self.cell_width, y, width * self.cell_width,
                                  self.cell_height, fill)
-                if style.flags != last_flags:
-                    if style.flags not in fonts:
-                        font = QFont(self.font)
-                        font.setBold(bool(style.flags & BOLD))
-                        font.setItalic(bool(style.flags & ITALIC))
-                        font.setUnderline(bool(style.flags & UNDERLINE))
-                        font.setStrikeOut(bool(style.flags & STRIKE))
-                        fonts[style.flags] = font
-                    painter.setFont(fonts[style.flags])
-                    last_flags = style.flags
-                painter.setPen(text_color)
-                painter.drawText(column * self.cell_width, y + self._metrics.ascent(), text)
+                if text.strip() or (style.flags & (UNDERLINE | STRIKE)):
+                    if style.flags != last_flags:
+                        if style.flags not in fonts:
+                            font = QFont(self.font)
+                            font.setBold(bool(style.flags & BOLD))
+                            font.setItalic(bool(style.flags & ITALIC))
+                            font.setUnderline(bool(style.flags & UNDERLINE))
+                            font.setStrikeOut(bool(style.flags & STRIKE))
+                            fonts[style.flags] = font
+                        painter.setFont(fonts[style.flags])
+                        last_flags = style.flags
+                    painter.setPen(text_color)
+                    painter.drawText(column * self.cell_width, y + self._metrics.ascent(), text)
                 column += width
 
     def _paint_selection(self, painter):
@@ -1141,6 +1212,7 @@ class TerminalPane(QWidget):
             self.clear_selection()
             self.process.write(payload)
             self.update()
+            event.accept()
 
     def scroll(self, lines):
         if not self.screen._alt_active:
@@ -1194,6 +1266,64 @@ class TerminalPane(QWidget):
             event.accept()
         else:
             super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mouseDoubleClickEvent(event)
+            return
+        self.setFocus()
+        row, col = self._cell_at(event.position())
+        line = self.screen.viewport(self.scroll_offset)[row]
+        if col >= len(line):
+            self.clear_selection()
+            self.update()
+            event.accept()
+            return
+        if col and not line[col][0]:
+            col -= 1
+        target_space = line[col][0].isspace()
+        left = col
+        while left > 0:
+            prev = left - 1
+            if prev and not line[prev][0]:
+                prev -= 1
+            if line[prev][0].isspace() != target_space:
+                break
+            left = prev
+        right = col + max(1, cell_width(line[col][0]))
+        while right < len(line):
+            if not line[right][0]:
+                right += 1
+                continue
+            if line[right][0].isspace() != target_space:
+                break
+            right += max(1, cell_width(line[right][0]))
+        self._selection_start = (row, left)
+        self._selection_end = (row, right)
+        self._selecting = False
+        self.update()
+        event.accept()
+
+    def contextMenuEvent(self, event):
+        menu = QMenu(self)
+        selected = self.selected_text()
+        copy_action = menu.addAction("Copy")
+        copy_action.setEnabled(bool(selected))
+        paste_action = menu.addAction("Paste")
+        clipboard_text = QApplication.clipboard().text()
+        paste_action.setEnabled(bool(clipboard_text and self.process is not None and self.process.running))
+        menu.addSeparator()
+        find_action = menu.addAction("Find…")
+        clear_action = menu.addAction("Clear scrollback")
+        chosen = menu.exec(event.globalPos())
+        if chosen is copy_action and selected:
+            QApplication.clipboard().setText(selected)
+        elif chosen is paste_action and clipboard_text:
+            self.paste(clipboard_text)
+        elif chosen is find_action:
+            self.find_requested.emit()
+        elif chosen is clear_action:
+            self.clear_scrollback()
 
     def selected_text(self):
         if self._selection_start is None or self._selection_end is None:
@@ -1395,6 +1525,16 @@ class TerminalWindow(QDialog):
             self.process.terminate()
         # Keep the window (and its process/notifier) owned until EOF and reaping.
         return False
+
+    def keyPressEvent(self, event):
+        # Closing the search bar with Escape must not terminate the terminal session.
+        if event.key() == Qt.Key.Key_Escape and self.search_bar.isVisible():
+            focused = self.focusWidget()
+            if focused is not None and (focused is self.search_bar or self.search_bar.isAncestorOf(focused)):
+                self.toggle_search()
+                event.accept()
+                return
+        super().keyPressEvent(event)
 
     def reject(self):
         # Escape calls reject directly, bypassing closeEvent.
